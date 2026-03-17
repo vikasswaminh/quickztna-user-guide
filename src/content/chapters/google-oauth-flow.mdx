@@ -1,0 +1,181 @@
+---
+title: "Google OAuth Flow"
+topic: "Authentication & Account Security"
+order: 13
+machines: ["Win-A"]
+summary: "Verify the Google OAuth login flow — both from the dashboard and CLI — including token exchange, email verification, and new user auto-creation."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Google OAuth uses the authorization code flow, identical in structure to GitHub but with Google's endpoints. The backend (`handlers/google-auth.ts`) implements:
+
+- **Initiate**: `POST /api/auth/google` with `action: "initiate"` — returns a Google authorize URL
+- **Callback**: Google redirects to `GET /api/auth/google?code=...&state=...` — backend exchanges code for Google tokens, then issues QuickZTNA JWT pair
+- **CLI flow**: CLI starts a localhost callback server, passes `redirect_uri` to initiate
+
+Google Client ID: `182966675040-00g2vc59hkll6i4ac2tm6uon9lgp1m31.apps.googleusercontent.com`
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + CLI testing |
+
+You need a Google account to test this flow.
+
+---
+
+## ST1 — Google Login from Dashboard
+
+**What it verifies:** Clicking "Sign in with Google" completes the full OAuth flow.
+
+**Steps:**
+1. Open `https://login.quickztna.com/auth` (incognito window).
+2. Click the **Google** login button (or "Continue with Google").
+3. Google's consent screen opens. Select your Google account and authorize.
+4. You are redirected back to `login.quickztna.com`.
+
+**Expected behavior:**
+- Google shows consent screen with app name "QuickZTNA" and requested scopes (email, profile)
+- After authorization: redirected to `/dashboard` (existing user) or `/create-org` (new user)
+- Browser dev tools → Network: `POST /api/auth/google` with `action: "callback"` returns tokens
+
+**Pass:** Full redirect cycle works. Dashboard loads. Tokens stored in local storage.
+
+**Fail / Common issues:**
+- "Access blocked: This app's request is invalid" — the callback URL may not match Google's authorized redirect URI. The registered URI is `https://login.quickztna.com/api/auth/google`.
+- Google shows "This app isn't verified" warning — this is normal for development. Click "Advanced" → "Go to QuickZTNA (unsafe)" to proceed.
+
+---
+
+## ST2 — Google Login from CLI
+
+**What it verifies:** `ztna login --google` opens a browser, completes Google OAuth, and delivers tokens to the CLI.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna logout
+ztna login --google
+```
+
+2. A browser window opens to Google. Select your account and authorize.
+3. The CLI shows success.
+
+**Expected CLI output:**
+```
+To authenticate, visit:
+  https://accounts.google.com/o/oauth2/v2/auth?client_id=182966675040-...
+
+Login successful!
+```
+
+4. Verify:
+```powershell
+ztna status
+```
+
+**Pass:** `Authenticated: true` in status. Login completed without errors.
+
+**Fail / Common issues:**
+- "authentication timed out" — default timeout is 5 minutes. Extend with `--timeout 10m`.
+- "google callback failed" — state mismatch or code already exchanged. Retry from scratch.
+
+---
+
+## ST3 — Google Email Extraction
+
+**What it verifies:** The backend correctly extracts the user's email from Google's token response and uses it for account creation/lookup.
+
+**Steps:**
+1. Log in via Google (from ST1 or ST2).
+2. Open `https://login.quickztna.com/profile`.
+3. Check the email shown on the profile page.
+
+**Expected:** The email matches your Google account's primary email address.
+
+**Alternative verification via API:**
+```bash
+# Use the access token from login
+curl -s https://login.quickztna.com/api/auth/me \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "...",
+    "email": "yourname@gmail.com",
+    "name": "Your Name"
+  }
+}
+```
+
+**Pass:** Profile shows the correct Google email. `/auth/me` returns the same email.
+
+**Fail / Common issues:**
+- Email is wrong — the Google account may have a different primary email than expected.
+- Name is missing — the backend may only extract email, not name, from Google's response.
+
+---
+
+## ST4 — Google vs GitHub Same Email (Account Linking)
+
+**What it verifies:** If a user signs up with Google and later tries to log in with GitHub (same email), the accounts are linked.
+
+**Steps:**
+1. Create an account via Google (using email `test@example.com`).
+2. Log out.
+3. Try to log in via GitHub with a GitHub account that has the same email (`test@example.com`).
+
+**Expected behavior:** One of:
+- **A. Accounts linked automatically** — login succeeds, same user account
+- **B. Error: email already in use** — the backend prevents duplicate emails across providers
+
+Document which behavior you observe — both are valid security decisions.
+
+**Pass:** The system handles the duplicate email case gracefully (either linking or clear error). No crash, no data corruption.
+
+---
+
+## ST5 — Google Login State Validation
+
+**What it verifies:** A forged callback with an invalid state parameter is rejected.
+
+**Steps:**
+1. Via `curl`, try a callback with forged state:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/google \
+  -H "Content-Type: application/json" \
+  -d '{"action":"callback","code":"fake-code","state":"forged-state"}' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_STATE",
+    "message": "Invalid or expired state parameter"
+  }
+}
+```
+
+**Pass:** Forged state is rejected. No tokens issued.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Dashboard Google login | Full OAuth cycle, tokens issued, dashboard loads |
+| ST2 | CLI Google login | `ztna login --google` succeeds, authenticated |
+| ST3 | Email extraction | Profile shows correct Google email |
+| ST4 | Same email handling | Duplicate email handled gracefully (link or error) |
+| ST5 | State validation | Forged state rejected |

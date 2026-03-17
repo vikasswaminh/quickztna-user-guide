@@ -32,7 +32,7 @@ All three machines must be enrolled and online in your QuickZTNA org before star
 ```bash
 ztna status
 ```
-Expected: `Connected` status on all three.
+Expected: `Authenticated: true` and `Mode: tun` (or `userspace`) on all three.
 
 ---
 
@@ -128,37 +128,32 @@ tcpdump -r /tmp/wg-traffic.pcap -A | head -60
 
 **Steps:**
 
-1. On <MachineRef name="Win-A" />, note the current handshake time:
-```powershell
-ztna status
-# Look for: "Latest handshake: X minutes ago"
+1. On <MachineRef name="Linux-C" />, capture WireGuard handshake initiation packets on the physical NIC. Handshake packets are 148 bytes:
+```bash
+# Replace eth0 with your interface
+sudo tcpdump -i eth0 udp and 'udp[0:4] = 0x01000000' -n -c 5 &
 ```
 
-2. Keep the tunnel active for 3+ minutes:
+2. On <MachineRef name="Win-A" />, generate sustained traffic for 4+ minutes (forces multiple key rotations):
 ```powershell
-ztna ping 100.64.x.x --count 200 --interval 1
+ztna ping 100.64.x.x --count 240
 ```
 
-3. Check again after 3 minutes:
-```powershell
-ztna status
-# "Latest handshake" should show a recent timestamp
-```
+3. On <MachineRef name="Linux-C" />, observe the tcpdump output. Each WireGuard handshake initiation packet indicates a new ephemeral key exchange.
 
 **Expected output:**
 ```
-# Before:
-Latest handshake: 2 minutes, 45 seconds ago
-
-# After waiting 3 minutes:
-Latest handshake: 8 seconds ago   ← new ephemeral keys negotiated
+# Multiple handshake initiation packets captured over ~4 minutes:
+14:02:33 IP 203.x.x.x.41641 > 178.x.x.x.41641: UDP, length 148
+14:05:35 IP 203.x.x.x.41641 > 178.x.x.x.41641: UDP, length 148
+# ~180 second gap = new ephemeral session keys
 ```
 
-**Pass:** The handshake timestamp resets — new ephemeral keys were generated.
+**Pass:** Multiple handshake packets captured with ~180-second intervals — confirming ephemeral key rotation.
 
 **Fail / Common issues:**
-- Handshake never updates → send traffic to force it: `ztna ping 100.64.x.x`
-- Handshake too old (> 3 minutes) with no new one → check if tunnel is still up with `ztna status`
+- Only 1 handshake captured in 4 minutes → traffic may be going via DERP (not direct UDP). Check `ztna peers` for path type
+- No handshakes at all → capture may be on wrong interface. Try `tcpdump -i any`
 
 ---
 
@@ -168,30 +163,36 @@ Latest handshake: 8 seconds ago   ← new ephemeral keys negotiated
 
 **Steps:**
 
-1. On <MachineRef name="Win-A" />, display the public key:
+1. On <MachineRef name="Win-A" />, display the full machine details in JSON:
 ```powershell
-ztna status
-# Note the public key field
+ztna status --json
 ```
+Look for the `node_key` field. Note: `ztna status` (human-readable) shows a truncated key. Use `--json` for the full value.
 
 2. Verify it in the dashboard:
    - Go to `login.quickztna.com` → Machines → click Win-A
    - Copy the public key shown in machine details
 
-3. Compare: CLI key should exactly match dashboard.
+3. Compare: the node key prefix from CLI should match the dashboard public key.
 
 **Expected output:**
+```json
+{
+  "node_key": "bpkM2YWJEhXfP...",
+  "authenticated": true,
+  "machine": {
+    "tailnet_ip": "100.64.0.1",
+    ...
+  }
+}
 ```
-Public key: bpkM2YWJEhXfP3Kj8L9oR1sNwH4DqTmZ6eAcXvByI0=
-Length: 44 characters
-Curve: Curve25519 (X25519)
-```
+The full public key is a 44-character base64 string (Curve25519 / X25519).
 
-**Pass:** 44-character base64 key, identical in CLI and dashboard.
+**Pass:** 44-character base64 key visible in `--json` output, matches dashboard public key.
 
 **Fail / Common issues:**
 - Key mismatch → wait 30s for heartbeat sync, then check again
-- Key not shown in `ztna status` → try `ztna status --verbose`
+- `node_key` is null → machine is not registered. Run `ztna up` first
 
 ---
 

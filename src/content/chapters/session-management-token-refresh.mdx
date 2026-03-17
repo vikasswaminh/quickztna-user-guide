@@ -1,0 +1,266 @@
+---
+title: "Session Management & Token Refresh"
+topic: "Authentication & Account Security"
+order: 15
+machines: ["Win-A"]
+summary: "Verify JWT access token expiry, refresh token rotation, logout invalidation, and the CLI auto-refresh mechanism."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA uses a two-token authentication model (`handlers/auth.ts`):
+
+- **Access token**: ES256 JWT, **1 hour TTL** (`ACCESS_TOKEN_TTL = 3600`)
+- **Refresh token**: Opaque hex string, **30 day TTL** (`REFRESH_TOKEN_TTL = 30 * 86400`), stored in Valkey (`sessions` keyspace)
+- **Refresh endpoint**: `POST /api/auth/refresh` with `{ "refresh_token": "..." }` — rotates the refresh token (old one deleted, new one issued)
+- **Logout**: `POST /api/auth/logout` — deletes the refresh token from Valkey
+
+The CLI (`cmd_login.go`) saves tokens to `~/.config/ztna/tokens.json`. The frontend stores them in localStorage and auto-refreshes 5 minutes before expiry.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | API testing via curl + dashboard browser testing |
+
+---
+
+## ST1 — Access Token Expiry Verification
+
+**What it verifies:** Access tokens expire after 1 hour and are rejected after expiry.
+
+**Steps:**
+1. Log in and capture the access token:
+```bash
+RESPONSE=$(curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}')
+
+TOKEN=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+EXPIRES=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['expires_in'])")
+echo "Token expires in: ${EXPIRES}s"
+```
+
+**Expected:** `Token expires in: 3600s`
+
+2. Decode the JWT to verify the `exp` claim:
+```bash
+echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+```
+
+**Expected JWT payload:**
+```json
+{
+  "sub": "user-id-here",
+  "email": "your@email.com",
+  "exp": 1742299200,
+  "iat": 1742295600
+}
+```
+
+3. Verify `exp - iat = 3600` (1 hour).
+
+**Pass:** `expires_in: 3600`. JWT `exp` claim is exactly 3600 seconds after `iat`.
+
+**Fail / Common issues:**
+- `expires_in` is different — the constant may have changed. Check `auth.ts` line 48.
+- Base64 decode fails — JWT segments use URL-safe base64. Add `==` padding if needed.
+
+---
+
+## ST2 — Refresh Token Rotation
+
+**What it verifies:** The refresh endpoint issues a new token pair and invalidates the old refresh token.
+
+**Steps:**
+1. Log in and capture both tokens:
+```bash
+RESPONSE=$(curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}')
+
+TOKEN=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+REFRESH=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['refresh_token'])")
+echo "Refresh token: $REFRESH"
+```
+
+2. Use the refresh token to get a new pair:
+```bash
+NEW_RESPONSE=$(curl -s -X POST https://login.quickztna.com/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refresh_token\":\"$REFRESH\"}")
+
+echo $NEW_RESPONSE | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "token": "eyJ...(new access token)",
+    "refresh_token": "...(new refresh token, different from old)",
+    "expires_in": 3600
+  }
+}
+```
+
+3. Try the **old** refresh token again (should be invalidated):
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refresh_token\":\"$REFRESH\"}" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_TOKEN",
+    "message": "Invalid or expired refresh token"
+  }
+}
+```
+
+**Pass:** New token pair issued. Old refresh token is rejected (rotation). New refresh token is different from old.
+
+**Fail / Common issues:**
+- Old refresh token still works — the backend may not be deleting old tokens from Valkey. Security concern — report this.
+- `MISSING_TOKEN` (400) — the `refresh_token` field is missing from the request body.
+
+---
+
+## ST3 — Logout Invalidates Refresh Token
+
+**What it verifies:** `POST /api/auth/logout` deletes the refresh token so it can't be reused.
+
+**Steps:**
+1. Log in and capture tokens:
+```bash
+RESPONSE=$(curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}')
+
+TOKEN=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+REFRESH=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['refresh_token'])")
+```
+
+2. Log out:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/logout \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"refresh_token\":\"$REFRESH\"}" | python3 -m json.tool
+```
+
+3. Try to use the refresh token:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refresh_token\":\"$REFRESH\"}" | python3 -m json.tool
+```
+
+**Expected:** Refresh fails with `INVALID_TOKEN` — the token was deleted on logout.
+
+**Pass:** After logout, the refresh token is invalid. No way to get new access tokens without re-authenticating.
+
+---
+
+## ST4 — CLI Token Storage and Status
+
+**What it verifies:** The CLI stores tokens in `tokens.json` and uses them for authenticated commands.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, log in:
+```powershell
+ztna login --interactive
+```
+
+2. Check that tokens were saved:
+```powershell
+# Windows:
+type %USERPROFILE%\.config\ztna\tokens.json
+# Or:
+cat ~/.config/ztna/tokens.json
+```
+
+**Expected:** A JSON file containing `access_token` and `refresh_token` fields.
+
+3. Verify authenticated status:
+```powershell
+ztna status
+```
+Should show `Authenticated: true`.
+
+4. Log out:
+```powershell
+ztna logout
+```
+
+5. Check tokens again:
+```powershell
+ztna status
+```
+Should show `Authenticated: false` and the hint `(run 'ztna login' to authenticate)`.
+
+**Pass:** Tokens saved after login, `Authenticated: true`. After logout, `Authenticated: false`.
+
+**Fail / Common issues:**
+- `tokens.json` doesn't exist — the CLI may not have write permissions to `~/.config/ztna/`. Check directory permissions.
+- `Authenticated: true` after logout — tokens file may not have been cleared. Delete it manually: `rm ~/.config/ztna/tokens.json`.
+
+---
+
+## ST5 — Expired Access Token Rejected by API
+
+**What it verifies:** An expired JWT access token is rejected by protected API endpoints.
+
+**Steps:**
+1. Create a deliberately expired JWT (or wait 1 hour after login):
+
+For quick testing, use an old token from a previous session, or forge a short-lived one. The simplest approach:
+```bash
+# Get a valid token
+TOKEN=$(curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+
+# Use it immediately — should work
+curl -s https://login.quickztna.com/api/auth/me \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Status:', 'ok' if d['success'] else 'failed')"
+```
+
+2. Now try with a clearly invalid/expired token:
+```bash
+curl -s https://login.quickztna.com/api/auth/me \
+  -H "Authorization: Bearer expired.token.here" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Invalid or expired token"
+  }
+}
+```
+
+**Pass:** Valid token returns user data. Invalid/expired token returns 401 UNAUTHORIZED.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Access token TTL | `expires_in: 3600`, JWT exp-iat = 3600 |
+| ST2 | Refresh rotation | New pair issued, old refresh invalidated |
+| ST3 | Logout invalidation | Refresh token rejected after logout |
+| ST4 | CLI token storage | Tokens in `tokens.json`, status reflects auth state |
+| ST5 | Expired token rejection | Invalid token returns 401 |

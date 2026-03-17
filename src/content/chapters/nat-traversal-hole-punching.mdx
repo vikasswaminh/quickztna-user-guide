@@ -1,0 +1,267 @@
+---
+title: "NAT Traversal & Hole-Punching"
+topic: "DERP & Network Connectivity"
+order: 8
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify that the client uses STUN discovery and UDP hole-punching to establish direct peer connections through NAT devices."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+NAT traversal is the process by which two peers behind different NAT devices establish a direct UDP connection without a relay. QuickZTNA's approach:
+
+1. **STUN Discovery** — Each client sends a STUN request (UDP 3478) to discover its public IP:port mapping
+2. **Endpoint Exchange** — Public endpoints are shared via the control plane (`POST /api/derp-relay` action `discover`)
+3. **Hole-Punching** — Both peers send UDP packets to each other's discovered endpoints simultaneously
+4. **Path Selection** — `pkg/pathselector/selector.go` evaluates: attempt direct UDP → wait 3s → if handshake fails after 3 attempts → fall back to DERP relay
+
+Win-A (India/NAT) and Win-B (Europe/NAT) are behind NAT. Linux-C has a public IP — it always reaches direct.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Initiating peer (behind NAT) |
+| <MachineRef name="Win-B" /> | Responding peer (behind NAT) |
+| <MachineRef name="Linux-C" /> | Reference peer (public IP — always direct) |
+
+---
+
+## ST1 — Verify STUN Discovery Works
+
+**What it verifies:** `ztna netcheck` uses STUN to discover the machine's public IP and port, which is the first step in NAT traversal.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna netcheck
+```
+
+**Expected output:**
+```
+Running network diagnostics...
+
+Report
+======
+UDP:              true
+IPv4:             yes, 203.198.x.x:41641
+IPv6:             no
+Nearest DERP:     blr1 (Bangalore)
+STUN:             ok (derp-blr1.quickztna.com:3478)
+```
+
+2. Note the `IPv4` line — it shows your NAT-mapped public IP and port. This is the endpoint that peers will try to reach.
+
+3. For the full JSON report:
+```powershell
+ztna netcheck --json
+```
+
+**Expected JSON:**
+```json
+{
+  "udp": true,
+  "ipv4": "203.198.x.x:41641",
+  "nearest_derp": "blr1 (Bangalore)",
+  "stun_status": "ok",
+  "public_ip": "203.198.x.x",
+  "public_port": 41641
+}
+```
+
+**Pass:** `UDP: true` and `STUN: ok`. A public IP:port is discovered.
+
+**Fail / Common issues:**
+- `UDP: false` and `STUN: failed` — your network blocks outbound UDP entirely. All traffic will go via DERP relay (WebSocket over port 443). This is not a bug — it's a network restriction.
+- `IPv4: no` — STUN couldn't discover an IPv4 endpoint. The client will still work via DERP.
+
+---
+
+## ST2 — Detect Direct vs Relay Path Between Peers
+
+**What it verifies:** The `ztna peers` command shows whether each peer is reached via direct UDP or via DERP relay.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, list all peers:
+```powershell
+ztna peers
+```
+
+**Expected output:**
+```
+Machine: Win-A (100.64.0.1)
+Connection strategy: stun -> direct -> relay
+
+NAME                 TAILNET IP       DERP REGION  DIRECT?  ROUTES                   ENDPOINT
+Win-B                100.64.0.2       lon1         relay    —                        [DERP]
+Linux-C              100.64.0.3       blr1         direct   —                        178.62.x.x:41641
+```
+
+2. For detailed NAT traversal info on a specific peer:
+```powershell
+ztna peers Win-B
+```
+
+**Expected single-peer output:**
+```
+Name:           Win-B
+Tailnet IP:     100.64.0.2
+Public Key:     xYz123...
+Endpoint:       [DERP]
+DERP Region:    lon1
+Reachable:      true
+Needs Relay:    true
+```
+
+Or if direct path is established:
+```
+Needs Relay:    false
+Direct EP:      86.12.x.x:41641
+```
+
+**Pass:** `Connection strategy: stun -> direct -> relay` shows the client's path selection order. Linux-C shows `direct`, Win-B may show `relay` (both behind NAT).
+
+---
+
+## ST3 — Observe Hole-Punch Upgrade via Ping
+
+**What it verifies:** When pinging a peer, the path may upgrade from relay to direct during the session.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, restart VPN to reset connection state:
+```powershell
+ztna down
+ztna up
+```
+
+2. Immediately start pinging Linux-C (which has a public IP):
+```powershell
+ztna ping 100.64.0.3 --count 20
+```
+
+3. Observe the path type in parentheses after each probe:
+
+**Expected output:**
+```
+PING 100.64.0.3
+  probe 1: 65ms (relayed)
+  probe 2: 62ms (relayed)
+  probe 3: 63ms (relayed)
+  probe 4: 18ms (direct)
+  probe 5: 17ms (direct)
+  ...
+  probe 20: 17ms (direct)
+
+20/20 probes succeeded, avg latency: 28ms (via tunnel)
+```
+
+**Pass:** Path transitions from `(relayed)` to `(direct)` during the ping sequence. Latency drops significantly when direct path is established.
+
+**Fail / Common issues:**
+- All probes show `(tunnel)` — the path type label depends on the IPC service. If `ztna up` is running as a service, path type may show as `tunnel` (which includes both direct and relayed). Check `ztna peers` after pinging to see if DIRECT? changed.
+- Stays `(relayed)` for all 20 probes to Linux-C — UDP 41641 may be blocked. Check Linux-C's firewall.
+
+---
+
+## ST4 — NAT-to-NAT Peer (Win-A ↔ Win-B)
+
+**What it verifies:** Whether direct hole-punching succeeds between two NATted peers (hardest case).
+
+**Steps:**
+1. Ensure both are online:
+```powershell
+# On Win-A:
+ztna status
+# On Win-B:
+ztna status
+```
+
+2. On <MachineRef name="Win-A" />, ping Win-B:
+```powershell
+ztna ping 100.64.0.2 --count 10
+```
+
+3. Check path:
+```powershell
+ztna peers Win-B
+```
+
+**Expected outcomes (either is valid):**
+
+**Outcome A — Direct hole-punch succeeded:**
+```
+Name:           Win-B
+Tailnet IP:     100.64.0.2
+Reachable:      true
+Needs Relay:    false
+Direct EP:      86.12.x.x:41641
+```
+Ping latency: 30-80ms (varies by geography).
+
+**Outcome B — Direct failed, relay is used:**
+```
+Name:           Win-B
+Tailnet IP:     100.64.0.2
+Reachable:      true
+Needs Relay:    true
+```
+Ping latency: 100-300ms (DERP relay adds latency).
+
+**Pass:** Win-B is reachable (pings succeed). Whether direct or relayed, the connection works. Document which outcome you got — it depends on NAT type.
+
+**Fail / Common issues:**
+- All probes `unreachable` — check that Win-B has `ztna up` running. Also check `ztna peers` to see if Win-B appears at all.
+- NAT-to-NAT direct connection is harder than NAT-to-public. Symmetric NAT on either side prevents hole-punching entirely. DERP relay is the correct and expected fallback.
+
+---
+
+## ST5 — Connection Strategy Verification
+
+**What it verifies:** The client follows the `stun -> direct -> relay` strategy and the state machine transitions are correct.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, check the connection strategy:
+```powershell
+ztna peers
+```
+The first line after the machine info shows `Connection strategy:`.
+
+2. Verify by checking the DERP debug output before and after connection:
+```powershell
+ztna debug derp
+```
+
+3. Cross-reference with `ztna netcheck` to confirm STUN works:
+```powershell
+ztna netcheck
+```
+
+**Expected strategy line:**
+```
+Connection strategy: stun -> direct -> relay
+```
+
+This means the client:
+1. First performs STUN discovery (discover public endpoint)
+2. Then attempts direct UDP to peer's discovered endpoint (3 attempts, 3s timeout each)
+3. Falls back to DERP relay if direct fails
+
+**Pass:** Connection strategy is `stun -> direct -> relay`. STUN shows `ok` in netcheck. Direct paths form to peers with public IPs.
+
+**Fail / Common issues:**
+- Strategy shows only `relay` — STUN may have failed entirely. Check `ztna netcheck` for `STUN: failed`.
+- Strategy shows `direct` only — you may be on a network with public IPs (e.g., a cloud VM). No relay is needed.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | STUN discovery | `ztna netcheck` shows `UDP: true`, `STUN: ok`, public IP |
+| ST2 | Path type detection | `ztna peers` shows direct/relay per peer |
+| ST3 | Hole-punch upgrade | Ping path transitions from `relayed` to `direct` |
+| ST4 | NAT-to-NAT connectivity | Win-B reachable (direct or relay — both valid) |
+| ST5 | Connection strategy | `stun -> direct -> relay` order confirmed |

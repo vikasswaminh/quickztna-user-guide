@@ -1,0 +1,245 @@
+---
+title: "Direct P2P Connection Verification"
+topic: "DERP & Network Connectivity"
+order: 9
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Confirm direct peer-to-peer WireGuard connections are active, measure their performance vs relay, and verify they bypass DERP entirely."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+A direct P2P connection means WireGuard packets travel from one peer to another over UDP without passing through any DERP relay. This gives the best performance: lowest latency, highest throughput, and zero dependency on relay infrastructure.
+
+From `pkg/pathselector/selector.go`, the path types are:
+- `PathDirect` (string: `"direct"`) — Direct UDP P2P
+- `PathDERP` (string: `"derp"`) — DERP relay
+- `PathNone` (string: `"none"`) — No path established
+
+The IPC ping result (`pkg/ipc/protocol.go`) reports path as `"direct"` or `"relayed"`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Client — initiates connections |
+| <MachineRef name="Linux-C" /> | Server — public IP, should always go direct |
+| <MachineRef name="Win-B" /> | NAT peer — may stay relayed |
+
+---
+
+## ST1 — Confirm Direct Path via Peer Table
+
+**What it verifies:** At least one peer has an active direct UDP path.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, list peers:
+```powershell
+ztna peers
+```
+
+**Expected output:**
+```
+Machine: Win-A (100.64.0.1)
+Connection strategy: stun -> direct -> relay
+
+NAME                 TAILNET IP       DERP REGION  DIRECT?  ROUTES                   ENDPOINT
+Win-B                100.64.0.2       lon1         relay    —                        [DERP]
+Linux-C              100.64.0.3       blr1         direct   —                        178.62.x.x:41641
+```
+
+2. For detailed info on the direct peer:
+```powershell
+ztna peers Linux-C
+```
+
+**Expected single-peer output:**
+```
+Name:           Linux-C
+Tailnet IP:     100.64.0.3
+Public Key:     abc123...
+Endpoint:       178.62.x.x:41641
+DERP Region:    blr1
+Reachable:      true
+Needs Relay:    false
+Direct EP:      178.62.x.x:41641
+```
+
+**Pass:** `DIRECT?` column shows `direct` for Linux-C. `ENDPOINT` shows a real public IP:port (not `[DERP]`). `Needs Relay: false` in detail view.
+
+**Fail / Common issues:**
+- Linux-C shows `relay` — UDP 41641 may be blocked. On Linux-C:
+  ```bash
+  sudo ufw allow 41641/udp
+  ```
+- `Endpoint: [DERP]` — wait 60 seconds for the path selector to attempt direct (retry interval is 60s).
+
+---
+
+## ST2 — Measure Direct Path Latency vs Relay
+
+**What it verifies:** Direct P2P latency is significantly lower than DERP relay latency.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ping Linux-C (which should be direct):
+```powershell
+ztna ping 100.64.0.3 --count 10
+```
+
+2. Now ping Win-B (which is likely relayed via DERP):
+```powershell
+ztna ping 100.64.0.2 --count 10
+```
+
+3. Compare the average latencies from the summary lines.
+
+**Expected output (direct to Linux-C):**
+```
+PING 100.64.0.3
+  probe 1: 18ms (direct)
+  probe 2: 17ms (direct)
+  ...
+10/10 probes succeeded, avg latency: 17ms (via tunnel)
+```
+
+**Expected output (relayed to Win-B):**
+```
+PING 100.64.0.2
+  probe 1: 145ms (relayed)
+  probe 2: 142ms (relayed)
+  ...
+10/10 probes succeeded, avg latency: 143ms (via tunnel)
+```
+
+**Pass:** Direct path latency is at least 30% lower than relay latency. Document both numbers as your baseline.
+
+**Fail / Common issues:**
+- Both show similar latency — if Linux-C is also going via relay, check `ztna peers` to confirm path type.
+- Path labels show `(tunnel)` instead of `(direct)/(relayed)` — this happens when the IPC service doesn't differentiate. Check `ztna peers` for the authoritative path type.
+
+---
+
+## ST3 — iperf3 Throughput on Direct Path
+
+**What it verifies:** Direct P2P throughput approaches the underlying network capacity.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, install and start iperf3:
+```bash
+sudo apt install iperf3 -y
+iperf3 -s
+```
+
+2. On <MachineRef name="Win-A" />, download iperf3 from https://iperf.fr/iperf-download.php, then run using Linux-C's **Tailnet IP**:
+```powershell
+iperf3.exe -c 100.64.0.3 -t 10 -P 4
+```
+
+**Expected output:**
+```
+[ ID] Interval       Transfer     Bitrate
+[SUM] 0.00-10.00 sec  112 MBytes  94.2 Mbits/sec  sender
+[SUM] 0.00-10.00 sec  111 MBytes  93.4 Mbits/sec  receiver
+```
+
+**Pass:** Throughput is reasonable for your internet connection (typically >50 Mbps on broadband). The WireGuard overhead is minimal (~5-10%).
+
+**Fail / Common issues:**
+- Very low throughput (under 5 Mbps) — check if path is actually direct. If relayed, DERP bandwidth is the bottleneck.
+- `iperf3: error - unable to connect` — iperf3 uses TCP port 5201. Allow it on Linux-C:
+  ```bash
+  sudo ufw allow 5201/tcp
+  ```
+- `ztna up` must be running on both machines for Tailnet IPs to route.
+
+**Cleanup:** Stop iperf3 server on Linux-C with Ctrl+C.
+
+---
+
+## ST4 — Direct Path Survives Network Interruption
+
+**What it verifies:** After a brief network blip, the direct P2P path re-establishes automatically.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, start a long ping to Linux-C:
+```powershell
+ztna ping 100.64.0.3 --count 30
+```
+
+2. While pings are running, disconnect Win-A from Wi-Fi for 5 seconds, then reconnect.
+
+3. Observe the ping output.
+
+**Expected output:**
+```
+  probe 1: 18ms (direct)
+  probe 2: 17ms (direct)
+  probe 3: 18ms (direct)
+  probe 4: timeout (3s)
+  probe 5: timeout (3s)
+  probe 6: 65ms (relayed)      ← briefly via relay while re-establishing
+  probe 7: 18ms (direct)       ← back to direct
+  ...
+```
+
+**Pass:** Pings resume within 30 seconds of reconnecting. Path eventually returns to direct.
+
+**Fail / Common issues:**
+- Pings never resume — run `ztna down && ztna up` to force reconnection.
+- Stays on `relayed` after recovery — the path selector retries direct every 60 seconds. Wait and check `ztna peers` again.
+
+---
+
+## ST5 — Verify No DERP Traffic During Direct Session
+
+**What it verifies:** Once a direct path is established, no data traffic passes through DERP.
+
+**Steps:**
+1. First confirm the path to Linux-C is direct:
+```powershell
+ztna peers
+# Linux-C should show: DIRECT? = direct
+```
+
+2. On <MachineRef name="Linux-C" />, capture traffic to/from all DERP IPs:
+```bash
+sudo tcpdump -i eth0 -n host 139.59.26.108 or host 142.93.7.116 or host 142.93.39.6 or host 137.184.190.98 -c 20 -w /tmp/derp-check.pcap &
+```
+
+3. On <MachineRef name="Win-A" />, generate traffic to Linux-C:
+```powershell
+ztna ping 100.64.0.3 --count 10
+```
+
+4. On <MachineRef name="Linux-C" />, check the capture:
+```bash
+# Wait a few seconds, then:
+kill %1
+tcpdump -r /tmp/derp-check.pcap -n 2>/dev/null | wc -l
+```
+
+**Expected output:**
+```
+0
+```
+Zero packets to any DERP IP during an established direct-path session.
+
+**Pass:** No DERP server IPs appear in the capture. All traffic went peer-to-peer.
+
+**Fail / Common issues:**
+- A few DERP packets appear — background keepalive or control-plane updates may use DERP even during a direct data session. Small numbers (1-3 packets) are normal. Large volumes indicate the data path is still relayed — check `ztna peers` again.
+
+**Cleanup:** `rm /tmp/derp-check.pcap`
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Direct path active | `DIRECT? = direct` in `ztna peers` for Linux-C |
+| ST2 | Direct is faster | Direct latency at least 30% lower than relay |
+| ST3 | Full throughput | >50 Mbps via iperf3 over direct tunnel |
+| ST4 | Survives network blip | Pings resume and return to direct after disconnect |
+| ST5 | No DERP data traffic | Zero DERP packets during direct session |

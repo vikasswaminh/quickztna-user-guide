@@ -85,23 +85,23 @@ ztna peers
 
 **Expected output on Win-A:**
 ```
-Peer             IP            Status    Relay           Direct
-Win-B            100.64.0.2    online    blr1.derp...    false
-Linux-C          100.64.0.3    online    blr1.derp...    false
+NAME                 TAILNET IP      DERP REGION  DIRECT?  ROUTES  ENDPOINT
+Win-B                100.64.0.2      lon1         relay    —       [DERP]
+Linux-C              100.64.0.3      blr1         relay    —       [DERP]
 ```
 
 **Expected output on Linux-C:**
 ```
-Peer             IP            Status    Relay           Direct
-Win-A            100.64.0.1    online    blr1.derp...    false
-Win-B            100.64.0.2    online    blr1.derp...    false
+NAME                 TAILNET IP      DERP REGION  DIRECT?  ROUTES  ENDPOINT
+Win-A                100.64.0.1      blr1         relay    —       [DERP]
+Win-B                100.64.0.2      lon1         relay    —       [DERP]
 ```
 
 **Pass:** Both machines' peer tables show all other enrolled machines as `online`.
 
 **Fail / Common issues:**
 - A peer shows as `offline` → check if that machine has `ztna up` running
-- A peer is missing entirely → check if it's enrolled in the same org; run `ztna orgs` to confirm
+- A peer is missing entirely → check if it's enrolled in the same org; run `ztna switch --list` to confirm
 - Peer count is 0 → org may have only 1 machine; verify all 3 are enrolled
 
 ---
@@ -174,18 +174,26 @@ ztna ping 100.64.0.2 --count 5
 
 **Expected output:**
 ```
-PING 100.64.0.2 via WireGuard
-5 packets transmitted, 5 received, 0% packet loss
-rtt min/avg/max = 45.2/52.1/58.4 ms
+PING Win-B (100.64.0.2)
+  probe 1: 52ms (tunnel)
+  probe 2: 48ms (tunnel)
+  probe 3: 55ms (tunnel)
+  probe 4: 51ms (tunnel)
+  probe 5: 49ms (tunnel)
+5/5 probes succeeded, avg latency: 51ms (via tunnel)
 
-PING 100.64.0.3 via WireGuard
-5 packets transmitted, 5 received, 0% packet loss
-rtt min/avg/max = 12.1/14.8/17.2 ms
+PING Linux-C (100.64.0.3)
+  probe 1: 14ms (tunnel)
+  probe 2: 15ms (tunnel)
+  probe 3: 13ms (tunnel)
+  probe 4: 16ms (tunnel)
+  probe 5: 14ms (tunnel)
+5/5 probes succeeded, avg latency: 14ms (via tunnel)
 ```
 
 Latency will vary by distance and whether traffic is relayed or direct.
 
-**Pass:** 0% packet loss to all peers. Response times are reasonable (< 300ms for relay, < 50ms for same-region).
+**Pass:** 0% packet loss to all peers. Response times are reasonable (under 300ms for relay, under 50ms for same-region).
 
 **Fail / Common issues:**
 - 100% packet loss → check `ztna up` is running on the target machine
@@ -217,13 +225,15 @@ ztna peers
 **Expected output:**
 ```
 # Initial state (DERP relay):
-Linux-C   100.64.0.3   online   blr1.derp...   direct=false
+NAME                 TAILNET IP      DERP REGION  DIRECT?  ROUTES  ENDPOINT
+Linux-C              100.64.0.3      blr1         relay    —       [DERP]
 
 # After NAT hole-punch succeeds:
-Linux-C   100.64.0.3   online                  direct=true
+NAME                 TAILNET IP      DERP REGION  DIRECT?  ROUTES  ENDPOINT
+Linux-C              100.64.0.3      blr1         direct   —       178.62.x.x:41641
 ```
 
-**Pass:** `direct=true` for Linux-C (which has a public IP). Win-A ↔ Linux-C is direct P2P, Win-A ↔ Win-B is via DERP (both behind NAT).
+**Pass:** DIRECT? column shows `direct` for Linux-C and ENDPOINT shows a public IP:port. Win-A ↔ Win-B stays `relay` (both behind NAT).
 
 **Fail / Common issues:**
 - Direct never establishes → some NAT types block incoming UDP even when the other side has a public IP; DERP relay is the correct fallback

@@ -1,0 +1,242 @@
+---
+title: "MFA (TOTP) Setup & Enforcement"
+topic: "Authentication & Account Security"
+order: 14
+machines: ["Win-A"]
+summary: "Verify TOTP-based multi-factor authentication — setup, verification, login enforcement, backup codes, and disable flow."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA supports TOTP (Time-based One-Time Password) MFA via `handlers/auth.ts`. The flow:
+
+1. **Setup**: `POST /api/auth/mfa/setup` — generates a TOTP secret and returns a `otpauth://` URI (for scanning with an authenticator app)
+2. **Verify**: `POST /api/auth/mfa/verify` with the 6-digit TOTP code — enables MFA and returns 10 backup codes
+3. **Login enforcement**: `POST /api/auth/login` returns `MFA_REQUIRED` (HTTP 403) if MFA is enabled but no `totp_code` provided
+4. **Disable**: `POST /api/auth/mfa/disable` with current password + TOTP code — removes MFA
+
+Database fields: `user_credentials.totp_enabled`, `totp_secret`, `totp_backup_codes`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + API testing |
+
+You need an authenticator app (Google Authenticator, Authy, 1Password, etc.) on your phone.
+
+---
+
+## ST1 — MFA Setup (Generate TOTP Secret)
+
+**What it verifies:** The MFA setup endpoint generates a valid TOTP secret and URI.
+
+**Steps:**
+1. Log in to get an access token (use `curl` or the dashboard):
+```bash
+TOKEN=$(curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+```
+
+2. Call the MFA setup endpoint:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/mfa/setup \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "secret": "JBSWY3DPEHPK3PXP...",
+    "uri": "otpauth://totp/QuickZTNA:your@email.com?secret=JBSWY3DPEHPK3PXP...&issuer=QuickZTNA"
+  }
+}
+```
+
+3. Scan the `uri` as a QR code in your authenticator app (or manually enter the `secret`).
+
+**Pass:** Response contains `secret` (base32 string) and `uri` (otpauth:// format). Authenticator app shows a 6-digit code that refreshes every 30 seconds.
+
+**Fail / Common issues:**
+- `MFA_ALREADY_ENABLED` (409) — MFA is already set up. Call `/auth/mfa/disable` first to reset.
+- Token expired — re-login to get a fresh access token.
+
+---
+
+## ST2 — MFA Verify (Enable MFA)
+
+**What it verifies:** Submitting a valid TOTP code enables MFA and returns backup codes.
+
+**Steps:**
+1. Open your authenticator app and note the current 6-digit code.
+2. Verify MFA:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/mfa/verify \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"123456"}' | python3 -m json.tool
+```
+Replace `123456` with the actual code from your authenticator.
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "message": "MFA enabled successfully",
+    "backup_codes": [
+      "a1b2c3d4",
+      "e5f6g7h8",
+      "..."
+    ]
+  }
+}
+```
+
+3. **IMPORTANT:** Save the backup codes securely. They are shown only once.
+
+**Pass:** Response includes `"MFA enabled successfully"` and an array of backup codes (typically 10).
+
+**Fail / Common issues:**
+- `INVALID_CODE` — the TOTP code expired (30-second window). Get a fresh code and retry immediately.
+- `MFA_NOT_SETUP` — you skipped ST1. Call `/auth/mfa/setup` first.
+- `MFA_ALREADY_ENABLED` — MFA was already verified. This is not a failure; it means ST2 was already done.
+
+---
+
+## ST3 — Login With MFA Enforcement
+
+**What it verifies:** After MFA is enabled, login without a TOTP code returns `MFA_REQUIRED`. Login with a valid code succeeds.
+
+**Steps:**
+1. Log out and try to log in **without** TOTP:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}' | python3 -m json.tool
+```
+
+**Expected response (no TOTP code):**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MFA_REQUIRED",
+    "message": "TOTP code required"
+  }
+}
+```
+HTTP status: **403**
+
+2. Now log in **with** TOTP:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD","totp_code":"123456"}' | python3 -m json.tool
+```
+
+**Expected response (with valid TOTP):**
+```json
+{
+  "success": true,
+  "data": {
+    "token": "eyJ...",
+    "refresh_token": "...",
+    "expires_in": 3600
+  }
+}
+```
+
+**Pass:** Login without TOTP returns 403 `MFA_REQUIRED`. Login with valid TOTP returns 200 with tokens.
+
+---
+
+## ST4 — Backup Code Login
+
+**What it verifies:** A backup code can be used instead of a TOTP code for login.
+
+**Steps:**
+1. Take one of the backup codes from ST2.
+2. Log in using the backup code in the `totp_code` field:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD","totp_code":"a1b2c3d4"}' | python3 -m json.tool
+```
+
+**Expected response:** Login succeeds (200 with tokens).
+
+3. Try the **same** backup code again:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD","totp_code":"a1b2c3d4"}' | python3 -m json.tool
+```
+
+**Expected response:** Login fails (backup code was consumed on first use).
+
+**Pass:** Backup code works once, then is rejected on reuse. The backend removes used codes from the `totp_backup_codes` array.
+
+**Fail / Common issues:**
+- Backup code rejected on first use — it may have already been used in a previous test. Try a different one.
+- Backup code works twice — security bug. Report immediately.
+
+---
+
+## ST5 — Disable MFA
+
+**What it verifies:** MFA can be disabled with current password and TOTP code.
+
+**Steps:**
+1. Get a fresh token (log in with TOTP from ST3).
+2. Disable MFA:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/mfa/disable \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"password":"YOUR_PASSWORD","code":"123456"}' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "message": "MFA disabled successfully"
+  }
+}
+```
+
+3. Verify MFA is disabled by logging in without TOTP:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}' | python3 -m json.tool
+```
+
+**Expected:** Login succeeds without `totp_code` — MFA is no longer required.
+
+**Pass:** MFA disabled. Login works without TOTP code.
+
+**Fail / Common issues:**
+- `MFA_NOT_ENABLED` — MFA was already disabled or never enabled.
+- `INVALID_PASSWORD` — the password in the disable request must match the current password.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | MFA setup | TOTP secret and otpauth URI returned |
+| ST2 | MFA verify | MFA enabled, backup codes returned |
+| ST3 | MFA enforcement | Login without TOTP → 403, with TOTP → 200 |
+| ST4 | Backup codes | One-time use, consumed after login |
+| ST5 | MFA disable | Disabled with password + code, login works without MFA |

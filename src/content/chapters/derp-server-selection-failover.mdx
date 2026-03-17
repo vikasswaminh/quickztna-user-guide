@@ -1,0 +1,259 @@
+---
+title: "DERP Server Selection & Failover"
+topic: "DERP & Network Connectivity"
+order: 7
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify that the client selects the nearest DERP region and handles DERP server unavailability gracefully."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA clients are assigned a DERP region by the control plane based on STUN discovery (the client's public IP is mapped to the nearest DERP). The client connects to that DERP over WebSocket (port 443). If the assigned DERP becomes unreachable, the client's state machine transitions: `DIRECT_CONNECT → RELAY_FALLBACK → MONITOR`, and it attempts reconnection with exponential backoff.
+
+Key source-of-truth values from the client code (`pkg/pathselector/selector.go`):
+- Direct connect timeout: **3 seconds**
+- Direct retry interval: **60 seconds**
+- Max direct attempts before relay fallback: **3**
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Primary test client — block DERP to test failover |
+| <MachineRef name="Win-B" /> | Peer — monitor connectivity during failover |
+| <MachineRef name="Linux-C" /> | Ping target to detect connectivity status |
+
+---
+
+## ST1 — Confirm Nearest DERP Assignment
+
+**What it verifies:** The control plane assigns each machine to its geographically nearest DERP region.
+
+**Steps:**
+1. On <MachineRef name="Win-A" /> (India):
+```powershell
+ztna status
+```
+Note the `DERP Region:` value.
+
+2. On <MachineRef name="Win-B" /> (Europe):
+```powershell
+ztna status
+```
+Note the `DERP Region:` value.
+
+3. Run `ztna netcheck` on both to see the nearest DERP assignment:
+```powershell
+ztna netcheck
+```
+
+**Expected output on Win-A:**
+```
+Running network diagnostics...
+
+Report
+======
+UDP:              true
+IPv4:             yes, 203.x.x.x:41641
+IPv6:             no
+Nearest DERP:     blr1 (Bangalore)
+STUN:             ok (derp-blr1.quickztna.com:3478)
+```
+
+**Expected output on Win-B:**
+```
+Nearest DERP:     lon1 (London)
+STUN:             ok (derp-lon1.quickztna.com:3478)
+```
+
+**Pass:** Win-A shows `blr1` (nearest to India), Win-B shows `lon1` (nearest to Europe). Both match the `DERP Region:` from `ztna status`.
+
+**Fail / Common issues:**
+- `Nearest DERP:` is blank — STUN discovery may have failed. Check if `STUN:` shows an error.
+- Unexpected region (e.g., Win-A gets `sfo3`) — your ISP may route through a different exit point. This is network-dependent, not a bug.
+
+---
+
+## ST2 — Simulate DERP Region Failure (Windows Firewall Block)
+
+**What it verifies:** When the assigned DERP server is blocked, the client detects the failure. Existing direct connections remain unaffected.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, note the current DERP region and its IP (e.g., blr1 = 139.59.26.108):
+```powershell
+ztna status
+ztna debug derp
+```
+
+2. Open **Windows Defender Firewall with Advanced Security** → **Outbound Rules** → **New Rule**:
+   - Type: Custom
+   - Protocol: TCP, remote port 443
+   - Remote IP: `139.59.26.108` (blr1 IP)
+   - Action: Block
+   - Name: `block-derp-blr1-test`
+
+3. Wait 15 seconds, then check DERP status:
+```powershell
+ztna debug derp
+```
+
+4. Test if direct connections still work (Linux-C has public IP):
+```powershell
+ztna ping 100.64.x.x --count 5
+```
+
+**Expected output from `ztna debug derp` after blocking:**
+```
+DERP Server:  wss://derp-blr1.quickztna.com
+STUN Server:  derp-blr1.quickztna.com:3478
+Status:       error (connection refused)
+Peers:        0
+```
+
+**Expected ping to Linux-C (direct path):**
+```
+PING 100.64.0.3
+  probe 1: 18ms (direct)
+  probe 2: 17ms (direct)
+  ...
+5/5 probes succeeded, avg latency: 17ms (via tunnel)
+```
+
+**Pass:** Direct connections to peers with public IPs continue working even when DERP is blocked. `ztna debug derp` shows an error state for the DERP connection.
+
+**Fail / Common issues:**
+- Ping to Linux-C also fails — you may have accidentally blocked its IP too. Check the firewall rule only targets the DERP IP.
+- `ztna debug derp` still shows `connected` — the WebSocket may maintain an existing connection. Wait 60 seconds for the keepalive timeout.
+
+**Cleanup:** Delete the `block-derp-blr1-test` firewall rule after the test.
+
+---
+
+## ST3 — Relay Path Becomes Direct Over Time
+
+**What it verifies:** The client starts with DERP relay and upgrades to direct P2P when possible (retry interval: 60 seconds per `pathselector.DirectRetryInterval`).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, restart the VPN to reset all connection state:
+```powershell
+ztna down
+ztna up
+```
+
+2. Immediately check the peer table:
+```powershell
+ztna peers
+```
+Linux-C (public IP) may initially show `relay` in DIRECT? column.
+
+3. Wait 60 seconds, then ping and re-check:
+```powershell
+ztna ping 100.64.x.x --count 5
+ztna peers
+```
+
+**Expected progression:**
+```
+# Immediately after ztna up:
+Linux-C   100.64.0.3   blr1   relay   —   [DERP]
+
+# After 60 seconds + traffic:
+Linux-C   100.64.0.3   blr1   direct  —   178.62.x.x:41641
+```
+
+**Pass:** Linux-C upgrades from `relay` to `direct` within 60 seconds. ENDPOINT changes from `[DERP]` to a real IP:port.
+
+**Fail / Common issues:**
+- Stays `relay` indefinitely — UDP 41641 may be blocked between Win-A and Linux-C. Check cloud security groups on Linux-C:
+  ```bash
+  sudo ufw allow 41641/udp
+  ```
+
+---
+
+## ST4 — All DERP Regions Blocked (Total Relay Failure)
+
+**What it verifies:** When all DERP regions are blocked and no direct path exists (both peers behind NAT), the client reports peer as unreachable.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, add Windows Firewall outbound block rules for all 4 DERP IPs (port 443 TCP):
+   - `139.59.26.108` (blr1)
+   - `142.93.7.116` (nyc1)
+   - `142.93.39.6` (lon1)
+   - `137.184.190.98` (sfo3)
+
+2. Also block UDP 41641 outbound (blocks direct WireGuard):
+   - New Outbound Rule → Port → UDP 41641 → Block
+
+3. Wait 30 seconds, then try to ping Win-B (which is also behind NAT — no direct path available):
+```powershell
+ztna ping 100.64.0.2 --count 3
+```
+
+**Expected output:**
+```
+PING 100.64.0.2
+  probe 1: unreachable
+  probe 2: unreachable
+  probe 3: unreachable
+
+0/3 probes succeeded — peer unreachable
+```
+
+**Pass:** Ping fails with `unreachable` or `timeout`. The client does NOT crash or log out — the VPN session stays registered.
+
+4. Verify the machine is still registered:
+```powershell
+ztna status
+```
+`Authenticated: true` should still show.
+
+**Cleanup:** Remove all 5 firewall rules after the test. Run `ztna status` to confirm connectivity restores.
+
+---
+
+## ST5 — DERP Health Endpoint (Backend API)
+
+**What it verifies:** The DERP health API endpoint returns the status of all DERP servers, confirming the backend's view of relay infrastructure.
+
+**Steps:**
+1. From any machine with `curl`:
+```bash
+curl -s https://login.quickztna.com/api/derp-health | python3 -m json.tool
+```
+
+**Expected output:**
+```json
+{
+  "status": "ok",
+  "regions": [
+    {"code": "blr1", "name": "Bangalore", "healthy": true},
+    {"code": "nyc1", "name": "New York", "healthy": true},
+    {"code": "lon1", "name": "London", "healthy": true},
+    {"code": "sfo3", "name": "San Francisco", "healthy": true}
+  ]
+}
+```
+
+**Pass:** All 4 regions show `healthy: true`. Response returns HTTP 200.
+
+**Fail / Common issues:**
+- HTTP 404 — the `/api/derp-health` endpoint may not be exposed publicly. Try from the server directly:
+  ```bash
+  ssh root@172.99.189.211 "curl -s http://localhost:3000/api/derp-health"
+  ```
+- One region shows `healthy: false` — the DERP droplet for that region may be down. Check its IP with `ping`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Nearest DERP assignment | `ztna netcheck` shows nearest region matching geography |
+| ST2 | DERP block doesn't kill direct paths | Direct pings continue when DERP is blocked |
+| ST3 | Relay upgrades to direct | Peer transitions from `relay` to `direct` in `ztna peers` |
+| ST4 | Total relay failure handling | Ping reports unreachable, session stays authenticated |
+| ST5 | Backend DERP health API | All 4 regions report healthy |

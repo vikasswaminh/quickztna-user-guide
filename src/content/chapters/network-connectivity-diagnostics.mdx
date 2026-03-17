@@ -1,0 +1,281 @@
+---
+title: "Network Connectivity Diagnostics"
+topic: "DERP & Network Connectivity"
+order: 10
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Use ztna netcheck, ztna debug, and ztna bugreport to diagnose connectivity issues, verify STUN reachability, and collect diagnostic bundles for support."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA provides three diagnostic tools:
+
+- **`ztna netcheck`** — Probes the network: UDP reachability, STUN status, nearest DERP region, and public IP detection.
+- **`ztna debug`** — Three subcommands: `derp` (relay status), `metrics` (system info), `goroutines` (thread dump).
+- **`ztna bugreport`** — Generates a sanitized ZIP bundle with config, state, logs, and system info. Private keys and tokens are excluded.
+
+These commands are your first stop when diagnosing connectivity problems.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Primary diagnostics target (NAT environment) |
+| <MachineRef name="Linux-C" /> | Cloud machine diagnostics (public IP environment) |
+
+---
+
+## ST1 — Run netcheck and Interpret Output
+
+**What it verifies:** `ztna netcheck` returns a complete network report with UDP status, STUN, and nearest DERP.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna netcheck
+```
+
+**Expected output:**
+```
+Running network diagnostics...
+
+Report
+======
+UDP:              true
+IPv4:             yes, 203.198.x.x:41641
+IPv6:             no
+Nearest DERP:     blr1 (Bangalore)
+STUN:             ok (derp-blr1.quickztna.com:3478)
+```
+
+**What each field means:**
+| Field | Meaning |
+|-------|---------|
+| `UDP` | Can the machine send/receive UDP? Required for direct WireGuard |
+| `IPv4` | STUN-discovered public IP and port (NAT-mapped) |
+| `IPv6` | IPv6 endpoint if available |
+| `Nearest DERP` | Closest relay region (used for fallback) |
+| `STUN` | STUN server status and which server was used |
+
+**Pass:** `UDP: true` and `STUN: ok`. A public IP:port is reported.
+
+**Fail / Common issues:**
+- `UDP: false`, `STUN: failed` — network blocks outbound UDP. Client will work via DERP relay only (WebSocket over HTTPS 443).
+- `Nearest DERP:` blank — STUN failed so the client couldn't determine location. DERP assignment may use fallback logic.
+
+---
+
+## ST2 — Compare netcheck Across Machines
+
+**What it verifies:** Different network environments produce different netcheck results, confirming the tool measures real conditions.
+
+**Steps:**
+1. Run `ztna netcheck --json` on all three machines:
+
+On <MachineRef name="Win-A" />:
+```powershell
+ztna netcheck --json
+```
+
+On <MachineRef name="Win-B" />:
+```powershell
+ztna netcheck --json
+```
+
+On <MachineRef name="Linux-C" />:
+```bash
+ztna netcheck --json
+```
+
+2. Compare the JSON output:
+
+**Expected comparison:**
+| Field | Win-A (India) | Win-B (Europe) | Linux-C (Cloud) |
+|-------|--------------|----------------|-----------------|
+| `udp` | `true` | `true` | `true` |
+| `public_ip` | 203.x.x.x | 86.x.x.x | 178.62.x.x |
+| `nearest_derp` | `blr1 (Bangalore)` | `lon1 (London)` | `blr1 (Bangalore)` |
+| `stun_status` | `ok` | `ok` | `ok` |
+
+**Pass:** Each machine reports a different `public_ip`. `nearest_derp` matches geographic location. All show `stun_status: ok`.
+
+---
+
+## ST3 — Debug DERP Connection Status
+
+**What it verifies:** `ztna debug derp` shows the current DERP relay connection and per-peer path type.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna debug derp
+```
+
+**Expected output:**
+```
+DERP Server:  wss://derp-blr1.quickztna.com
+STUN Server:  derp-blr1.quickztna.com:3478
+Status:       connected
+Peers:        2
+  Win-B (100.64.0.2) — relayed
+  Linux-C (100.64.0.3) — direct
+```
+
+2. Also check `ztna debug metrics` for system info:
+```powershell
+ztna debug metrics
+```
+
+**Expected output:**
+```
+Version:     3.2.8
+OS:          windows/amd64
+Go:          go1.22.x
+Goroutines:  12
+DERP Server: wss://derp-blr1.quickztna.com
+STUN Server: derp-blr1.quickztna.com:3478
+DNS Enabled: true
+Userspace:   false
+```
+
+**Pass:** `Status: connected` for DERP. Peers show correct path types (relayed/direct). Metrics show expected version and config.
+
+**Fail / Common issues:**
+- `Status: not authenticated` — run `ztna login` first.
+- `Status: error (connection refused)` — DERP server may be unreachable. Check network connectivity to port 443 of the DERP IP.
+- `Peers: 0` — no peers fetched yet. Run `ztna ping <peer>` to trigger a peer refresh.
+
+---
+
+## ST4 — Generate Bug Report (Sanitized Bundle)
+
+**What it verifies:** `ztna bugreport` produces a ZIP bundle suitable for support — with private keys and tokens redacted.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna bugreport
+```
+
+**Expected output:**
+```
+Generating bug report...
+  + config (sanitized)
+  + state (redacted)
+  + logs (last 200KB)
+  + status
+  + system info
+
+Bug report saved: ztna-bugreport-20260317-140205.zip (12345 bytes)
+```
+
+2. Open the ZIP file and inspect its contents. It should contain:
+   - `config.json` — sanitized (no private keys, no tokens)
+   - `state.json` — redacted sensitive fields show `[REDACTED]`
+   - `ztna.log` — last 200KB of logs
+   - `status.json` — authentication status, machine ID, version
+   - `system.txt` — OS, architecture, Go version, CPU count
+
+3. **Critical security check** — verify no secrets leaked:
+```powershell
+# Extract and search for sensitive strings:
+# On Linux-C (easier with grep):
+unzip -o ztna-bugreport-*.zip -d /tmp/bugreport
+grep -ri "private\|secret\|token\|password" /tmp/bugreport/
+```
+
+**Expected:** Only `[REDACTED]` markers found. No actual private keys or tokens.
+
+4. You can also specify a custom output path:
+```powershell
+ztna bugreport --output C:\temp\my-report.zip
+```
+
+**Pass:** ZIP generated with all 5 files. No private keys, tokens, or passwords in any file. Sensitive fields show `[REDACTED]`.
+
+**Fail / Common issues:**
+- `error loading config` — ztna may not be configured yet. Run `ztna login` first.
+- ZIP is empty (0 bytes) — check disk space and write permissions.
+- Private key found in output — **security issue**. Do not share the file. Report to QuickZTNA team.
+
+**Cleanup:** Delete the bugreport ZIP after review.
+
+---
+
+## ST5 — Diagnose an Unreachable Peer
+
+**What it verifies:** When a peer is offline, the diagnostic tools provide actionable information.
+
+**Steps:**
+1. On <MachineRef name="Win-B" />, stop the VPN:
+```powershell
+ztna down
+```
+
+2. On <MachineRef name="Win-A" />, try to reach Win-B:
+```powershell
+ztna ping 100.64.0.2 --count 3
+```
+
+**Expected output:**
+```
+PING 100.64.0.2
+  probe 1: unreachable
+  probe 2: unreachable
+  probe 3: unreachable
+
+0/3 probes succeeded — peer unreachable
+```
+
+3. Check peers:
+```powershell
+ztna peers
+```
+Win-B should show as offline:
+```
+NAME                 TAILNET IP       DERP REGION  DIRECT?  ROUTES                   ENDPOINT
+Win-B                100.64.0.2       lon1         relay    —                        [DERP]
+```
+(With `Reachable: false` if you use `ztna peers Win-B`)
+
+4. Check DERP debug:
+```powershell
+ztna debug derp
+```
+
+5. Reconnect Win-B:
+```powershell
+# On Win-B:
+ztna up
+```
+
+6. Re-check from Win-A:
+```powershell
+ztna ping 100.64.0.2 --count 3
+```
+
+**Expected after reconnecting:**
+```
+PING 100.64.0.2
+  probe 1: 145ms (relayed)
+  probe 2: 143ms (relayed)
+  probe 3: 142ms (relayed)
+
+3/3 probes succeeded, avg latency: 143ms (via tunnel)
+```
+
+**Pass:** Tools correctly identify unreachable vs reachable state. Ping reports `unreachable` when peer is down and succeeds when peer reconnects.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | netcheck reports network state | `UDP: true`, `STUN: ok`, public IP shown |
+| ST2 | netcheck varies by location | Different public_ip and nearest_derp per machine |
+| ST3 | debug shows DERP + path types | `ztna debug derp` shows connected + per-peer paths |
+| ST4 | bugreport is sanitized | ZIP has no private keys/tokens, sensitive fields redacted |
+| ST5 | Diagnose unreachable peer | Ping shows unreachable, recovers when peer reconnects |

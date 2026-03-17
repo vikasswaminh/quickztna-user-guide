@@ -1,0 +1,189 @@
+---
+title: "GitHub OAuth Flow"
+topic: "Authentication & Account Security"
+order: 12
+machines: ["Win-A"]
+summary: "Verify the GitHub OAuth login flow — both from the dashboard (browser) and from the CLI — including state parameter validation and token exchange."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+GitHub OAuth uses the authorization code flow. The backend (`handlers/github-auth.ts`) implements:
+
+- **Initiate**: `POST /api/auth/github` with `action: "initiate"` — returns a GitHub authorize URL
+- **Callback**: GitHub redirects to `GET /api/auth/github/callback?code=...&state=...` — backend exchanges code for GitHub access token, then issues QuickZTNA JWT pair
+- **CLI flow**: CLI starts a localhost callback server, passes `redirect_uri` to initiate, GitHub redirects back to the CLI's localhost server
+
+GitHub Client ID: `Ov23liPKggYcvMx6cHic` (from the memory file — this is the real OAuth app).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + CLI testing |
+
+You need a GitHub account to test this flow.
+
+---
+
+## ST1 — GitHub Login from Dashboard
+
+**What it verifies:** Clicking "Sign in with GitHub" on the auth page completes the full OAuth flow.
+
+**Steps:**
+1. Open `https://login.quickztna.com/auth` (incognito window).
+2. Click the **GitHub** login button (or "Continue with GitHub").
+3. GitHub's authorization page opens. Authorize the "QuickZTNA" OAuth app.
+4. You are redirected back to `login.quickztna.com`.
+
+**Expected behavior:**
+- GitHub shows: "Authorize QuickZTNA" with permissions listed
+- After authorization: redirected to `/dashboard` (if user has an org) or `/create-org` (if new user)
+- Network tab: `POST /api/auth/github` with `action: "initiate"` → 200 with redirect URL
+- After callback: `POST /api/auth/github` with `action: "callback"` → 200 with tokens
+
+**Pass:** Full redirect cycle works. Dashboard loads with user data. Tokens are stored in local storage.
+
+**Fail / Common issues:**
+- "OAuth error" page — GitHub may have denied the authorization, or the state parameter was tampered with.
+- Redirect loop — the callback URL may not match the GitHub OAuth app's registered callback URL (`https://login.quickztna.com/api/auth/github/callback`).
+
+---
+
+## ST2 — GitHub Login from CLI
+
+**What it verifies:** `ztna login --github` opens a browser, completes OAuth, and delivers tokens back to the CLI.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, log out first:
+```powershell
+ztna logout
+```
+
+2. Start GitHub OAuth login:
+```powershell
+ztna login --github
+```
+
+3. A browser window opens to GitHub. Authorize the app.
+4. The browser shows a "Login successful" page or redirects to localhost.
+5. The CLI shows success.
+
+**Expected CLI output:**
+```
+To authenticate, visit:
+  https://github.com/login/oauth/authorize?client_id=Ov23liPKggYcvMx6cHic&...
+
+Login successful!
+```
+
+6. Verify:
+```powershell
+ztna status
+```
+Should show `Authenticated: true`.
+
+**Pass:** Browser opens, GitHub authorization completes, CLI shows "Login successful!", `ztna status` shows authenticated.
+
+**Fail / Common issues:**
+- "authentication timed out" — the default timeout is 5 minutes. If you took too long on GitHub, retry. You can extend: `ztna login --github --timeout 10m`.
+- "github callback failed" — the state parameter didn't match. This can happen if you have multiple login windows open. Close all and retry with a single window.
+- Browser doesn't open — the CLI uses `pkg/browser` to open the default browser. If it fails, manually copy the URL from the terminal.
+
+---
+
+## ST3 — State Parameter Validation (Anti-CSRF)
+
+**What it verifies:** The OAuth flow uses a random `state` parameter to prevent CSRF attacks. A forged callback without the correct state is rejected.
+
+**Steps:**
+1. Via `curl`, initiate a GitHub OAuth flow:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/github \
+  -H "Content-Type: application/json" \
+  -d '{"action":"initiate"}' | python3 -m json.tool
+```
+
+2. Note the `redirect_url` in the response — it contains a `state=...` parameter.
+
+3. Now try to fake a callback with a wrong state:
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/github \
+  -H "Content-Type: application/json" \
+  -d '{"action":"callback","code":"fake-code","state":"forged-state-value"}' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_STATE",
+    "message": "Invalid or expired state parameter"
+  }
+}
+```
+
+**Pass:** Forged state is rejected with `INVALID_STATE` error. The backend validates state against the stored session.
+
+**Fail / Common issues:**
+- Error is something other than INVALID_STATE — the state validation may have a different error code. Check that the response indicates the state was rejected.
+
+---
+
+## ST4 — New User via GitHub (Account Creation)
+
+**What it verifies:** A GitHub user who hasn't signed up before gets an account automatically created on first OAuth login.
+
+**Steps:**
+1. Use a GitHub account that has **never** logged into QuickZTNA before.
+2. Open `https://login.quickztna.com/auth` → click GitHub login.
+3. Authorize the app.
+
+**Expected behavior:**
+- A new user record is created in the `users` table (using GitHub email)
+- Redirected to `/create-org` (new user has no organization)
+- Dashboard → Profile page shows the GitHub email
+
+**Pass:** New user is created and can proceed to create an org. No manual signup step needed.
+
+**Fail / Common issues:**
+- "Email already in use" — the GitHub account's email matches an existing email/password account. The backend should link them or show a clear error.
+- No email from GitHub — if GitHub email is private, the backend fetches it via the GitHub API using the access token.
+
+---
+
+## ST5 — GitHub Login Audit Trail
+
+**What it verifies:** GitHub OAuth logins are recorded in the audit log.
+
+**Steps:**
+1. Log in via GitHub (from ST1 or ST2).
+2. Open `https://login.quickztna.com/audit-log`.
+3. Filter or search for your recent login.
+
+**Expected audit entry:**
+- Action: `auth.login` (or `auth.github_login`)
+- User: your email
+- Timestamp: matches your login time
+- Additional data: may include `provider: "github"` or `mfa: false`
+
+**Pass:** An audit log entry exists for the GitHub login with the correct timestamp and user.
+
+**Fail / Common issues:**
+- No audit entry — audit logs are stored in Loki (not PostgreSQL). Check that the Loki service is running on the monitoring server (`188.166.155.128`).
+- Entry shows `auth.login` without GitHub context — the backend logs `mfa: false` but may not distinguish OAuth provider in the action name. Check the additional data field.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Dashboard GitHub login | Full OAuth redirect cycle, tokens issued |
+| ST2 | CLI GitHub login | `ztna login --github` opens browser, gets tokens |
+| ST3 | State parameter anti-CSRF | Forged state rejected with INVALID_STATE |
+| ST4 | Auto account creation | New GitHub user gets account without manual signup |
+| ST5 | Audit trail | Login event recorded in audit log |

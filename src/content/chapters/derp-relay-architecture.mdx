@@ -1,0 +1,210 @@
+---
+title: "DERP Relay Architecture"
+topic: "DERP & Network Connectivity"
+order: 6
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Understand and verify how DERP relay servers provide encrypted fallback paths when direct WireGuard UDP tunnels cannot be established."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+DERP (Designated Encrypted Relay for Packets) is QuickZTNA's fallback relay mechanism. When two peers cannot establish a direct WireGuard UDP tunnel (e.g., both are behind strict NAT), traffic is routed through a geographically distributed DERP server over WebSocket (port 443). DERP servers only see encrypted WireGuard packets — they cannot decrypt content.
+
+QuickZTNA runs 4 DERP nodes (hardcoded in the client binary at `pkg/ztna/client.go`):
+
+| Region Code | Location | IP | Hostname | STUN Port | DERP Port |
+|---|---|---|---|---|---|
+| `blr1` | Bangalore | 139.59.26.108 | derp-blr1.quickztna.com | 3478 | 443 |
+| `nyc1` | New York | 142.93.7.116 | derp-nyc1.quickztna.com | 3478 | 443 |
+| `lon1` | London | 142.93.39.6 | derp-lon1.quickztna.com | 3478 | 443 |
+| `sfo3` | San Francisco | 137.184.190.98 | derp-sfo3.quickztna.com | 3478 | 443 |
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Client in India — likely assigned blr1 |
+| <MachineRef name="Win-B" /> | Client in Europe — likely assigned lon1 |
+| <MachineRef name="Linux-C" /> | Cloud peer with public IP |
+
+---
+
+## ST1 — Identify Active DERP Region Per Machine
+
+**What it verifies:** Each enrolled machine reports its assigned DERP region in status output.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna status
+```
+2. Look for the `DERP Region:` line in the output.
+3. Repeat on <MachineRef name="Win-B" />:
+```powershell
+ztna status
+```
+
+**Expected output (Win-A):**
+```
+QuickZTNA Status
+================
+Version:       3.2.8
+Node Key:      bpkM2YWJEhXf...
+Authenticated: true
+API URL:       https://login.quickztna.com/api
+
+Machine ID:    abc123-...
+Machine Name:  Win-A
+Tailnet IP:    100.64.0.1
+Org ID:        db1743d7-...
+OS:            windows
+Mode:          tun
+DERP Region:   blr1
+```
+
+**Pass:** Each machine shows a DERP Region value. Win-A (India) should show `blr1`, Win-B (Europe) should show `lon1`.
+
+**Fail / Common issues:**
+- DERP Region blank — machine is disconnected (`Mode: disconnected`). Run `ztna up` first.
+- DERP Region doesn't match expected geography — the control plane assigns the region based on the nearest DERP to the machine's public IP. If using a VPN or proxy, the assignment may be different.
+
+---
+
+## ST2 — Verify Peer DERP Region in Peer Table
+
+**What it verifies:** The `ztna peers` command shows which DERP region each peer is associated with.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna peers
+```
+2. Read the `DERP REGION` column for each peer.
+
+**Expected output:**
+```
+Machine: Win-A (100.64.0.1)
+Connection strategy: stun -> direct -> relay
+
+NAME                 TAILNET IP       DERP REGION  DIRECT?  ROUTES                   ENDPOINT
+Win-B                100.64.0.2       lon1         relay    —                        [DERP]
+Linux-C              100.64.0.3       blr1         direct   —                        178.62.x.x:41641
+```
+
+**Pass:** Each peer row has a DERP REGION value. Peers behind NAT show `relay` in DIRECT? column; peers with public IPs may show `direct`.
+
+**Fail / Common issues:**
+- All peers show empty DERP REGION — the control plane may not have assigned regions yet. Run `ztna ping <peer-ip>` to force a peer refresh, then re-check.
+
+---
+
+## ST3 — DERP Server IPs Match Known Infrastructure
+
+**What it verifies:** The DERP servers your client uses are QuickZTNA's own servers, not third-party relays.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, get the detailed peer info in JSON:
+```powershell
+ztna peers --json
+```
+2. Look for the `derp_region` and `endpoint` fields for each peer.
+3. Cross-reference against the known IPs:
+
+| Region | Expected IP |
+|--------|-------------|
+| blr1 | 139.59.26.108 |
+| nyc1 | 142.93.7.116 |
+| lon1 | 142.93.39.6 |
+| sfo3 | 137.184.190.98 |
+
+4. You can also verify DERP server configuration via the debug command:
+```powershell
+ztna debug derp
+```
+This shows the DERP Server and STUN Server URLs from your local config.
+
+**Expected output from `ztna debug derp`:**
+```
+DERP Server:  wss://derp-blr1.quickztna.com
+STUN Server:  derp-blr1.quickztna.com:3478
+Status:       connected
+Peers:        2
+  Win-B (100.64.0.2) — relayed
+  Linux-C (100.64.0.3) — direct
+```
+
+**Pass:** DERP Server URL matches a known `derp-*.quickztna.com` hostname. Peer path types (relayed/direct) are shown.
+
+**Fail / Common issues:**
+- `Status: not authenticated` — run `ztna login` first, then `ztna up`.
+- Unknown DERP server URL — check `ztna debug metrics` and verify the `DERP Server` field.
+
+---
+
+## ST4 — Confirm DERP Traffic Is Encrypted
+
+**What it verifies:** Packets relayed through DERP are encrypted WireGuard packets — the relay server cannot inspect content.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, start a packet capture on the physical NIC filtering for DERP server traffic (port 443):
+```bash
+sudo tcpdump -i eth0 -n port 443 -c 20 -w /tmp/derp-capture.pcap
+```
+2. On <MachineRef name="Win-A" />, ping Linux-C to generate traffic:
+```powershell
+ztna ping 100.64.x.x --count 10
+```
+3. On <MachineRef name="Linux-C" />, stop the capture and inspect:
+```bash
+tcpdump -r /tmp/derp-capture.pcap -A -n | head -40
+```
+
+**Expected output:**
+```
+# Packets show TLS/WebSocket traffic to a DERP server IP
+# No plaintext payloads visible — only encrypted data
+14:02:33 IP 178.62.x.x.54321 > 139.59.26.108.443: Flags [.] length 128
+```
+
+**Pass:** Captured packets show HTTPS (port 443) traffic. Payload is binary/encrypted — no readable strings.
+
+**Fail / Common issues:**
+- Packets go directly between machines on UDP 41641 — this means a direct WireGuard connection exists (not DERP). That's actually better performance. To force DERP, temporarily block UDP 41641 outbound.
+- No packets captured — traffic may already be direct. Check `ztna peers` for path type.
+
+**Cleanup:** `rm /tmp/derp-capture.pcap`
+
+---
+
+## ST5 — Dashboard DERP Region Display
+
+**What it verifies:** The QuickZTNA dashboard shows the DERP relay region for each connected machine.
+
+**Steps:**
+1. Open `https://login.quickztna.com` → log in as admin.
+2. Navigate to **Machines** list.
+3. Click on a machine (e.g., Win-A) to open its detail page.
+4. Look for the DERP region or relay information.
+
+**Expected:**
+- Machine detail shows the DERP region assigned to this machine.
+- The **Key Exchanges** page (`/key-exchanges`) may show WireGuard key exchange records with DERP region info.
+
+**Pass:** At least one machine shows a DERP region in the dashboard that matches the CLI output from ST1.
+
+**Fail / Common issues:**
+- No DERP info shown in dashboard — the dashboard may not expose this field in the UI. Use `ztna status` as the authoritative source for DERP region.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Machine knows its DERP | `DERP Region:` line in `ztna status` |
+| ST2 | Peer table shows DERP regions | `DERP REGION` column populated in `ztna peers` |
+| ST3 | DERP servers are QuickZTNA's own | IPs and hostnames match known infrastructure |
+| ST4 | DERP traffic is encrypted | No plaintext in captured relay packets |
+| ST5 | Dashboard shows DERP info | Region visible in machine detail or key exchanges |
