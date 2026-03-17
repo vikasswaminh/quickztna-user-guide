@@ -1,0 +1,276 @@
+---
+title: "Machine Version Badge & Update Check"
+topic: "Machine Management"
+order: 24
+machines: ["Win-A", "Linux-C"]
+summary: "Verify client version reporting, update availability detection, version comparison logic, and the ztna update command flow."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA clients report their version on every heartbeat. The backend compares it against the `client_versions` table and signals when an update is available. The flow:
+
+1. **Version reporting:** Each heartbeat includes the `version` field (e.g., `3.2.8`), stored on the machine record
+2. **Version check API:** `POST /api/client-version` with `action: "check"` — compares current vs latest, returns download URL
+3. **CLI command:** `ztna version` shows the installed version; `ztna update --check` queries the backend for updates
+4. **Heartbeat response:** Includes `update_available: true/false` based on semver comparison
+5. **Dashboard:** Machine detail page shows the version in the Attributes card (`node:clientVersion`)
+
+From `cmd_version.go`:
+- Output: `ztna version {Version} (built {BuildTime}, {GOOS}/{GOARCH})`
+
+From `cmd_update.go`:
+- Flags: `--check` (check only), `--json`, `--yes` (skip prompt)
+- Version comparison: strips `v` prefix, splits on `.`, compares numerically
+
+From `client-version.ts`:
+- Uses Valkey cache: `latest-version:{platform}:{arch}` (TTL: 86400s)
+- DB table: `client_versions` with `is_latest` flag per platform/arch
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + API verification |
+| <MachineRef name="Linux-C" /> | CLI version and update commands |
+
+---
+
+## ST1 — Check Installed Version
+
+**What it verifies:** `ztna version` displays the installed client version with build metadata.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />:
+```bash
+ztna version
+```
+
+**Expected output:**
+```
+ztna version 3.2.8 (built 2026-03-13T10:30:00Z, linux/amd64)
+```
+
+2. On <MachineRef name="Win-A" />:
+```powershell
+ztna version
+```
+
+**Expected output:**
+```
+ztna version 3.2.8 (built 2026-03-13T10:30:00Z, windows/amd64)
+```
+
+**Pass:** Version string includes version number, build timestamp, and OS/architecture. Both machines should show the same version number if updated together.
+
+**Fail / Common issues:**
+- Shows `dev` or `0.0.0` — the binary was built without `-ldflags` version injection. This happens with debug builds.
+
+---
+
+## ST2 — Check for Updates via CLI
+
+**What it verifies:** `ztna update --check` queries the backend and reports whether an update is available.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />:
+```bash
+ztna update --check
+```
+
+**Expected output (up to date):**
+```
+Current version: 3.2.8
+Latest version:  3.2.8
+You are up to date.
+```
+
+**Expected output (update available):**
+```
+Current version: 3.2.7
+Latest version:  3.2.8
+A new version is available!
+Release notes:
+Fixed bug X, added feature Y
+Download: https://login.quickztna.com/api/releases/v3.2.8/quickztna-linux-amd64.tar.gz
+```
+
+2. Check in JSON format:
+```bash
+ztna update --check --json
+```
+
+**Expected JSON (up to date):**
+```json
+{
+  "current_version": "3.2.8",
+  "latest_version": "3.2.8",
+  "update_available": false
+}
+```
+
+**Pass:** Version check returns correct current and latest versions. `update_available` correctly reflects whether an update exists.
+
+**Fail / Common issues:**
+- `version check failed` — network issue reaching the backend. Check `ztna status` for connectivity.
+- Shows update available when versions match — version comparison strips `v` prefix. If one has `v3.2.8` and the other `3.2.8`, they should still match.
+
+---
+
+## ST3 — Version Check via API
+
+**What it verifies:** `POST /api/client-version` with `action: "check"` returns correct version comparison.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```bash
+curl -s -X POST https://login.quickztna.com/api/client-version \
+  -H "Content-Type: application/json" \
+  -d '{"action":"check","current_version":"3.2.8","platform":"linux","arch":"amd64"}' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "current_version": "3.2.8",
+    "latest_version": "3.2.8",
+    "update_available": false,
+    "published_at": "2026-03-13T10:00:00Z"
+  }
+}
+```
+
+2. Test with an old version to trigger update detection:
+```bash
+curl -s -X POST https://login.quickztna.com/api/client-version \
+  -H "Content-Type: application/json" \
+  -d '{"action":"check","current_version":"1.0.0","platform":"linux","arch":"amd64"}' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "current_version": "1.0.0",
+    "latest_version": "3.2.8",
+    "update_available": true,
+    "download_url": "https://login.quickztna.com/api/releases/v3.2.8/quickztna-linux-amd64.tar.gz",
+    "checksum_sha256": "abc123...",
+    "release_notes": "...",
+    "published_at": "2026-03-13T10:00:00Z"
+  }
+}
+```
+
+3. Test missing fields:
+```bash
+curl -s -X POST https://login.quickztna.com/api/client-version \
+  -H "Content-Type: application/json" \
+  -d '{"action":"check"}' | python3 -m json.tool
+```
+
+**Expected error:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MISSING_FIELDS",
+    "message": "current_version and platform are required"
+  }
+}
+```
+
+**Pass:** Current version returns `update_available: false`. Old version returns `true` with download URL. Missing fields returns proper validation error.
+
+---
+
+## ST4 — Version Badge on Dashboard
+
+**What it verifies:** The machine detail page shows the client version and signals when an update is available.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+2. Click on Linux-C to open the detail page.
+3. Find the **Attributes** card.
+
+**Expected attributes:**
+- `node:clientVersion` — shows `3.2.8` (or whatever the installed version is)
+- `node:os` — shows `linux`
+
+4. Find the **Machine Details** card.
+
+**Expected fields:**
+- Version: `3.2.8`
+- OS: `linux` (with distro details if available from `os_version_detail`)
+
+5. If the machine is running an older version, look for an update badge or indicator near the version field.
+
+**Pass:** Version is displayed in the Attributes card. The version matches what `ztna version` reports on that machine.
+
+**Fail / Common issues:**
+- Version shows `null` — the machine may not have sent a heartbeat with the version field. Wait for the next heartbeat cycle (60 seconds).
+- Version not updated after upgrade — the version is reported on each heartbeat. After upgrading the CLI binary, restart with `ztna down && ztna up`.
+
+---
+
+## ST5 — List Available Versions
+
+**What it verifies:** The `list` action returns all published versions for a platform.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```bash
+curl -s -X POST https://login.quickztna.com/api/client-version \
+  -H "Content-Type: application/json" \
+  -d '{"action":"list","platform":"linux"}' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "versions": [
+      {
+        "version": "3.2.8",
+        "platform": "linux",
+        "arch": "amd64",
+        "download_url": "...",
+        "release_notes": "...",
+        "is_latest": true,
+        "published_at": "2026-03-13T10:00:00Z"
+      }
+    ]
+  }
+}
+```
+
+2. Check Windows versions:
+```bash
+curl -s -X POST https://login.quickztna.com/api/client-version \
+  -H "Content-Type: application/json" \
+  -d '{"action":"list","platform":"windows"}' | python3 -m json.tool
+```
+
+**Pass:** Version list returns published versions sorted by `published_at` descending (newest first). Exactly one version per platform/arch has `is_latest: true`. Up to 20 results returned.
+
+**Fail / Common issues:**
+- Empty versions array — no versions published for that platform. Check the `client_versions` table via the admin dashboard.
+- `UNKNOWN_ACTION` — the action must be exactly `"list"` (not `"list_versions"`).
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Installed version | `ztna version` shows version, build time, OS/arch |
+| ST2 | CLI update check | `ztna update --check` reports correct update status |
+| ST3 | API version check | Semver comparison works, download URL returned when update available |
+| ST4 | Dashboard version badge | Attributes card shows `node:clientVersion` matching CLI |
+| ST5 | Version listing | `list` action returns published versions with `is_latest` flag |

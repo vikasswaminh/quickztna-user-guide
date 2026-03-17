@@ -1,0 +1,269 @@
+---
+title: "WireGuard Config Download & Verification"
+topic: "Machine Management"
+order: 23
+machines: ["Win-A", "Linux-C"]
+summary: "Verify WireGuard configuration export — download via CLI (ztna wg-config export), verify config structure, validate keys and peer entries, and test with standalone WireGuard."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The `ztna wg-config export` command generates a standard WireGuard configuration file (`wg0.conf` format) for a registered machine. This config includes:
+- The machine's private key and assigned tailnet IP
+- Peer entries for all other online machines in the org (with their public keys and endpoints)
+- Approved routes as `AllowedIPs`
+
+From `cmd_wgconfig.go`:
+- **Command:** `ztna wg-config export`
+- **Flags:** `--machine <id>` (optional, defaults to current machine), `--json` (output with metadata)
+- **Output:** Raw WireGuard config text, or JSON with metadata when `--json` is used
+- **Error:** `not registered. Run 'ztna up' first, or specify --machine <id>`
+
+The config is generated server-side by `POST /api/client-setup`, which assembles peer entries from all online machines in the same org.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Verify config from dashboard/API |
+| <MachineRef name="Linux-C" /> | Export config via CLI |
+
+---
+
+## ST1 — Export WireGuard Config via CLI
+
+**What it verifies:** `ztna wg-config export` outputs a valid WireGuard configuration file.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, ensure the machine is registered and running:
+```bash
+ztna up
+```
+
+2. In a separate terminal, export the config:
+```bash
+ztna wg-config export
+```
+
+**Expected output (standard WireGuard format):**
+```ini
+[Interface]
+PrivateKey = <base64-encoded-private-key>
+Address = 100.64.0.3/32
+DNS = 100.100.100.100
+
+[Peer]
+# Win-A
+PublicKey = <base64-encoded-public-key>
+AllowedIPs = 100.64.0.1/32
+Endpoint = <public-ip>:<port>
+PersistentKeepalive = 25
+
+[Peer]
+# Win-B
+PublicKey = <base64-encoded-public-key>
+AllowedIPs = 100.64.0.2/32
+Endpoint = <public-ip>:<port>
+PersistentKeepalive = 25
+```
+
+3. Save it to a file:
+```bash
+ztna wg-config export > /tmp/wg0.conf
+cat /tmp/wg0.conf
+```
+
+**Pass:** Config contains an `[Interface]` section with `PrivateKey` and `Address`, plus one `[Peer]` section per online machine in the org. Keys are base64-encoded (44 chars ending in `=`).
+
+**Fail / Common issues:**
+- `not registered. Run 'ztna up' first, or specify --machine <id>` — the machine must be registered. Run `ztna up` first.
+- Empty peer list — other machines may be offline. Check `ztna peers` to verify.
+- `error generating WireGuard config` — backend error. Check the machine's auth status with `ztna status`.
+
+---
+
+## ST2 — Export Config as JSON
+
+**What it verifies:** `ztna wg-config export --json` outputs the config wrapped in a JSON metadata object.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />:
+```bash
+ztna wg-config export --json
+```
+
+**Expected output:**
+```json
+{
+  "Config": "[Interface]\nPrivateKey = ...\nAddress = 100.64.0.3/32\n...",
+  ...
+}
+```
+
+2. Parse and verify:
+```bash
+ztna wg-config export --json | python3 -c "import sys,json; d=json.load(sys.stdin); print('Config length:', len(d['Config']), 'chars')"
+```
+
+**Pass:** JSON output contains a `Config` field with the full WireGuard config as a string. The config can be parsed from the JSON.
+
+---
+
+## ST3 — Validate Config Structure
+
+**What it verifies:** The exported config has all required WireGuard fields and valid key formats.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, export and validate:
+```bash
+ztna wg-config export > /tmp/wg0.conf
+
+# Check Interface section exists
+grep -c "\[Interface\]" /tmp/wg0.conf
+
+# Check PrivateKey exists and is base64 (44 chars)
+grep "PrivateKey" /tmp/wg0.conf | awk '{print $3}' | wc -c
+
+# Check Address is a tailnet IP
+grep "Address" /tmp/wg0.conf
+
+# Count peer sections
+grep -c "\[Peer\]" /tmp/wg0.conf
+
+# Check all peers have PublicKey
+grep -c "PublicKey" /tmp/wg0.conf
+
+# Check all peers have AllowedIPs
+grep -c "AllowedIPs" /tmp/wg0.conf
+```
+
+**Expected:**
+- Exactly 1 `[Interface]` section
+- PrivateKey value is ~44 characters (base64)
+- Address is `100.64.x.x/32`
+- Number of `[Peer]` sections matches number of other online machines
+- Each peer has `PublicKey` and `AllowedIPs`
+
+2. Verify the private key is valid base64:
+```bash
+PRIVKEY=$(grep "PrivateKey" /tmp/wg0.conf | awk '{print $3}')
+echo "$PRIVKEY" | base64 -d | wc -c
+```
+
+**Expected:** 32 bytes (WireGuard uses Curve25519 keys = 32 bytes).
+
+**Pass:** Config has valid structure. Private key decodes to 32 bytes. Each peer has a public key and allowed IPs.
+
+**Fail / Common issues:**
+- Private key is 0 bytes — the base64 may be URL-safe encoded. Try `echo "$PRIVKEY" | tr '_-' '/+' | base64 -d | wc -c`.
+- Missing peers — only `online` machines with a `public_key` set are included as peers.
+
+---
+
+## ST4 — Verify Peer Entries Match Registered Machines
+
+**What it verifies:** Each peer in the config corresponds to a real registered machine in the org.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, get the list of peers from the config:
+```bash
+grep -A1 "\[Peer\]" /tmp/wg0.conf | grep "# " | awk '{print $2}'
+```
+
+This shows the comment lines with peer names.
+
+2. Compare with the machine list:
+```bash
+ztna machines list
+```
+
+**Expected:** Every peer name in the config matches a machine in the `ztna machines list` output (excluding the current machine).
+
+3. Verify AllowedIPs match tailnet IPs:
+```bash
+grep "AllowedIPs" /tmp/wg0.conf
+```
+
+**Expected:** Each peer's `AllowedIPs` includes their tailnet IP (`100.64.x.x/32`). If the peer has approved routes, those CIDRs are also included.
+
+**Pass:** Peer names and IPs match the machine list. No unknown peers in the config. Approved routes appear in AllowedIPs.
+
+---
+
+## ST5 — Test Config with Standalone WireGuard
+
+**What it verifies:** The exported config can be used with the standalone `wg` tool (not the QuickZTNA client).
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, stop the QuickZTNA VPN first:
+```bash
+ztna down
+```
+
+2. Install WireGuard tools if not present:
+```bash
+sudo apt install wireguard-tools -y
+```
+
+3. Copy the config and bring up the interface:
+```bash
+sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+sudo chmod 600 /etc/wireguard/wg0.conf
+sudo wg-quick up wg0
+```
+
+4. Verify the interface:
+```bash
+sudo wg show wg0
+```
+
+**Expected output:**
+```
+interface: wg0
+  public key: <base64>
+  private key: (hidden)
+  listening port: <port>
+
+peer: <base64>
+  endpoint: <ip>:<port>
+  allowed ips: 100.64.0.1/32
+  latest handshake: <time>
+  transfer: <rx> received, <tx> sent
+```
+
+5. Test connectivity:
+```bash
+ping -c 3 100.64.0.1
+```
+
+**Expected:** Pings succeed if Win-A is online and reachable.
+
+6. **Cleanup:** Bring down the standalone interface and restart QuickZTNA:
+```bash
+sudo wg-quick down wg0
+sudo rm /etc/wireguard/wg0.conf
+ztna up
+```
+
+**Pass:** Standalone WireGuard brings up the interface with the exported config. `wg show` displays the correct peers and keys. Basic connectivity works.
+
+**Fail / Common issues:**
+- `RTNETLINK answers: Operation not permitted` — must run as root (`sudo`).
+- `Unable to access interface: Protocol not supported` — WireGuard kernel module not loaded. Run `sudo modprobe wireguard`.
+- Handshake doesn't complete — the QuickZTNA client on the peer side may require the heartbeat mechanism to update endpoints. Standalone WireGuard uses static endpoints only.
+
+**Cleanup:** Always remove `/etc/wireguard/wg0.conf` after testing — it contains your private key.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | CLI config export | `ztna wg-config export` outputs valid WireGuard config |
+| ST2 | JSON export | `--json` wraps config in metadata JSON |
+| ST3 | Config validation | Interface section, valid keys, correct peer count |
+| ST4 | Peer verification | Peer names and IPs match registered machines |
+| ST5 | Standalone WireGuard | Exported config works with `wg-quick up` |

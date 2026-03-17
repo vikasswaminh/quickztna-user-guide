@@ -1,0 +1,287 @@
+---
+title: "Machine Rename & Tagging"
+topic: "Machine Management"
+order: 21
+machines: ["Win-A", "Linux-C"]
+summary: "Verify machine rename and tag management — via CLI (ztna set), API (machine-admin), and dashboard edit dialog — including name validation and tag-based ACL integration."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Machine names and tags are mutable metadata used for identification and ACL matching. There are three ways to change them:
+
+1. **CLI:** `ztna set --hostname <name>` or `ztna set --tags <comma-separated>`
+2. **API:** `POST /api/machine-admin` with `action: "rename"` or `action: "update_tags"`
+3. **Dashboard:** Machine detail page → Edit dialog
+
+Name validation rules (from `machine-admin.ts`):
+- Length: 1–100 characters
+- Sanitized: invalid characters stripped
+- If sanitized name is empty: `INVALID_INPUT` error
+- Field name in API: `name` (not `new_name`)
+
+Tag rules:
+- Stored as JSON array of strings
+- Tags with `tag:` prefix are stripped (client sends `tag:prod`, backend stores `prod`)
+- Max 50 chars per tag, alphanumeric + hyphens/underscores
+- `update_tags` action requires admin or machine owner
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin dashboard + API testing |
+| <MachineRef name="Linux-C" /> | Target machine for rename/tag changes |
+
+---
+
+## ST1 — Rename Machine via CLI
+
+**What it verifies:** `ztna set --hostname` changes the machine name locally and on the control plane.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, check current name:
+```bash
+ztna status
+```
+Note the current `Machine Name` value.
+
+2. Rename:
+```bash
+ztna set --hostname linux-server-01
+```
+
+**Expected output:**
+```
+Hostname set to: linux-server-01
+Settings saved.
+```
+
+3. Verify on the control plane:
+```bash
+ztna status
+```
+
+**Expected:** `Machine Name: linux-server-01`
+
+4. On <MachineRef name="Win-A" />, verify on dashboard — the machine list should show the new name.
+
+**Pass:** CLI prints `Hostname set to: linux-server-01`. Status reflects new name. Dashboard shows updated name.
+
+**Fail / Common issues:**
+- `Warning: failed to update hostname on control plane: ...` — the control plane update is non-fatal. The local config is still changed. Retry or check network connectivity.
+- `no settings changed. Use --help to see available flags` — no flags were provided. Include `--hostname`.
+
+---
+
+## ST2 — Rename Machine via API
+
+**What it verifies:** The `rename` action in `/api/machine-admin` updates the machine name with proper validation.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+MACHINE_ID="LINUX_C_MACHINE_ID"
+
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"rename\",\"machine_id\":\"$MACHINE_ID\",\"name\":\"linux-prod-server\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "name": "linux-prod-server"
+  }
+}
+```
+
+2. Test validation — try an empty name:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"rename\",\"machine_id\":\"$MACHINE_ID\",\"name\":\"\"}" | python3 -m json.tool
+```
+
+**Expected error:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "Name must be 1-100 characters"
+  }
+}
+```
+
+3. Test with invalid characters only:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"rename\",\"machine_id\":\"$MACHINE_ID\",\"name\":\"@#$%^&\"}" | python3 -m json.tool
+```
+
+**Expected error:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "Name contains only invalid characters"
+  }
+}
+```
+
+**Pass:** Valid rename succeeds. Empty name returns `INVALID_INPUT`. Invalid-character-only name returns `INVALID_INPUT`.
+
+---
+
+## ST3 — Update Tags via CLI
+
+**What it verifies:** `ztna set --tags` sets machine tags locally and syncs to the control plane.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />:
+```bash
+ztna set --tags "prod,linux,web-server"
+```
+
+**Expected output:**
+```
+Tags set to: [prod linux web-server]
+Settings saved.
+```
+
+2. Verify via API from <MachineRef name="Win-A" />:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID&select=name,tags" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "linux-prod-server",
+      "tags": ["prod", "linux", "web-server"]
+    }
+  ]
+}
+```
+
+**Pass:** Tags are set on the machine record as a JSON array. Each tag is a separate string without the `tag:` prefix.
+
+**Fail / Common issues:**
+- Tags show as a single string — the CLI splits on commas. Ensure you use comma separation without spaces.
+
+---
+
+## ST4 — Update Tags via API
+
+**What it verifies:** The `update_tags` action sets tags as a JSON array and validates input.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"update_tags\",\"machine_id\":\"$MACHINE_ID\",\"tags\":[\"staging\",\"docker\",\"monitoring\"]}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "tags": ["staging", "docker", "monitoring"]
+  }
+}
+```
+
+2. Test validation — send tags as a string instead of array:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"update_tags\",\"machine_id\":\"$MACHINE_ID\",\"tags\":\"not-an-array\"}" | python3 -m json.tool
+```
+
+**Expected error:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "tags must be an array"
+  }
+}
+```
+
+3. Clear all tags:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"update_tags\",\"machine_id\":\"$MACHINE_ID\",\"tags\":[]}" | python3 -m json.tool
+```
+
+**Expected:** Success with `"tags": []`.
+
+**Pass:** Array of tags saved correctly. Non-array input rejected. Empty array clears tags.
+
+---
+
+## ST5 — Rename and Tag via Dashboard Edit Dialog
+
+**What it verifies:** The dashboard machine detail page allows editing the machine name and tags through a UI dialog.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+2. Click on `linux-prod-server` (or whatever the current name is) to open the detail page.
+3. Click the **Edit Machine** button.
+4. In the edit dialog:
+   - Change **Machine name** to `linux-c-final`
+   - Set **Tags** to `production, critical, linux`
+5. Click **Save**.
+
+**Expected:** The dialog closes. The machine detail page refreshes showing:
+- Name: `linux-c-final`
+- Tags section shows badges: `production`, `critical`, `linux`
+
+6. Verify the changes persisted by refreshing the page (F5).
+
+**Pass:** Edit dialog saves both name and tags. Changes persist after page refresh. Tags display as individual badges in the Attributes card.
+
+**Fail / Common issues:**
+- Dialog doesn't save — check browser console for API errors. The edit sends `rename` and `update_tags` as separate API calls.
+- Tags not showing — the Attributes card shows tags as badges. If no tags are set, the section may be empty.
+
+**Cleanup:** Rename the machine back to `Linux-C` for consistency in other tests:
+```bash
+ztna set --hostname Linux-C --tags ""
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | CLI rename | `ztna set --hostname` updates name locally and on control plane |
+| ST2 | API rename | `rename` action validates name length and characters |
+| ST3 | CLI tags | `ztna set --tags` syncs comma-separated tags as JSON array |
+| ST4 | API tags | `update_tags` validates array input, supports clear |
+| ST5 | Dashboard edit | Edit dialog saves name and tags via UI |

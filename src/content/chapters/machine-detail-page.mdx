@@ -1,0 +1,250 @@
+---
+title: "Machine Detail Page Verification"
+topic: "Machine Management"
+order: 25
+machines: ["Win-A", "Linux-C"]
+summary: "Verify every section of the machine detail page — settings card, subnets card, machine details card, attributes card, addresses card, connection info card, and all action buttons."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The machine detail page (`MachineDetailPage.tsx`) is the central management view for a single machine. It displays 8 card sections and multiple action buttons. This chapter verifies that every section renders correctly with accurate data.
+
+**Page URL:** `https://login.quickztna.com/machines/{machine-id}`
+
+**Card sections (from source):**
+1. **Header** — Name, status badge, ephemeral flag, tailnet IP
+2. **Machine Settings** — Owner, status, approval info
+3. **Subnets** — Advertised routes, approved routes, exit node status
+4. **Machine Details** — ID, OS, node key, created/last seen dates, uptime, key expiry
+5. **Attributes** — OS, version, exit node, shields up, SSH, accept routes, tags
+6. **Addresses** — Tailnet IPv4, short domain, full domain (`name.org-slug.zt.net`)
+7. **Connection Info** — Endpoints, DERP relay, connectivity flags (UDP, IPv6, UPnP, etc.)
+8. **Action Buttons** — Approve, Enable/Disable, Quarantine, Edit, Remote Desktop, AI Analyze
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — view the detail page |
+| <MachineRef name="Linux-C" /> | Target machine to inspect |
+
+---
+
+## ST1 — Header and Status Badge
+
+**What it verifies:** The page header shows the correct machine name, status badge, and tailnet IP.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+2. Click on **Linux-C** to open its detail page.
+3. Inspect the header section.
+
+**Expected header elements:**
+- **Machine name:** `Linux-C` (large text)
+- **Status badge:** One of:
+  - `Connected` (green) — machine is online
+  - `Disconnected` (gray) — machine is offline
+  - `Pending Approval` (yellow) — awaiting admin approval
+  - `Quarantined` (red) — security isolation
+- **Tailnet IP:** `100.64.0.3` displayed near the header
+- **Ephemeral flag:** Only shown if the machine was registered with an ephemeral auth key
+
+**Pass:** Name matches the registered machine name. Status badge color and text match the actual machine status. Tailnet IP is correct.
+
+**Fail / Common issues:**
+- Status shows `Disconnected` for a running machine — heartbeat may be delayed. Wait 60 seconds and refresh.
+- Wrong name — the machine may have been renamed. Check `ztna status` on Linux-C.
+
+---
+
+## ST2 — Machine Details Card
+
+**What it verifies:** The details card shows accurate machine metadata including ID, OS, key, timestamps, and uptime.
+
+**Steps:**
+1. On the Linux-C detail page, find the **Machine Details** card.
+
+**Expected fields:**
+| Field | Expected Value |
+|-------|---------------|
+| Machine name | `Linux-C` |
+| OS hostname | OS hostname (if different from name) |
+| OS | `linux` (with distro details like `Ubuntu 24.04` if reported via `os_version_detail`) |
+| Machine ID | UUID format (click to copy) |
+| Node key | First 16 characters + `...` (click to copy) |
+| Created | Registration timestamp |
+| Last seen | Recent timestamp (within last few minutes) |
+| Uptime | Percentage (e.g., `99.8%`) |
+| Key expiry | Days remaining or `Disabled` |
+
+2. Verify the Machine ID matches the API:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+curl -s "https://login.quickztna.com/api/db/machines?name=eq.Linux-C&select=id,created_at,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. Compare `id`, `created_at`, and `last_seen` with what the page shows.
+
+**Pass:** All fields populated. Machine ID matches API. Last seen is within the last few minutes. Key expiry shows days remaining or `Disabled`.
+
+**Fail / Common issues:**
+- Node key shows `null` — the machine's `node_key_hash` may not be set. Re-register with `ztna up`.
+- OS shows just `linux` without version — the client may not have sent `os_version_detail` in the heartbeat yet.
+
+---
+
+## ST3 — Attributes and Addresses Cards
+
+**What it verifies:** The Attributes card shows all machine flags and tags. The Addresses card shows the DNS names.
+
+**Steps:**
+1. Find the **Attributes** card on the detail page.
+
+**Expected attributes:**
+| Attribute | Expected |
+|-----------|----------|
+| `node:os` | `linux` |
+| `node:clientVersion` | `3.2.8` (current version) |
+| `node:exitNode` | `false` (unless configured) |
+| `node:exitNodeApproved` | `false` (unless admin approved) |
+| `node:shieldsUp` | `false` (orange badge if `true`) |
+| `node:sshEnabled` | `false` (green badge if `true`) |
+| `node:acceptRoutes` | `false` |
+| Tags | Displayed as badges (if any are set) |
+
+2. Find the **Addresses** card.
+
+**Expected address fields:**
+| Field | Expected |
+|-------|----------|
+| QuickZTNA IPv4 | `100.64.0.3` (click to copy) |
+| Short domain | `Linux-C` (the machine name) |
+| Full domain | `linux-c.{org-slug}.zt.net` |
+
+3. Verify the full domain resolves (if MagicDNS is enabled):
+```bash
+# On Linux-C:
+ztna dns query linux-c
+```
+
+**Pass:** All attributes display with correct values. Tags show as individual badges. Addresses card shows tailnet IP and DNS names. Full domain follows `name.org-slug.zt.net` format.
+
+---
+
+## ST4 — Connection Info Card
+
+**What it verifies:** The Connection Info card shows DERP relay, endpoints, and NAT connectivity details.
+
+**Steps:**
+1. Find the **Connection Info** card on the detail page.
+
+**Expected fields:**
+| Field | Expected |
+|-------|----------|
+| Endpoints | Public IP:port from STUN discovery (e.g., `178.62.x.x:41641`) |
+| DERP relay | Preferred DERP region (e.g., `blr1` — Bangalore) |
+| Client Connectivity | Flags from heartbeat telemetry |
+
+**Connectivity flags (from `client_connectivity` JSON):**
+- **UDP:** `true` / `false` — can send/receive UDP
+- **IPv6:** `true` / `false` — IPv6 connectivity
+- **UPnP:** `true` / `false` — UPnP port mapping available
+- **NAT-PMP:** `true` / `false` — NAT-PMP available
+- **PCP:** `true` / `false` — PCP available
+- **Hairpinning:** `true` / `false` — NAT hairpinning works
+- **NAT mapping varies:** `true` / `false` — mapping varies by destination
+- **Firewall mode:** `none` / `nftables` / `iptables`
+
+2. Compare with CLI network check:
+```bash
+# On Linux-C:
+ztna netcheck
+```
+
+**Expected netcheck output:**
+```
+Running network diagnostics...
+
+Report
+======
+UDP: true
+IPv4: yes, 178.62.x.x:41641
+Nearest DERP: blr1 (Bangalore)
+STUN: ok (derp-blr1.quickztna.com:3478)
+```
+
+3. Verify the DERP region on the detail page matches the `Nearest DERP` from netcheck.
+
+**Pass:** Connection info card populated with endpoint, DERP region, and connectivity flags. DERP region matches `ztna netcheck` output. Connectivity flags reflect the machine's actual network capabilities.
+
+**Fail / Common issues:**
+- All connectivity flags empty — the machine hasn't sent connectivity telemetry yet. Wait for the next heartbeat.
+- Endpoints empty — the machine is behind strict NAT and STUN discovery failed. It's still reachable via DERP relay.
+
+---
+
+## ST5 — Action Buttons and Subnets Card
+
+**What it verifies:** The action buttons work correctly, and the Subnets card shows route approval status.
+
+**Steps:**
+1. On the detail page, identify the available action buttons:
+   - **Approve** (visible for pending machines)
+   - **Enable / Disable** (toggle button)
+   - **Quarantine / Remove Quarantine**
+   - **Edit Machine** (opens edit dialog)
+   - **Remote Desktop** (if feature enabled)
+   - **AI Analyze** (if incident_response feature enabled)
+
+2. Test the **Edit Machine** button:
+   - Click **Edit Machine**
+   - The dialog should show: Machine name, Tags, Advertised routes, Shields up toggle, SSH enabled toggle, Accept routes toggle
+   - Make a small change (e.g., add a tag `test-tag`)
+   - Click **Save**
+   - Verify the Attributes card updates with the new tag
+
+3. Check the **Subnets** card:
+   - If Linux-C has advertised routes: they appear with an approval status (green checkmark if approved, orange clock if pending)
+   - If Linux-C advertises as exit node: the exit node section shows approval status
+   - **Approve All** / **Reject All** buttons appear for admins when pending routes exist
+
+4. Test route approval from the Subnets card:
+   - First, advertise a route on Linux-C: `ztna set --advertise-routes "172.16.0.0/24"`
+   - Refresh the detail page
+   - The Subnets card should show `172.16.0.0/24` as pending (orange)
+   - Click **Approve All**
+   - The route should change to approved (green)
+
+5. Test the **Disable** button:
+   - Click **Disable** → confirm in the dialog
+   - Status badge changes to `Disconnected`
+   - Click **Enable** → confirm
+   - Status badge changes back to `Connected`
+
+**Pass:** Edit dialog opens and saves changes. Subnets card shows route approval status. Approve/Reject buttons work. Enable/Disable toggle changes machine status.
+
+**Fail / Common issues:**
+- Edit dialog errors — check browser console for `400` or `403` responses from `/api/machine-admin`.
+- Approve button missing — you must be an org admin. Members can only edit their own machines' flags.
+- Subnets card empty — no routes advertised. Set some with `ztna set --advertise-routes`.
+
+**Cleanup:** Remove test routes and tags:
+```bash
+ztna set --advertise-routes "" --tags ""
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Header and status | Correct name, status badge color/text, tailnet IP |
+| ST2 | Machine details | ID, OS, key, timestamps, uptime all populated and accurate |
+| ST3 | Attributes and addresses | Flags, tags, tailnet IP, DNS names displayed correctly |
+| ST4 | Connection info | DERP region, endpoints, connectivity flags match CLI output |
+| ST5 | Actions and subnets | Edit dialog, route approval, enable/disable all functional |

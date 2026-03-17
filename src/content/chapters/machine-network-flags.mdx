@@ -1,0 +1,303 @@
+---
+title: "Machine Network Flags (Shields Up, SSH, Accept Routes)"
+topic: "Machine Management"
+order: 22
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify per-machine network flags — shields up, SSH enabled, accept routes, advertise exit node — via CLI (ztna set), API (update_flags), and dashboard toggle."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Each machine has four boolean network flags that control its behavior on the tailnet:
+
+| Flag | DB Column | Default | Effect |
+|------|-----------|---------|--------|
+| **Shields Up** | `shields_up` | `false` | Blocks all incoming connections to this machine |
+| **SSH Enabled** | `ssh_enabled` | `false` | Enables the built-in SSH server on the tailnet IP |
+| **Accept Routes** | `accept_routes` | `false` | Accepts subnet routes advertised by other machines |
+| **Advertise Exit Node** | `advertise_exit_node` | `false` | Offers this machine as an exit node for other peers |
+
+These flags can be set three ways:
+- **CLI:** `ztna set --shields-up`, `ztna set --ssh`, `ztna set --accept-routes`, `ztna set --advertise-exit-node`
+- **API:** `POST /api/machine-admin` with `action: "update_flags"` — at least one flag must be provided
+- **Dashboard:** Machine detail page → Edit dialog toggles
+
+The `ztna up` command also accepts these as initial flags: `--shields-up`, `--ssh`, `--accept-routes`, `--advertise-exit-node`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — set flags via API and dashboard |
+| <MachineRef name="Win-B" /> | Peer — verify effects of flags |
+| <MachineRef name="Linux-C" /> | Target — apply flags via CLI |
+
+---
+
+## ST1 — Enable Shields Up via CLI
+
+**What it verifies:** `ztna set --shields-up` blocks all incoming connections to the machine.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, enable shields:
+```bash
+ztna set --shields-up
+```
+
+**Expected output:**
+```
+Shields up: blocking incoming connections.
+Settings saved.
+```
+
+2. Verify the flag is set on the control plane:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+MACHINE_ID="LINUX_C_MACHINE_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID&select=name,shields_up" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"shields_up": true`
+
+3. On <MachineRef name="Win-B" />, try to ping Linux-C:
+```powershell
+ztna ping 100.64.0.3 --count 3
+```
+
+**Expected:** Pings may fail or show increased latency — shields up blocks inbound traffic.
+
+4. Disable shields:
+```bash
+ztna set --shields-up=false
+```
+
+**Expected output:**
+```
+Shields down: accepting incoming connections.
+Settings saved.
+```
+
+**Pass:** Flag toggles on and off. Control plane reflects the change. Incoming connections are affected.
+
+**Fail / Common issues:**
+- `no settings changed` — you must pass the flag explicitly. `--shields-up` sets to true, `--shields-up=false` sets to false.
+
+---
+
+## ST2 — Enable SSH via CLI
+
+**What it verifies:** `ztna set --ssh` enables the built-in SSH server on the machine's tailnet IP.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />:
+```bash
+ztna set --ssh
+```
+
+**Expected output:**
+```
+SSH server enabled (local config only).
+Settings saved.
+```
+
+2. Verify the flag:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID&select=name,ssh_enabled" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"ssh_enabled": true`
+
+3. From <MachineRef name="Win-A" />, try SSH via the tailnet:
+```powershell
+ztna ssh root@Linux-C
+```
+
+**Expected output:**
+```
+Resolved Linux-C -> 100.64.0.3
+```
+Then an SSH session opens (or SSH key/password prompt).
+
+4. If `ztna ssh` is not working, try direct SSH:
+```powershell
+ssh root@100.64.0.3
+```
+
+**Pass:** SSH flag enabled. `ztna ssh` resolves the peer name and connects. The machine detail page shows `node:sshEnabled = true`.
+
+**Fail / Common issues:**
+- `ssh not found in PATH` — the `ztna ssh` command wraps the system SSH client. Install OpenSSH on Windows: Settings → Apps → Optional Features → OpenSSH Client.
+- Connection refused — the SSH server on Linux-C must also be running (system `sshd`). The flag tells the tailnet that SSH is available, but the actual SSH daemon must be running.
+
+---
+
+## ST3 — Update Flags via API
+
+**What it verifies:** The `update_flags` action sets multiple flags at once with proper validation.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, set multiple flags:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"update_flags\",\"machine_id\":\"$MACHINE_ID\",\"shields_up\":false,\"ssh_enabled\":true,\"accept_routes\":true}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "shields_up": false,
+    "ssh_enabled": true,
+    "accept_routes": true
+  }
+}
+```
+
+2. Test validation — send no flags:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"update_flags\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected error:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "At least one flag must be provided"
+  }
+}
+```
+
+**Pass:** Multiple flags updated in one call. No-flag request rejected with validation error.
+
+---
+
+## ST4 — Accept Routes and Subnet Routing
+
+**What it verifies:** `accept_routes` allows a machine to use subnet routes advertised by other machines.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, advertise a route:
+```bash
+ztna set --advertise-routes "10.0.0.0/24"
+```
+
+**Expected output:**
+```
+Advertised routes: 10.0.0.0/24
+Settings saved.
+```
+
+2. On <MachineRef name="Win-A" />, approve the route (admin action):
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"approve_routes\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "approved_routes": ["10.0.0.0/24"]
+  }
+}
+```
+
+3. On <MachineRef name="Win-B" />, enable accept routes:
+```powershell
+ztna set --accept-routes
+```
+
+**Expected:**
+```
+Accepting routes from peers.
+Settings saved.
+```
+
+4. Verify Win-B can see the route from Linux-C:
+```powershell
+ztna peers Linux-C
+```
+
+The detail view should show the route under `ROUTES`.
+
+**Pass:** Route advertised by Linux-C, approved by admin, accepted by Win-B. The route appears in the peer detail view.
+
+**Fail / Common issues:**
+- `Subnet routing is disabled for this organization` (403) — the org setting `allow_subnet_routing` must be enabled. Check org settings in the dashboard.
+- Route shows as pending — admin must approve via `approve_routes` before peers can use it.
+
+---
+
+## ST5 — Toggle Flags via Dashboard
+
+**What it verifies:** The machine detail page edit dialog allows toggling network flags through the UI.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+2. Click on Linux-C to open the detail page.
+3. Check the **Attributes** card — it shows the current flag states:
+   - `node:shieldsUp` — true/false (orange badge if true)
+   - `node:sshEnabled` — true/false (green badge if true)
+   - `node:acceptRoutes` — true/false
+   - `node:exitNode` — true/false
+   - `node:exitNodeApproved` — true/false
+
+4. Click **Edit Machine**.
+5. In the edit dialog:
+   - Toggle **Shields Up** to ON
+   - Toggle **SSH Enabled** to OFF
+   - Toggle **Accept Routes** to ON
+6. Click **Save**.
+
+**Expected:** The dialog closes. The Attributes card updates to show:
+- `node:shieldsUp = true` (orange badge)
+- `node:sshEnabled = false`
+- `node:acceptRoutes = true`
+
+7. Verify via CLI on <MachineRef name="Linux-C" />:
+```bash
+ztna status
+```
+
+The flags should reflect the dashboard changes on the next heartbeat cycle.
+
+**Pass:** Dashboard toggles save correctly. Attributes card reflects new values. Changes propagate to the client.
+
+**Fail / Common issues:**
+- Toggles revert on save — check browser console for API errors. The edit dialog sends `action: "update_flags"` to `/api/machine-admin`.
+- Client doesn't pick up changes immediately — flag changes propagate via the heartbeat response. Wait up to 60 seconds.
+
+**Cleanup:** Reset flags to defaults:
+```bash
+ztna set --shields-up=false --ssh=false --accept-routes=false --advertise-routes ""
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Shields up | CLI toggles shields, control plane reflects, inbound affected |
+| ST2 | SSH enabled | CLI enables SSH flag, `ztna ssh` resolves and connects |
+| ST3 | API flag update | Multiple flags set in one call, validation enforced |
+| ST4 | Accept routes | Route advertised, approved, accepted — visible in peer detail |
+| ST5 | Dashboard toggles | Edit dialog toggles flags, Attributes card shows updated values |
