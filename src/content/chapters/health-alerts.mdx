@@ -1,0 +1,343 @@
+---
+title: "Health Page Alerts"
+topic: "Health & Monitoring"
+order: 84
+machines: ["Win-A"]
+summary: "Verify the DERP relay health check — the on-demand probe button, handleDerpHealth handler, region_health response, active session count, and error states."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Health page includes a "Network Relay Health" card that performs an on-demand probe of DERP relay servers. This is the closest thing to an alerting mechanism on the Health page — it indicates degraded relay connectivity that could affect machines falling back to DERP routing.
+
+The probe is triggered by clicking the **Check Health** button, which calls:
+
+```
+POST /api/derp-health
+Body: { "org_id": "<org_id>" }
+```
+
+This hits `handleDerpHealth` in `backend/src/handlers/derp-health.ts`. The handler:
+
+1. Looks up org-configured DERP regions from `derp_regions WHERE org_id = ?`
+2. Falls back to the default server (`vpn.quickztna.com`, region `US-1`) if no custom regions are configured
+3. For each region, makes an HTTP `GET` to `https://<hostname>/derp/probe` with a 5-second timeout
+4. Considers a region healthy if the probe response status is 200, 404, or 426 (any of these indicate the DERP server is reachable and responding)
+5. Queries `relay_sessions` joined to `machines` for sessions with `last_heartbeat` within the last 2 minutes
+6. Returns a payload with `region_health`, `active_sessions`, `total_sessions`, and per-session data
+
+The frontend (`HealthPage.tsx`) calls this via `api.functions.invoke("derp-health")`, which maps to `POST /api/derp-health` (the `functions.invoke` helper posts to `/<fnName>`).
+
+After a successful probe, the card renders:
+- **Relay Status** badge: `Healthy` (green) if `derpHealth.healthy !== false`, otherwise `Degraded` (red)
+- **Active Sessions** count: from `derpHealth.active_sessions`
+- **Region** label: from `derpHealth.region` (falls back to `"Primary"` if not present)
+- **Probe Results** table (only shown if `probe_results` is a non-empty array in the response)
+
+Note: The `derp-health` endpoint requires authentication (`getAuthedUser`) and org membership (`isOrgMember`).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser observation + direct API testing of the health check endpoint |
+
+---
+
+## ST1 — DERP Health Check Button Triggers Probe
+
+**What it verifies:** Clicking "Check Health" sends a POST to `/api/derp-health` and the card populates with the probe result.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, navigate to `/health`.
+
+2. Find the **Network Relay Health** card. Before clicking, it shows:
+   `Click "Check Health" to probe DERP relay status`
+
+3. Click the **Check Health** button. The button shows a spinning loader icon while the request is in flight.
+
+4. Once the request completes (within ~5 seconds given the 5-second probe timeout per region), the card body should populate with three sub-panels: Relay Status, Active Sessions, and Region.
+
+5. Verify the same result via direct API call from <MachineRef name="Win-A" />:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST https://login.quickztna.com/api/derp-health \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+**Expected API response:**
+```json
+{
+  "success": true,
+  "data": {
+    "derp_server": {
+      "hostname": "vpn.quickztna.com",
+      "stun_port": 3478,
+      "derp_port": 443,
+      "region_code": "US-1",
+      "region_name": "QuickZTNA Primary",
+      "healthy": true,
+      "stun_endpoint": "vpn.quickztna.com:3478",
+      "derp_endpoint": "vpn.quickztna.com:443"
+    },
+    "region_health": [
+      {
+        "hostname": "vpn.quickztna.com",
+        "stun_port": 3478,
+        "derp_port": 443,
+        "region_code": "US-1",
+        "region_name": "QuickZTNA Primary",
+        "healthy": true,
+        "stun_endpoint": "vpn.quickztna.com:3478",
+        "derp_endpoint": "vpn.quickztna.com:443"
+      }
+    ],
+    "regions": [],
+    "active_sessions": 2,
+    "total_sessions": 3,
+    "sessions": [
+      {
+        "machine_id": "uuid",
+        "machine_name": "Linux-C",
+        "tailnet_ip": "100.64.0.3",
+        "public_ip": "203.0.113.5",
+        "status": "ready",
+        "last_heartbeat": "2026-03-17T10:30:45.123Z"
+      }
+    ],
+    "stats": {
+      "relay_regions": 1,
+      "machines_using_relay": 2,
+      "direct_connections": 0
+    }
+  }
+}
+```
+
+**Pass:** Button triggers the probe, card populates with relay status, active sessions count, and region. Relay Status badge shows `Healthy` when the probe returns 200/404/426.
+
+**Fail / Common issues:**
+- Button spinner never stops — the probe request may have timed out (5-second timeout per region). Check browser DevTools for the `/api/derp-health` request duration.
+- `401 UNAUTHORIZED` from the API — ensure the `TOKEN` is valid (not expired). The `derp-health` handler calls `getAuthedUser`, which validates the JWT.
+- `400 MISSING_FIELDS` — the request body must include `org_id`. The frontend sends it via `api.functions.invoke("derp-health")` with the org_id injected by the context (verify `currentOrg.id` is set).
+
+---
+
+## ST2 — Healthy DERP Server Probe Result
+
+**What it verifies:** The probe correctly identifies a healthy DERP server based on HTTP status codes 200, 404, or 426 from `/derp/probe`.
+
+**Steps:**
+
+1. From <MachineRef name="Win-A" />, manually probe the default DERP server endpoint:
+```bash
+curl -sv https://vpn.quickztna.com/derp/probe 2>&1 | grep "< HTTP"
+```
+
+**Expected output:**
+```
+< HTTP/2 426
+```
+or
+```
+< HTTP/2 200
+```
+
+DERP servers typically return 426 (Upgrade Required) to plain HTTP GET requests on the probe endpoint because the client is expected to upgrade to a WebSocket connection. The handler treats 200, 404, and 426 all as "healthy" responses.
+
+2. Trigger the health check via the UI or API and confirm `"healthy": true` in the `region_health` array for `vpn.quickztna.com`.
+
+3. Verify the Relay Status badge on the Health page shows `Healthy` (green badge, not destructive/red).
+
+**Expected:** Direct `curl` to `/derp/probe` returns 200, 404, or 426. Health check reports `healthy: true`. Badge is green.
+
+**Pass:** DERP probe returns one of the three accepted status codes. Handler reports `healthy: true`. UI badge is `Healthy`.
+
+**Fail / Common issues:**
+- Probe returns 5xx or connection refused — the DERP server may be down. Check `vpn.quickztna.com` availability via `ping vpn.quickztna.com`.
+- Probe returns 200 but `healthy: false` in the response — this would indicate a logic error. The handler uses `(res.status === 200 || res.status === 404 || res.status === 426)` — double-check by running the raw API call and inspecting `region_health[0].healthy`.
+
+---
+
+## ST3 — Degraded State When DERP Probe Fails
+
+**What it verifies:** When the DERP probe cannot reach the relay server, `healthy` is `false` and the UI shows a `Degraded` badge.
+
+**Steps:**
+
+1. This test is best done by pointing the org to a non-existent DERP region hostname. If you have admin access, insert a test region:
+```bash
+curl -s -X POST https://login.quickztna.com/api/db/derp_regions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"hostname\": \"nonexistent.test.invalid\",
+    \"stun_port\": 3478,
+    \"derp_port\": 443,
+    \"region_code\": \"TEST-1\",
+    \"region_name\": \"Test Unreachable\",
+    \"priority\": 100
+  }" | python3 -m json.tool
+```
+
+2. Run the health check:
+```bash
+curl -s -X POST https://login.quickztna.com/api/derp-health \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "data": {
+    "region_health": [
+      {
+        "hostname": "nonexistent.test.invalid",
+        "healthy": false,
+        ...
+      }
+    ]
+  }
+}
+```
+
+3. On the Health page, click **Refresh** (the button text changes to "Refresh" after the first probe). Confirm the Relay Status badge now shows `Degraded` (red destructive badge).
+
+4. Clean up: delete the test region:
+```bash
+curl -s -X DELETE "https://login.quickztna.com/api/db/derp_regions?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"_filters\":[{\"column\":\"region_code\",\"op\":\"=\",\"value\":\"TEST-1\"},{\"column\":\"org_id\",\"op\":\"=\",\"value\":\"$ORG_ID\"}]}"
+```
+
+**Pass:** `healthy: false` returned for unreachable hostname. UI badge switches to `Degraded`.
+
+**Fail / Common issues:**
+- Probe does not time out quickly — the handler uses a 5-second AbortController timeout. DNS resolution for `.invalid` domains should fail quickly, but in some environments DNS lookups can take several seconds before failing.
+- Badge still shows `Healthy` — the UI renders based on `derpHealth.healthy !== false`. Check whether `derpHealth` from the API has the `healthy` field on the top-level `derp_server` object (which is `region_health[0]`), not on a `probe_results` array.
+
+---
+
+## ST4 — Active Sessions Count Reflects Relay Usage
+
+**What it verifies:** The Active Sessions count shown in the health card accurately reflects the number of machines using the DERP relay in the last 2 minutes.
+
+**Steps:**
+
+1. Ensure <MachineRef name="Win-A" /> has been running with `ztna up` for more than 2 minutes to ensure a relay session exists (each heartbeat refreshes `relay_sessions.last_heartbeat`).
+
+2. Run the health check and note the `active_sessions` and `total_sessions` values:
+```bash
+curl -s -X POST https://login.quickztna.com/api/derp-health \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+3. Cross-check by querying `relay_sessions` directly:
+```bash
+curl -s "https://login.quickztna.com/api/db/relay_sessions?org_id=$ORG_ID&select=machine_id,status,last_heartbeat" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+4. From the `relay_sessions` response, manually count how many sessions have `last_heartbeat` within the last 2 minutes. This should match `active_sessions` from the health check response.
+
+**Expected:** `active_sessions` equals the count of `relay_sessions` rows with `last_heartbeat` newer than 2 minutes ago.
+
+**Pass:** `active_sessions` count matches the manual count from `relay_sessions` with `last_heartbeat < 2 min ago`.
+
+**Fail / Common issues:**
+- `active_sessions` is 0 despite machines being online — machines that achieve direct P2P WireGuard connections may not have a `relay_sessions` entry, or their session may have expired. This is expected: `active_sessions` counts relay-dependent machines, not all online machines.
+- Sessions appear in `relay_sessions` but `active_sessions` is still 0 — check whether `last_heartbeat` timestamps are stale. The heartbeat handler updates `relay_sessions.last_heartbeat` only while the machine is not quarantined or admin-disabled.
+
+---
+
+## ST5 — Unauthenticated and Missing org_id Errors
+
+**What it verifies:** The `derp-health` endpoint correctly rejects requests missing authentication or `org_id`.
+
+**Steps:**
+
+1. Test without an auth token:
+```bash
+curl -s -X POST https://login.quickztna.com/api/derp-health \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "..."
+  }
+}
+```
+
+2. Test with a valid token but no `org_id`:
+```bash
+curl -s -X POST https://login.quickztna.com/api/derp-health \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MISSING_FIELDS",
+    "message": "org_id required"
+  }
+}
+```
+
+3. Test with a valid token but an `org_id` the user does not belong to:
+```bash
+curl -s -X POST https://login.quickztna.com/api/derp-health \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"00000000-0000-0000-0000-000000000000\"}" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Not a member"
+  }
+}
+```
+
+**Pass:** 401 for missing token, 400 for missing `org_id`, 403 for non-member org.
+
+**Fail / Common issues:**
+- Missing `org_id` returns 401 instead of 400 — the handler reads `org_id` from query params or request body. If the body fails to parse, the auth check (which runs first) may return 401 before the missing-fields check. Ensure the `Content-Type: application/json` header is present.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Check Health button triggers DERP probe | POST to `/api/derp-health` fires; card populates with region data |
+| ST2 | Healthy DERP server detected correctly | HTTP 200/404/426 from `/derp/probe` → `healthy: true` → green badge |
+| ST3 | Degraded state for unreachable relay | Connection failure → `healthy: false` → `Degraded` red badge |
+| ST4 | Active sessions count is accurate | `active_sessions` matches `relay_sessions` rows with heartbeat under 2 min |
+| ST5 | Auth and input validation | 401 no token, 400 no org_id, 403 non-member org |

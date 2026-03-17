@@ -1,0 +1,285 @@
+---
+title: "Upgrade Flow (Razorpay Checkout)"
+topic: "Billing & Plans"
+order: 93
+machines: ["Win-A"]
+summary: "Walk through the complete Razorpay subscription creation flow — from clicking Upgrade in the UI to the checkout session being created, the redirect, and the subscription.activated webhook updating the billing_subscriptions table."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Upgrading a plan triggers a multi-step flow across three backend handlers:
+
+**1. `handleCreateCheckout`** (`create-checkout.ts`, `POST /api/create-checkout`):
+- Requires JWT + org admin/owner role (`isOrgAdmin` check).
+- Accepts `{ org_id, plan_id }` where `plan_id` is `"business"` or `"workforce"`.
+- Maps `plan_id` to a Razorpay Plan ID from env vars `RAZORPAY_PLAN_BUSINESS` or `RAZORPAY_PLAN_WORKFORCE`.
+- Calls `POST https://api.razorpay.com/v1/subscriptions` with `{ plan_id, total_count: 96, quantity: 1, notes: { org_id, plan_id, user_id } }`.
+- The `notes` object is critical — it is how the webhook later identifies which org to update.
+- Returns `{ checkout_url, subscription_id }`. The `checkout_url` is Razorpay's hosted payment page (`subscription.short_url`).
+- Stores the `subscription.id` in `billing_subscriptions.razorpay_subscription_id`.
+
+**2. User completes payment on Razorpay's hosted page.**
+
+**3. `handleRazorpayWebhook`** (`razorpay-webhook.ts`, `POST /api/razorpay-webhook`):
+- Verifies `X-Razorpay-Signature` header using HMAC-SHA256 (constant-time comparison).
+- On `subscription.activated` event: upserts `billing_subscriptions` row with `plan`, `status = 'active'`, limits, and period dates.
+- On `subscription.charged` event: updates period dates.
+- On `subscription.cancelled` or `subscription.halted`: resets to `plan = 'free'`.
+- Invalidates `features:{org_id}` in Valkey after any event.
+
+**Frontend flow** (`BillingPage.tsx`):
+- `initSubscription(planId)` calls `api.functions.invoke("create-checkout", { body: { plan_id, org_id, ... } })`.
+- If `result.url` is set, it does `window.location.href = result.url` (hard redirect to Razorpay).
+- On return, Razorpay redirects to `/billing?success=true` or `/billing?canceled=true`.
+- A green alert banner appears for `?success=true`; a yellow alert for `?canceled=true`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — initiate upgrade flow as org admin |
+
+---
+
+## ST1 — Create-Checkout API Returns Valid Checkout URL
+
+**What it verifies:** `POST /api/create-checkout` with a valid Business plan request returns a Razorpay checkout URL and subscription ID.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, obtain a JWT for an org where you are admin or owner:
+```bash
+TOKEN=$(curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['access_token'])")
+```
+
+2. Call the checkout endpoint:
+```bash
+curl -s -X POST https://login.quickztna.com/api/create-checkout \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "plan_id": "business"
+  }' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "checkout_url": "https://pages.razorpay.com/pl_XXXXXXXXXXXX/view",
+    "subscription_id": "sub_XXXXXXXXXXXX"
+  }
+}
+```
+
+**Pass:** HTTP 200. `data.checkout_url` starts with `https://pages.razorpay.com/` or `https://rzp.io/`. `data.subscription_id` starts with `sub_`.
+
+**Fail / Common issues:**
+- `FORBIDDEN` (403) — the user is not an admin or owner of the org.
+- `INVALID_PLAN` (400) — `plan_id` is not `"business"` or `"workforce"`. The Free plan has no Razorpay plan ID and cannot be "upgraded to".
+- `NOT_CONFIGURED` (503) — `RAZORPAY_PLAN_BUSINESS` env var is not set on the server.
+- `RAZORPAY_ERROR` (502) — Razorpay API rejected the request. Check the error message for details (invalid plan ID, authentication failure, etc.).
+
+---
+
+## ST2 — Non-Admin Cannot Create Checkout
+
+**What it verifies:** The `isOrgAdmin` check in `handleCreateCheckout` blocks non-admin users from creating subscriptions.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, log in as a **member** (not admin, not owner) of the org.
+2. Call the checkout endpoint with the member's token:
+```bash
+curl -s -X POST https://login.quickztna.com/api/create-checkout \
+  -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"YOUR_ORG_ID","plan_id":"business"}' | python3 -m json.tool
+```
+
+**Expected response (HTTP 403):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Only owners and admins can manage billing"
+  }
+}
+```
+
+**Pass:** HTTP 403, `error.code` is `"FORBIDDEN"`.
+
+**Fail / Common issues:**
+- HTTP 200 returned — the user's role may actually be admin. Verify with:
+```bash
+curl -s "https://login.quickztna.com/api/db/org_members?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## ST3 — Checkout Redirect and Success Banner in UI
+
+**What it verifies:** Clicking the Upgrade button in the UI redirects to Razorpay, and returning to `/billing?success=true` displays the green success alert.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, log in as org admin and navigate to `/billing`.
+2. In the plan selector grid, click **Upgrade** on the **Business** plan card.
+3. Observe the button state and network activity in DevTools.
+
+**Expected:**
+- The Upgrade button shows a spinner and `"Processing..."` label while the API call is in progress.
+- A network request to `POST /api/create-checkout` completes with HTTP 200.
+- The browser is redirected to `https://pages.razorpay.com/...`.
+
+4. Do **not** complete payment — click the back button or navigate directly to:
+   `https://login.quickztna.com/billing?canceled=true`
+
+**Expected:**
+- A yellow alert banner appears with title "Checkout canceled" and text "Your plan was not changed. You can try again anytime."
+- A **Dismiss** button is visible on the banner.
+
+5. Click Dismiss.
+
+**Expected:** The URL returns to `/billing` (query params cleared). The banner disappears.
+
+**Pass:** Spinner shown during API call. Redirect to Razorpay initiated. Canceled banner shown on return. Dismiss clears the banner and URL.
+
+**Fail / Common issues:**
+- Spinner never appears — JavaScript error on click. Check DevTools Console.
+- No redirect — the API may have returned an error. Check DevTools Network for the `create-checkout` response.
+- Banner does not appear — you may have navigated to `/billing` without the `?canceled=true` param.
+
+---
+
+## ST4 — Simulate Webhook: subscription.activated Updates DB
+
+**What it verifies:** A webhook payload with event `subscription.activated` upserts the `billing_subscriptions` row with correct plan, limits, and `status = 'active'`.
+
+This test sends a simulated webhook. Since signature verification is active, we must use the real `RAZORPAY_WEBHOOK_SECRET` or disable signature checking for this test.
+
+**Steps (development / staging environment only):**
+1. Obtain the Razorpay webhook secret from the production environment:
+```bash
+ssh root@172.99.189.211 "grep RAZORPAY_WEBHOOK_SECRET /opt/quickztna/.env.production"
+```
+
+2. Construct a test payload:
+```bash
+PAYLOAD='{
+  "event": "subscription.activated",
+  "payload": {
+    "subscription": {
+      "entity": {
+        "id": "sub_test001",
+        "plan_id": "plan_BUSINESS_ID",
+        "customer_id": "cust_test001",
+        "notes": {
+          "org_id": "YOUR_ORG_ID",
+          "plan_id": "business",
+          "user_id": "YOUR_USER_ID"
+        }
+      }
+    }
+  }
+}'
+```
+
+3. Compute the HMAC-SHA256 signature:
+```bash
+SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "YOUR_WEBHOOK_SECRET" | awk '{print $2}')
+```
+
+4. Send the webhook:
+```bash
+curl -s -X POST https://login.quickztna.com/api/razorpay-webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Razorpay-Signature: $SIG" \
+  -d "$PAYLOAD" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{"received": true}
+```
+
+5. Verify the DB was updated:
+```bash
+curl -s "https://login.quickztna.com/api/db/billing_subscriptions?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected DB row:**
+```json
+{
+  "plan": "business",
+  "status": "active",
+  "razorpay_subscription_id": "sub_test001",
+  "machine_limit": 100,
+  "user_limit": 9999
+}
+```
+
+**Pass:** Webhook returns `{"received": true}`. The `billing_subscriptions` row shows `plan = "business"`, `status = "active"`, `machine_limit = 100`, `user_limit = 9999`.
+
+**Fail / Common issues:**
+- `INVALID_SIGNATURE` (401) — the computed signature does not match. Ensure the raw payload string (no pretty-printing) is used for the HMAC computation.
+- `MISSING_SIGNATURE` (400) — the `X-Razorpay-Signature` header was not sent.
+
+---
+
+## ST5 — Manage Subscription: Cancel Action
+
+**What it verifies:** `POST /api/manage-subscription` with `action: "cancel"` calls Razorpay's cancel API (`POST /v1/subscriptions/:id/cancel`) and logs the event to Loki audit.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ensure the org has an active Razorpay subscription (from ST4 or a real upgrade). The `billing_subscriptions` row must have a non-null `razorpay_subscription_id`.
+
+2. Call the manage-subscription endpoint:
+```bash
+curl -s -X POST https://login.quickztna.com/api/manage-subscription \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "action": "cancel",
+    "cancel_at_cycle_end": true
+  }' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "cancelled": true
+  }
+}
+```
+
+**Pass:** HTTP 200, `data.cancelled` is `true`. After Razorpay fires the `subscription.cancelled` webhook, the `billing_subscriptions` row will return to `plan = "free"` and `status = "canceled"`.
+
+**Fail / Common issues:**
+- `NO_SUBSCRIPTION` (400) — no `razorpay_subscription_id` in the DB row. The org must have an active Razorpay subscription to cancel.
+- `FORBIDDEN` (403) — caller is not an admin or owner.
+- `RAZORPAY_ERROR` (502) — Razorpay rejected the cancel request (e.g., subscription already cancelled or in a non-cancellable state).
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Checkout API creates Razorpay subscription | Returns `checkout_url` and `subscription_id` |
+| ST2 | Non-admin blocked from checkout | HTTP 403 `FORBIDDEN` for member-role user |
+| ST3 | UI upgrade flow and return banners | Spinner, redirect, canceled/success banners work |
+| ST4 | Webhook activates subscription in DB | `billing_subscriptions` updated to business plan, limits set |
+| ST5 | Cancel subscription via API | Returns `cancelled: true`; Razorpay cancel API called |

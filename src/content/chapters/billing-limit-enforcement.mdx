@@ -1,0 +1,254 @@
+---
+title: "Machine/User Limit Enforcement"
+topic: "Billing & Plans"
+order: 94
+machines: ["Win-A"]
+summary: "Verify that machine registration is blocked when the org reaches its machine_limit quota, and that the limit values in billing_subscriptions match the plan constants enforced by the backend."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Two types of limits are enforced by the billing system:
+
+**Machine limit** — enforced at registration time in `register-machine.ts`:
+```
+subscription = SELECT machine_limit FROM billing_subscriptions WHERE org_id = ?
+machineLimit  = subscription?.machine_limit || 5   (default if no subscription row)
+currentCount  = SELECT COUNT(*) FROM machines WHERE org_id = ?
+if currentCount >= machineLimit → 403 QUOTA_EXCEEDED
+```
+
+Note: the code comments say "Default free plan: 5 machines" but migration `035_new_pricing_tiers.sql` seeds free-plan subscriptions with `machine_limit = 100`. The fallback of 5 only applies to orgs with no `billing_subscriptions` row at all (e.g., created before migration 001).
+
+**User limit** — not currently enforced at the API level with a hard block. The `billing_subscriptions` table stores `user_limit`, and the frontend displays it in the progress bar, but there is no server-side guard on `POST /api/org-management` invite flows that blocks at `user_limit`. The limit is informational on the frontend for non-per-user plans.
+
+**Plan limits from `razorpay-webhook.ts` `PLAN_LIMITS` constant:**
+
+| Plan | `machine_limit` | `user_limit` |
+|---|---|---|
+| `free` | 100 | 3 |
+| `business` | 100 | 9999 |
+| `workforce` | 100 | 9999 |
+
+These values are written to `billing_subscriptions` by the `subscription.activated` webhook handler. They can also be set by direct DB operations.
+
+**Frontend display** in `BillingPage.tsx`:
+- `machineLimit` reads from `subscription?.machine_limit` first, then falls back to the `PLANS` constant (`100` for free, or `999` for per-user plans).
+- `userLimit` reads similarly.
+- Progress bar color shifts to indicate saturation as count approaches limit.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + API — verify limits and attempt over-quota registration |
+
+---
+
+## ST1 — Verify machine_limit and user_limit in DB
+
+**What it verifies:** The `billing_subscriptions` row contains the correct `machine_limit` and `user_limit` values matching the plan constants.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, query the subscription row for your org:
+```bash
+curl -s "https://login.quickztna.com/api/db/billing_subscriptions?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected for a free-plan org:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "plan": "free",
+      "status": "active",
+      "machine_limit": 100,
+      "user_limit": 3,
+      "razorpay_subscription_id": null
+    }
+  ]
+}
+```
+
+**Expected for a business-plan org (after webhook):**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "plan": "business",
+      "status": "active",
+      "machine_limit": 100,
+      "user_limit": 9999
+    }
+  ]
+}
+```
+
+**Pass:** `machine_limit` and `user_limit` values match the plan constants from `PLAN_LIMITS` in `razorpay-webhook.ts`.
+
+**Fail / Common issues:**
+- No row returned (empty array) — the org has no subscription row. The free-plan default of 5 machines (from the fallback in `register-machine.ts`) would apply. This is likely an org created before migration seeding. Manually insert a row:
+```bash
+# On production server
+ssh root@172.99.189.211 "docker exec quickztna-api-1 node -e \"\
+  const { DB } = require('./dist/db'); \
+  DB.prepare('INSERT INTO billing_subscriptions (id, org_id, plan, status, machine_limit, user_limit) VALUES (gen_random_uuid(), ?, \'free\', \'active\', 100, 3) ON CONFLICT (org_id) DO NOTHING').bind('YOUR_ORG_ID').run();\
+\""
+```
+
+---
+
+## ST2 — Machine Count Progress Bar Matches Machines Page
+
+**What it verifies:** The machine counter and progress bar on the Billing page accurately reflect the number of registered machines.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, navigate to `/machines` and count the machines in the list.
+2. Navigate to `/billing`.
+3. Read the value on the Machines progress bar row.
+
+**Expected:** The number shown before the `/` on the Machines line equals the count from the Machines page.
+
+4. Open DevTools → Network, filter for `machines`, and find the count request. The `useBillingData` hook requests:
+   `GET /api/db/machines?org_id=YOUR_ORG_ID` with a count-only option.
+
+**Pass:** Billing page machine count matches Machines page count. Progress bar fills proportionally (e.g., 3 machines out of 100 = 3% fill).
+
+**Fail / Common issues:**
+- Discrepancy of more than 1 — a machine registration or deletion happened between the two page loads. Reload both pages and recheck.
+- Progress bar shows 0/0 — `machine_limit` is 0 in the DB (edge case from a bad migration). Update the row directly.
+
+---
+
+## ST3 — QUOTA_EXCEEDED Blocks Over-Limit Registration
+
+**What it verifies:** When an org has reached its `machine_limit`, attempting to register another machine via auth key returns `QUOTA_EXCEEDED` with HTTP 403.
+
+**Steps:**
+
+This test requires an org at or near its machine limit. For a test org, the easiest approach is to temporarily reduce `machine_limit` to match the current machine count.
+
+1. On <MachineRef name="Win-A" />, check the current machine count:
+```bash
+MACHINE_COUNT=$(curl -s "https://login.quickztna.com/api/db/machines?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['data']))")
+echo "Current machines: $MACHINE_COUNT"
+```
+
+2. On the production server, set `machine_limit` to the current count (simulating a full quota):
+```bash
+ssh root@172.99.189.211 \
+  "docker exec quickztna-api-1 psql \$DATABASE_URL -c \
+  \"UPDATE billing_subscriptions SET machine_limit = $MACHINE_COUNT WHERE org_id = 'YOUR_ORG_ID';\""
+```
+
+3. Attempt to register a new machine using an auth key:
+```bash
+curl -s -X POST https://login.quickztna.com/api/register-machine \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auth_key": "tskey-auth-YOUR_KEY",
+    "name": "quota-test-machine"
+  }' | python3 -m json.tool
+```
+
+**Expected response (HTTP 403):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "QUOTA_EXCEEDED",
+    "message": "Machine limit reached (N). Upgrade your plan."
+  }
+}
+```
+
+4. After confirming the error, restore the original limit:
+```bash
+ssh root@172.99.189.211 \
+  "docker exec quickztna-api-1 psql \$DATABASE_URL -c \
+  \"UPDATE billing_subscriptions SET machine_limit = 100 WHERE org_id = 'YOUR_ORG_ID';\""
+```
+
+**Pass:** HTTP 403 with `QUOTA_EXCEEDED`. `error.message` includes the limit count.
+
+**Fail / Common issues:**
+- Registration succeeds despite full quota — the `register-machine.ts` handler may be reading a stale count. Confirm the DB `machine_limit` was actually set to match the count.
+- `INVALID_KEY` instead of `QUOTA_EXCEEDED` — quota check comes after auth key validation. Ensure the auth key is valid.
+
+---
+
+## ST4 — User Limit Displayed Correctly for Per-User Plans
+
+**What it verifies:** For Business and Workforce plans (per-user pricing), the Users row on the Billing page does not show a progress bar (since users are unlimited at 9999). For the Free plan (3 user limit), a progress bar is shown.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, navigate to `/billing` while on the **Free** plan.
+2. Locate the **Users** row in the Current Plan card.
+
+**Expected (Free plan):**
+- Users row shows `N / 3` (e.g., `2 / 3`).
+- A progress bar is visible below the user count.
+
+3. Simulate a paid plan by calling the `subscription.activated` webhook (see ST4 in the Upgrade Flow chapter) to switch to Business.
+4. Reload `/billing`.
+
+**Expected (Business plan):**
+- Users row shows only the count (e.g., `2`) with no `/limit` suffix.
+- No progress bar for users (hidden because `currentPlan.perUser === true`).
+- A **Monthly estimate** row appears: `2 users x $10/user = $20/mo`.
+
+**Pass:** Free plan shows user progress bar with `/3` limit. Paid plan hides the user progress bar and shows a monthly estimate.
+
+**Fail / Common issues:**
+- Progress bar shown on Business plan — the `currentPlan.perUser` flag may not be set. The plan ID from `feature-check` must match one of the `PLANS` array entries in `BillingPage.tsx`.
+
+---
+
+## ST5 — Billing Page Skeleton Shown While Loading
+
+**What it verifies:** While `useBillingData` is fetching, the page renders skeleton placeholders (not a blank page or error). Once loaded, the skeleton is replaced with real data.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open DevTools → Network → select **Slow 3G** throttling.
+2. Navigate to `/billing` (hard refresh with Ctrl+Shift+R to bypass cache).
+
+**Expected while loading:**
+- A skeleton for the title (two grey bars of width 40 and 64 respectively).
+- A skeleton card with three skeleton rows representing the plan, machines, and users.
+- Three skeleton cards representing the plan selector.
+- No error messages or blank white space.
+
+3. After the page loads (may take several seconds on Slow 3G):
+
+**Expected after load:**
+- All skeletons are replaced with real plan data.
+- Machine and user counts are populated.
+- Feature comparison table is rendered.
+
+4. Restore network throttling to normal.
+
+**Pass:** Skeleton shown during load. No flash of blank content. Smooth transition to real data after fetch completes.
+
+**Fail / Common issues:**
+- Page shows error state immediately — a fast-failing 401 or 403 can cause the loading state to end before skeletons are visible. Check DevTools for failed requests.
+- Skeleton persists after data arrives — a React Query state issue. Try clearing browser localStorage and reloading.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | DB limits match plan constants | `machine_limit` = 100 (free/business/workforce), `user_limit` = 3 (free) or 9999 (paid) |
+| ST2 | Machine count accuracy | Billing progress bar matches Machines page count |
+| ST3 | QUOTA_EXCEEDED enforcement | HTTP 403 on registration when `machine_limit` is full |
+| ST4 | User limit display per plan type | Free shows progress bar + /3; paid hides bar, shows monthly estimate |
+| ST5 | Loading skeleton | Skeleton rendered during fetch, replaced cleanly on load |

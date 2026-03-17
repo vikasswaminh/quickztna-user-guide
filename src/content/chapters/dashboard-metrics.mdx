@@ -1,0 +1,240 @@
+---
+title: "Dashboard Metrics Accuracy"
+topic: "Dashboard & Analytics"
+order: 76
+machines: ["Win-A"]
+summary: "Verify that every dashboard metric card — machine count, online count, member count, ACL rule count, threats blocked, active certs, and posture compliance rate — matches the underlying database records returned by the get_dashboard_stats RPC."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+`DashboardPage.tsx` loads all metrics in a single RPC call via `useDashboardData`, which calls `api.rpc("get_dashboard_stats", { _org_id: orgId })`. This maps to `POST /api/db/_rpc` with body `{ "fn": "get_dashboard_stats", "_org_id": "..." }`, handled in `db-crud.ts` (`handleRpc`).
+
+The RPC executes two primary queries plus six secondary queries in parallel:
+
+- **Primary 1:** `machines` table — returns all machines for the org, sorted by `last_seen DESC`
+- **Primary 2:** `org_members` LEFT JOIN `profiles` — returns all members with `full_name` and `avatar_url`
+- **Secondary queries (parallel):** pending invites, SSO enabled count, posture compliance totals, threats blocked, active certs, ACL rule count
+
+The frontend derives:
+- `machineCount` — total machines (all statuses)
+- `onlineCount` — machines where `status = 'online'`
+- `offlineCount` — `machineCount - onlineCount`
+- `pendingCount` — machines where `status = 'pending'`
+- `recentMachines` — first 4 online machines (by `last_seen DESC`)
+- `postureRate` — `Math.round((postureCompliant / postureTotal) * 100)`
+- `lastHeartbeat` — `Math.max` of all `last_seen` timestamps across all machines
+
+The React Query cache key is `["dashboard", orgId]`. Stale time is the React Query default — no custom `staleTime` is set.
+
+The data is displayed on `DashboardPage.tsx` in the "Network Status" card (machine counts) and "Configuration" card (ACL rules, members), and in the "Active Machines" and "Team" lists at the bottom.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + API testing machine — runs all curl commands and dashboard checks |
+
+---
+
+## ST1 — Machine Count Matches API
+
+**What it verifies:** The "Network Status" card shows the correct total, online, and pending machine counts drawn from the `get_dashboard_stats` RPC.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, set your credentials:
+```bash
+TOKEN="YOUR_ADMIN_JWT_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+```
+
+2. Call the RPC directly:
+```bash
+curl -s -X POST https://login.quickztna.com/api/db/_rpc \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"fn\":\"get_dashboard_stats\",\"_org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "data": {
+      "machines": [...],
+      "machineCount": 3,
+      "onlineCount": 2,
+      "offlineCount": 1,
+      "members": [...],
+      "memberCount": 2,
+      "pendingInvites": 0,
+      "ssoEnabled": false,
+      "postureTotal": 3,
+      "postureCompliant": 2,
+      "threatsBlocked": 0,
+      "activeCerts": 1,
+      "aclRuleCount": 4
+    }
+  }
+}
+```
+
+3. Open `https://login.quickztna.com/dashboard` in a browser on <MachineRef name="Win-A" />.
+
+4. Compare the "Network Status" card's displayed counts (e.g., "2/3 Online") against the `onlineCount` and `machineCount` fields from the API response.
+
+**Pass:** The dashboard "Network Status" card displays `onlineCount`/`machineCount` Online. The count displayed matches the RPC response exactly. No rounding or formatting difference.
+
+**Fail / Common issues:**
+- Dashboard shows a stale count — the React Query cache has not expired. Hard-refresh the page (`Ctrl+Shift+R`) to force a re-fetch.
+- `FORBIDDEN` from the API — the token belongs to a member role, not admin/owner. The RPC only requires org membership (`isOrgMember`), so membership is sufficient.
+
+---
+
+## ST2 — Pending Count Display
+
+**What it verifies:** Machines with `status = 'pending'` are counted and surfaced in the Network Status card as "N pending approval".
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, query pending machines directly:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.pending&select=id,name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Note the count of results.
+
+3. Call the RPC and check `pendingCount` is not in the RPC response directly — the frontend derives it from `machines.filter(m => m.status === 'pending').length` client-side.
+
+4. On the dashboard, the Network Status card displays the pending count line only when `pendingCount > 0`. Verify this line appears (or is absent) consistent with the pending machine count from step 1.
+
+**Expected (when 1 pending machine exists):**
+The Network Status card shows:
+```
+1 pending approval
+```
+
+**Pass:** The pending count label appears in the Network Status card when and only when pending machines exist. The count matches the raw DB query.
+
+**Fail / Common issues:**
+- Pending count is stale — a machine was recently registered and not yet approved. Refresh the dashboard. If still wrong, check whether the machine's `status` column in the DB actually reads `pending`.
+
+---
+
+## ST3 — ACL Rule Count and Member Count
+
+**What it verifies:** The "Configuration" card (admin view) shows the correct ACL rule count and member count from the RPC.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, get the raw ACL rule count:
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',d.get('results',[]))))"
+```
+
+2. Get the member count:
+```bash
+curl -s "https://login.quickztna.com/api/db/org_members?org_id=eq.$ORG_ID&select=user_id,role" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',d.get('results',[]))))"
+```
+
+3. Compare against the RPC `aclRuleCount` and `memberCount` fields from the RPC call in ST1.
+
+4. On the dashboard Configuration card, the displayed values should read:
+```
+ACL Rules: 4
+Members: 2
+```
+(matching your actual counts)
+
+**Pass:** `aclRuleCount` in the RPC matches the raw count of rows in `acl_rules` for the org. `memberCount` matches the count of rows in `org_members`. The Configuration card displays both correctly.
+
+**Fail / Common issues:**
+- `aclRuleCount` in RPC does not match the CRUD query count — the RPC uses `SELECT COUNT(*) FROM acl_rules WHERE org_id = ?` (all rules regardless of `enabled` flag), while the CRUD query may use different filters. Both are expected to match when no filter is applied.
+- Configuration card is absent — you are logged in as a `member` role. The Configuration card only renders for `owner` or `admin` roles. Members see the "Team" card instead.
+
+---
+
+## ST4 — Posture Compliance Rate
+
+**What it verifies:** The health card's posture rate is correctly computed as `Math.round((postureCompliant / postureTotal) * 100)`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, query posture reports:
+```bash
+curl -s "https://login.quickztna.com/api/db/posture_reports?org_id=eq.$ORG_ID&select=compliant" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Count the total and compliant rows from the response.
+
+3. Compute expected rate: `round((compliant / total) * 100)` — e.g., 2 compliant out of 3 total = 67%.
+
+4. Click "Show health and security details" on the dashboard to expand the advanced cards.
+
+5. Read the "Health" card's posture line — it reads `"Posture: N% compliant"` or `"Posture: No devices checked"` when `postureTotal === 0`.
+
+**Expected (2 compliant, 3 total):**
+```
+Posture: 67% compliant
+```
+
+**Pass:** The displayed percentage matches the manual calculation. When no posture reports exist, the card displays "No devices checked".
+
+**Fail / Common issues:**
+- Rate appears as 0% — posture reports exist but `postureCompliant` is 0, meaning no machines passed their posture checks.
+- "No devices checked" appears despite reports existing — the `postureTotal` field from the RPC is 0, which means the `posture_reports` table join is not finding records for this org.
+
+---
+
+## ST5 — Threats Blocked and Active Certs
+
+**What it verifies:** The Security card (in advanced view) shows the correct "Threats blocked" count from `threat_checks` and active certificates from `issued_certificates`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, query threats blocked:
+```bash
+curl -s "https://login.quickztna.com/api/db/threat_checks?org_id=eq.$ORG_ID&action_taken=eq.blocked&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',d.get('results',[]))))"
+```
+
+2. Query active certs:
+```bash
+curl -s "https://login.quickztna.com/api/db/issued_certificates?org_id=eq.$ORG_ID&revoked=eq.false&select=id,expires_at" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Note: The RPC filters active certs with `revoked = FALSE AND expires_at > NOW()`. The CRUD query above does not apply the expiry filter, so the CRUD count may be higher if expired-but-not-revoked certs exist.
+
+3. On the dashboard, click "Show health and security details". Read the Security card:
+```
+SSO: Off
+Threats blocked: 0
+Certs: 1 active
+```
+
+**Pass:** "Threats blocked" matches the count of rows with `action_taken = 'blocked'`. "Certs: N active" matches the count of non-revoked, non-expired certificates. SSO shows "Active" when at least one SSO configuration has `enabled = TRUE`.
+
+**Fail / Common issues:**
+- Cert count differs by 1 or more — the discrepancy is likely expired but not revoked certificates. The RPC applies `expires_at > NOW()` which the direct CRUD query does not.
+- Threats blocked shows stale data — the dashboard uses React Query; if a threat check was run recently, force-refresh the page.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Machine count RPC | `machineCount`/`onlineCount` in Network Status card match `get_dashboard_stats` response |
+| ST2 | Pending count | "N pending approval" line appears when and only when pending machines exist |
+| ST3 | ACL rules and member count | Configuration card counts match raw DB row counts |
+| ST4 | Posture compliance rate | Displayed percentage equals `round((compliant/total) * 100)` |
+| ST5 | Threats blocked and certs | Security card values match `threat_checks` and `issued_certificates` queries |

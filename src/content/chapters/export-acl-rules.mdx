@@ -1,0 +1,347 @@
+---
+title: "Export ACL Rules"
+topic: "Export & Data Management"
+order: 103
+machines: ["Win-A"]
+summary: "Verify that ACL rule data can be retrieved via the CRUD endpoint and the compliance_report export, cross-check ACL rule counts, and confirm that exported rule structure matches what was configured in the dashboard."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The `handleExportData` handler (`POST /api/export`) does not have a dedicated `acl_rules` action. ACL rule data is exported through two mechanisms:
+
+1. **CRUD endpoint** — `GET /api/db/acl_rules` returns the full rule set with all columns.
+2. **Compliance report** — `POST /api/export` with `action: "compliance_report"` returns `summary.acl_rules` which is a count of enabled ACL rules (`enabled = TRUE`).
+
+The CRUD query for ACL rules:
+
+```
+GET /api/db/acl_rules?org_id=eq.ORG_ID
+```
+
+Returns all columns from the `acl_rules` table including `id`, `name`, `src`, `dst`, `ports`, `protocol`, `action`, `enabled`, `created_at`.
+
+The compliance report's ACL count query (from the handler source):
+
+```sql
+SELECT COUNT(*) as total FROM acl_rules WHERE org_id = ? AND enabled = TRUE
+```
+
+This chapter covers retrieving, validating, and cross-checking ACL rule data from both sources.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — all API calls issued from here |
+
+Before starting, confirm you have at least two ACL rules configured for your org — one enabled and one disabled. Create them at `https://login.quickztna.com/acls` if needed.
+
+```bash
+TOKEN="eyJhbGciOiJFUzI1NiIsInR..."
+ORG_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+---
+
+## ST1 — Retrieve All ACL Rules via CRUD
+
+**What it verifies:** The CRUD endpoint returns all ACL rules for the org (both enabled and disabled), with all expected fields present.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -m json.tool
+```
+
+**Expected response structure:**
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "...",
+      "org_id": "...",
+      "name": "Allow SSH from dev",
+      "src": "tag:dev",
+      "dst": "tag:servers",
+      "ports": "22",
+      "protocol": "tcp",
+      "action": "allow",
+      "enabled": true,
+      "created_at": "2026-03-10T09:00:00.000Z"
+    },
+    {
+      "id": "...",
+      "org_id": "...",
+      "name": "Block all to prod",
+      "src": "*",
+      "dst": "tag:prod",
+      "ports": "*",
+      "protocol": "*",
+      "action": "deny",
+      "enabled": false,
+      "created_at": "2026-03-11T14:00:00.000Z"
+    }
+  ]
+}
+```
+
+Count the rules:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+rules = d['data']
+enabled = [r for r in rules if r.get('enabled')]
+disabled = [r for r in rules if not r.get('enabled')]
+print(f'Total rules  : {len(rules)}')
+print(f'Enabled      : {len(enabled)}')
+print(f'Disabled     : {len(disabled)}')
+"
+```
+
+**Pass:** Response has `success: true`. Each rule has `id`, `name`, `src`, `dst`, `ports`, `protocol`, `action`, `enabled`, `created_at`. Both enabled and disabled rules are returned.
+
+**Fail / Common issues:**
+- Empty `data` array — no ACL rules exist for this org. Create at least one rule via the dashboard first.
+- `401 UNAUTHORIZED` — token expired. Re-authenticate.
+
+---
+
+## ST2 — Filter Enabled Rules Only
+
+**What it verifies:** The CRUD endpoint correctly filters when `enabled=eq.true` is appended to the query string, returning only enabled rules.
+
+**Steps:**
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID&enabled=eq.true" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+rules = d['data']
+print(f'Enabled rules: {len(rules)}')
+for r in rules:
+    print(f'  {r[\"name\"]} | src={r[\"src\"]} dst={r[\"dst\"]} action={r[\"action\"]}')
+"
+```
+
+**Expected:** Only rules where `enabled` is `true` are returned. No disabled rule appears.
+
+Also filter disabled rules:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID&enabled=eq.false" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(f'Disabled rules: {len(d[\"data\"])}')
+"
+```
+
+Cross-check: enabled count + disabled count must equal the total from ST1.
+
+**Pass:** Filtered results contain only rules matching the `enabled` filter. Enabled + disabled counts sum to the total.
+
+**Fail / Common issues:**
+- `enabled=eq.true` returns all rules — the CRUD handler may not support boolean filters on this column. Verify by inspecting the `enabled` field on each returned row.
+- Sum does not add up — there may be rules with a null `enabled` value. These would be excluded from both filtered queries.
+
+---
+
+## ST3 — Cross-Check ACL Count Against Compliance Report
+
+**What it verifies:** The `summary.acl_rules` count in the compliance report matches the count of enabled rules returned by the CRUD endpoint.
+
+**Steps:**
+
+1. Get enabled rule count from CRUD:
+
+```bash
+ENABLED_COUNT=$(curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID&enabled=eq.true" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; print(len(json.load(sys.stdin)['data']))")
+
+echo "CRUD enabled count: $ENABLED_COUNT"
+```
+
+2. Get ACL count from compliance report:
+
+```bash
+REPORT_COUNT=$(curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"compliance_report\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['summary']['acl_rules'])")
+
+echo "Report ACL count: $REPORT_COUNT"
+```
+
+3. Compare:
+
+```bash
+if [ "$ENABLED_COUNT" = "$REPORT_COUNT" ]; then
+  echo "PASS: Counts match ($ENABLED_COUNT)"
+else
+  echo "FAIL: CRUD=$ENABLED_COUNT, Report=$REPORT_COUNT"
+fi
+```
+
+**Expected:**
+
+```
+CRUD enabled count: 3
+Report ACL count: 3
+PASS: Counts match (3)
+```
+
+**Pass:** Both counts are equal. The compliance report's `acl_rules` value reflects the same data as the CRUD endpoint filtered by `enabled = TRUE`.
+
+**Fail / Common issues:**
+- Counts differ by 1 — a rule was enabled or disabled between the two API calls. Re-run immediately back-to-back.
+- Report count is 0 while CRUD count is non-zero — the compliance report query filters on `enabled = TRUE`. Check that your rules have `enabled: true`.
+
+---
+
+## ST4 — Export ACL Rules to JSON File for Backup
+
+**What it verifies:** ACL rule data retrieved via the CRUD endpoint can be saved as a JSON file suitable for offline backup or re-import into another org.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+rules = d['data']
+# Strip org_id and id for portability (would change on re-import to a new org)
+export = []
+for r in rules:
+    export.append({
+        'name': r['name'],
+        'src': r['src'],
+        'dst': r['dst'],
+        'ports': r['ports'],
+        'protocol': r['protocol'],
+        'action': r['action'],
+        'enabled': r['enabled'],
+    })
+with open('acl_rules_backup.json', 'w') as f:
+    json.dump(export, f, indent=2)
+print(f'Exported {len(export)} ACL rules to acl_rules_backup.json')
+"
+```
+
+**Expected:**
+
+```
+Exported 3 ACL rules to acl_rules_backup.json
+```
+
+Verify the file:
+
+```bash
+cat acl_rules_backup.json
+```
+
+**Expected:**
+
+```json
+[
+  {
+    "name": "Allow SSH from dev",
+    "src": "tag:dev",
+    "dst": "tag:servers",
+    "ports": "22",
+    "protocol": "tcp",
+    "action": "allow",
+    "enabled": true
+  }
+]
+```
+
+**Pass:** File is written without error. The JSON is valid and contains all exported rules. `id` and `org_id` are excluded (they are org-specific and cannot be re-used in a different org).
+
+**Fail / Common issues:**
+- `KeyError` in the Python script — a rule is missing an expected field. Check whether any rule was created with missing optional fields.
+- Empty file — no rules exist for the org. Create at least one ACL rule before running this test.
+
+---
+
+## ST5 — Verify Protocol Wildcard Field Value
+
+**What it verifies:** ACL rules configured with "all protocols" use `"*"` as the protocol value (not `"all"`, `"any"`, or `null`).
+
+This is a critical correctness check — the Go client reads the `protocol` field when evaluating ACL rules, and it expects `"*"` for wildcard.
+
+**Steps:**
+
+1. Create an ACL rule with protocol set to "all" via the dashboard at `https://login.quickztna.com/acls`. Set:
+   - Name: `test-protocol-wildcard`
+   - Source: `*`
+   - Destination: `*`
+   - Ports: `*`
+   - Protocol: `*` (all)
+   - Action: `allow`
+
+2. Retrieve the rule and check the `protocol` field:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID&name=eq.test-protocol-wildcard" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+if not d['data']:
+    print('ERROR: rule not found')
+else:
+    rule = d['data'][0]
+    print('protocol field value:', repr(rule['protocol']))
+    assert rule['protocol'] == '*', f'Expected \"*\" but got \"{rule[\"protocol\"]}\"'
+    print('PASS: protocol is \"*\"')
+"
+```
+
+**Expected:**
+
+```
+protocol field value: '*'
+PASS: protocol is "*"
+```
+
+3. Clean up the test rule via the dashboard or API.
+
+**Pass:** The `protocol` field for a wildcard rule stores `"*"` as the string value. No other representation (`"all"`, `"any"`, `null`) is used.
+
+**Fail / Common issues:**
+- `protocol` is `"all"` or `"any"` — the frontend may be storing a different value than the client expects. This would cause ACL evaluation mismatches on the Go client.
+- `protocol` is `null` — the column may not have a NOT NULL constraint and the frontend sent no value. The CRUD insert would need to supply `"*"` explicitly.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Full ACL rule retrieval | All rules returned with 9 expected fields each |
+| ST2 | Enabled/disabled filtering | `enabled=eq.true` and `eq.false` filters work; counts sum to total |
+| ST3 | Count cross-check | CRUD enabled count equals `compliance_report.summary.acl_rules` |
+| ST4 | JSON backup export | All rules saved to file with portable structure (no org_id/id) |
+| ST5 | Protocol wildcard value | Wildcard protocol stored as `"*"`, not `"all"` or `null` |

@@ -1,0 +1,403 @@
+---
+title: "Policy Versioning & Rollback"
+topic: "Governance & JIT Access"
+order: 70
+machines: ["Win-A"]
+summary: "Snapshot a policy before editing it, list version history, and roll back to a previous version. Verify the auto-snapshot-before-rollback behavior."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Policy versioning lets admins snapshot any ACL rule, posture policy, or ABAC policy before making changes, then roll back to any prior snapshot if needed. This chapter tests `snapshot_policy`, `list_policy_versions`, and `rollback_policy` inside `handleGovernance` (`backend/src/handlers/governance.ts`), routed via `POST /api/governance`.
+
+**`snapshot_policy`** (org admin only):
+- `policy_type` must be one of `'acl_rule'`, `'posture_policy'`, or `'abac_policy'`.
+- `policy_id` must be a UUID of a row in the corresponding table (`acl_rules`, `posture_policies`, `abac_policies`) belonging to the org.
+- Fetches the current row from the appropriate table and serializes it to `snapshot` (JSONB).
+- Computes the next version number: `MAX(version) + 1` across existing snapshots for this policy.
+- Inserts into `policy_versions`: `id`, `org_id`, `policy_type`, `policy_id`, `version`, `snapshot`, `change_summary`, `changed_by`.
+- Returns: `version_id`, `version` (the new version number).
+
+**`list_policy_versions`** (any org member):
+- Returns up to 50 version records for a specific `policy_type` + `policy_id`, ordered by `version DESC`.
+- Returns only metadata columns: `id`, `version`, `change_summary`, `changed_by`, `created_at` (not the full snapshot JSONB, to keep responses small).
+
+**`rollback_policy`** (org admin only):
+- Fetches the target `version_id` from `policy_versions`.
+- Auto-snapshots the current state before overwriting (inserts a new version with `change_summary = 'Auto-snapshot before rollback'`).
+- Builds a dynamic UPDATE from the snapshot's fields, excluding `id`, `org_id`, `created_at`, `created_by`, and always appending `updated_at = NOW()`.
+- Column names in the snapshot are validated against `/^[a-z][a-z0-9_]{0,62}$/` to prevent SQL injection.
+- On UPDATE failure, the auto-snapshot is deleted (rollback of the rollback).
+- Audit event: `policy.rollback` with `rolled_back_to_version` in details.
+- Returns: `rolled_back_to` (the version number restored).
+
+**DB tables touched:** `policy_versions`, `acl_rules` (or `posture_policies` / `abac_policies`).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | PowerShell for all API calls |
+
+**Prerequisites:** At least one enabled ACL rule exists in the org. You need an admin JWT token and the UUID of an ACL rule to test with. Get a rule UUID by listing ACL rules first.
+
+---
+
+## ST1 -- Snapshot a Policy Before Editing
+
+**What it verifies:** `snapshot_policy` captures the current state of an ACL rule and stores it in `policy_versions` with an incremented version number.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, get a list of ACL rules to find a UUID to work with:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+Pick any rule. Note its `id` (the ACL rule UUID) and its current `name` and `enabled` state.
+
+2. Create a version snapshot of that rule:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "snapshot_policy",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID",
+    "change_summary": "Snapshot before updating source selector from tag:dev to tag:dev-v2"
+  }'
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "version_id": "<uuid>",
+    "version": 1
+  },
+  "error": null
+}
+```
+
+This is version 1 (the first snapshot for this policy). Record `version_id`.
+
+3. Take a second snapshot immediately (to verify version increments):
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "snapshot_policy",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID",
+    "change_summary": "Second snapshot -- testing version increment"
+  }'
+```
+
+**Expected:** `version: 2`. The version number increments per policy, not globally.
+
+**Pass:** First snapshot returns HTTP 201 with `version: 1`. Second snapshot returns `version: 2`. `version_id` is a UUID.
+
+**Fail / Common issues:**
+- HTTP 404 `NOT_FOUND` -- `policy_id` does not match a row in `acl_rules` with the given `org_id`. Verify the UUID is correct and the rule belongs to your org.
+- HTTP 400 `INVALID_TYPE` -- `policy_type` must be exactly `"acl_rule"`, `"posture_policy"`, or `"abac_policy"`. Pluralized forms like `"acl_rules"` are not accepted.
+- HTTP 403 -- `snapshot_policy` requires org admin.
+
+---
+
+## ST2 -- List Policy Version History
+
+**What it verifies:** `list_policy_versions` returns metadata for all snapshots of a policy, ordered newest version first (highest version number first).
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, list all versions for the ACL rule snapshotted in ST1:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_policy_versions",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "versions": [
+      {
+        "id": "<uuid-v2>",
+        "version": 2,
+        "change_summary": "Second snapshot -- testing version increment",
+        "changed_by": "<admin-user-uuid>",
+        "created_at": "2026-03-17T..."
+      },
+      {
+        "id": "<uuid-v1>",
+        "version": 1,
+        "change_summary": "Snapshot before updating source selector from tag:dev to tag:dev-v2",
+        "changed_by": "<admin-user-uuid>",
+        "created_at": "2026-03-17T..."
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+2. Verify:
+   - Version 2 appears before version 1 (ordered by `version DESC`).
+   - `change_summary` matches what was provided in ST1.
+   - `changed_by` is the admin user UUID.
+   - The full `snapshot` JSONB is NOT present in this response (the query only selects `id, version, change_summary, changed_by, created_at`).
+
+3. Try listing versions for a policy that has never been snapshotted:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_policy_versions",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "00000000-0000-0000-0000-000000000000"
+  }'
+```
+
+**Expected:** HTTP 200, `data.versions: []` (empty array, no error).
+
+**Pass:** Versions are returned newest-first. `change_summary`, `changed_by`, and `created_at` are populated. Full snapshot JSONB is not included. Non-existent policy returns empty array.
+
+**Fail / Common issues:**
+- `versions` contains only 1 entry when 2 were created -- the second snapshot may have been created for a different `policy_id`. Verify both ST1 calls used the same `policy_id`.
+- `change_summary: null` -- the field is optional. If `change_summary` was not provided, it is stored as null.
+- HTTP 400 `MISSING_FIELDS` -- both `policy_type` and `policy_id` are required.
+
+---
+
+## ST3 -- Modify the Policy and Snapshot the Change
+
+**What it verifies:** After editing the ACL rule, a new snapshot captures the updated state. The version history grows.
+
+**Steps:**
+
+1. Edit the ACL rule (change its name to simulate a policy update):
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "_filters": {"id": "ACL_RULE_UUID", "org_id": "YOUR_ORG_ID"},
+    "name": "Updated Rule Name -- dev-v2 to prod-db"
+  }'
+```
+
+2. Snapshot the updated state:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "snapshot_policy",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID",
+    "change_summary": "Updated rule name from old to dev-v2 to prod-db"
+  }'
+```
+
+**Expected:** HTTP 201, `version: 3` (one higher than the previous max).
+
+3. Verify the version history now has 3 entries:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_policy_versions",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID"
+  }'
+```
+
+**Expected:** 3 versions returned, version 3 first.
+
+**Pass:** Version increments to 3 after the third snapshot. Version list returns 3 entries in descending order.
+
+**Fail / Common issues:**
+- CRUD PATCH for ACL rules: the `_filters` key in the body specifies the WHERE conditions. Unlike standard CRUD GET (which uses URL query params), PATCH ignores URL params and reads `_filters` from the body.
+- Version counter resets to 1 -- the `MAX(version)` query returned null (no rows found) and `(null || 0) + 1 = 1`. This should not happen if previous snapshots exist; verify the `policy_type` and `policy_id` match exactly.
+
+---
+
+## ST4 -- Roll Back to a Previous Version
+
+**What it verifies:** `rollback_policy` restores the ACL rule to its state at the target version, auto-snapshots the current state before overwriting, and returns the version number restored to.
+
+**Steps:**
+
+1. Note the current rule name (after ST3 edits it should be `"Updated Rule Name -- dev-v2 to prod-db"`).
+
+2. Get the `version_id` of version 1 from the list (the original pre-edit snapshot):
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_policy_versions",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID"
+  }'
+```
+
+Find the entry with `version: 1` and copy its `id` (the version row UUID).
+
+3. Roll back to version 1:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "rollback_policy",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID",
+    "version_id": "VERSION_1_UUID"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "rolled_back_to": 1
+  },
+  "error": null
+}
+```
+
+4. Verify the ACL rule now has its original name (from version 1):
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** The rule's `name` matches the name captured in the version 1 snapshot (the original name from before ST3's edit). `updated_at` is a fresh timestamp.
+
+**Pass:** `rollback_policy` returns `rolled_back_to: 1`. The rule's name is restored to the version 1 state. `updated_at` is set to the current time.
+
+**Fail / Common issues:**
+- HTTP 404 `NOT_FOUND` -- `version_id` is the UUID of the `policy_versions` row, not the version number integer. Use the `id` field from the list, not the `version` number.
+- HTTP 400 `MISSING_FIELDS` -- all three of `policy_type`, `policy_id`, and `version_id` are required.
+- Rule fields after rollback do not match the snapshot -- the handler excludes `id`, `org_id`, `created_at`, `created_by` from the UPDATE to preserve immutable fields. All other fields from the snapshot are applied.
+
+---
+
+## ST5 -- Auto-Snapshot Before Rollback Creates a New Version
+
+**What it verifies:** The `rollback_policy` handler auto-snapshots the pre-rollback state before overwriting, so the "current" state at time of rollback is preserved as a new version.
+
+**Steps:**
+
+1. Before rolling back, note the current version count. From ST4, we have 3 snapshots (versions 1, 2, 3). After the rollback in ST4, re-list:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_policy_versions",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID"
+  }'
+```
+
+**Expected:** 4 versions now exist (versions 1, 2, 3, and 4). Version 4 is the auto-snapshot created by the rollback handler before overwriting, with `change_summary: "Auto-snapshot before rollback"`.
+
+2. Confirm version 4 has:
+   - `change_summary: "Auto-snapshot before rollback"`
+   - `changed_by`: the admin user UUID who performed the rollback
+   - `created_at`: a timestamp matching approximately when the rollback was called
+
+3. Confirm version 4's snapshot contains the state that was active just before the rollback -- in this case, the `"Updated Rule Name -- dev-v2 to prod-db"` from ST3. You cannot inspect the snapshot content via `list_policy_versions` (it is not returned). But you can verify indirectly by rolling back to version 4 and checking the rule name:
+
+```powershell
+# Get version_id for version 4
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_policy_versions",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID"
+  }'
+# Copy the id for version 4
+
+# Roll back to version 4
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "rollback_policy",
+    "org_id": "YOUR_ORG_ID",
+    "policy_type": "acl_rule",
+    "policy_id": "ACL_RULE_UUID",
+    "version_id": "VERSION_4_UUID"
+  }'
+```
+
+4. Verify the rule name is now `"Updated Rule Name -- dev-v2 to prod-db"` (the ST3 state):
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `name: "Updated Rule Name -- dev-v2 to prod-db"`. The auto-snapshot correctly captured the pre-rollback state and it is now restorable.
+
+**Pass:** After rollback, version count increases by 1. The new version has `change_summary: "Auto-snapshot before rollback"`. Rolling back to the auto-snapshot version restores the pre-rollback state.
+
+**Fail / Common issues:**
+- Version count only grows by 1 for each rollback -- this is correct. Each rollback call adds exactly one auto-snapshot before applying the target version.
+- Auto-snapshot is missing -- the handler only creates the auto-snapshot `if (currentPolicy)`. If the policy row does not exist at rollback time (e.g., it was deleted), no auto-snapshot is created and the handler still attempts the UPDATE, which would affect 0 rows.
+- Auto-snapshot is deleted -- this happens only in the error path: if the `UPDATE` of the policy table throws, the handler deletes the auto-snapshot it just inserted and returns HTTP 500. In normal operation, the auto-snapshot persists.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | `snapshot_policy` captures the current policy row as JSONB and assigns an incrementing version number (HTTP 201) |
+| ST2 | `list_policy_versions` returns version metadata newest-first without the full snapshot payload; empty list for unsnapshotted policies |
+| ST3 | After editing a policy, a new snapshot captures the updated state; version counter increments correctly |
+| ST4 | `rollback_policy` restores the policy to the target version's snapshot, preserving immutable fields; returns `rolled_back_to` |
+| ST5 | Rollback auto-creates a new `"Auto-snapshot before rollback"` version; this auto-snapshot itself is restorable via a subsequent rollback |

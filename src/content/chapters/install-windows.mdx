@@ -1,0 +1,241 @@
+---
+title: "Windows Install via PowerShell"
+topic: "Client Install & Setup"
+order: 107
+machines: ["Win-A"]
+summary: "Verify that the PowerShell one-liner installs the ztna binary to %LOCALAPPDATA%\\Programs\\QuickZTNA, adds it to the user PATH, optionally installs the Windows service, and prints the correct success message."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Windows installer lives at `https://login.quickztna.com/install.ps1` and is served as a static file from the `public/` directory of the web app. When run via `irm ... | iex`, it performs the following sequence:
+
+1. Detects architecture: `amd64` or `arm64` based on `[Environment]::Is64BitOperatingSystem` and `$env:PROCESSOR_ARCHITECTURE`.
+2. Downloads the `ztna` binary from `https://login.quickztna.com/api/releases/latest/windows/amd64` (or the versioned path when `$env:ZTNA_VERSION` is set).
+3. Optionally downloads `quickztna-svc` and registers a Windows Service named `QuickZTNA` — only when running as Administrator and the service binary is available.
+4. Verifies a SHA-256 checksum if a `.sha256` sidecar is reachable (silently skipped if unavailable).
+5. Stops any existing `ztna` or `ztna-svc` processes before overwriting.
+6. Installs the binary to `%LOCALAPPDATA%\Programs\QuickZTNA\ztna.exe`.
+7. Copies `wintun.dll` alongside the binary if present in the archive.
+8. Adds `%LOCALAPPDATA%\Programs\QuickZTNA` to the current user's `PATH` environment variable (persistent, User scope).
+9. Prints either "ZTNA installed. Run 'ztna login' to authenticate." (no key) or "Connected to ZTNA Network. Please ask admin to approve your machine for further VPN access." (key provided via `$env:ZTNA_AUTH_KEY`).
+
+Install directory: `%LOCALAPPDATA%\Programs\QuickZTNA\`
+CLI binary: `ztna.exe`
+Service binary: `ztna-svc.exe`
+Windows service name: `QuickZTNA`
+Config directory (set by `ztna install`): `%ProgramData%\QuickZTNA\`
+
+## Your Test Setup
+
+| Machine | Role | Notes |
+|---------|------|-------|
+| <MachineRef name="Win-A" /> | Target install machine | Windows, India; run PowerShell as standard user first, then as Administrator for service tests |
+
+---
+
+## ST1 — Clean Install as Standard User
+
+**Objective:** Confirm the one-liner installs the binary and adds it to PATH without requiring elevation.
+
+**Steps:**
+
+1. Open PowerShell as a standard (non-elevated) user on <MachineRef name="Win-A" />.
+2. Confirm `ztna` is not present:
+   ```powershell
+   Get-Command ztna -ErrorAction SilentlyContinue
+   ```
+3. Run the installer:
+   ```powershell
+   irm https://login.quickztna.com/install.ps1 | iex
+   ```
+4. After completion, verify the install:
+   ```powershell
+   ztna version
+   ```
+
+**Expected final output line:**
+```
+ZTNA installed. Run 'ztna login' to authenticate.
+```
+
+**Expected output of `ztna version`:**
+```
+ztna version 3.2.13 (built <timestamp>, windows/amd64)
+```
+
+**Pass criteria:**
+- PowerShell one-liner completes without throwing a terminating error.
+- `ztna.exe` exists at `$env:LOCALAPPDATA\Programs\QuickZTNA\ztna.exe`.
+- `ztna version` runs successfully from a new PowerShell session (confirming PATH update).
+- Final printed line matches "ZTNA installed. Run 'ztna login' to authenticate."
+
+**Fail criteria:**
+- Script throws a red `Write-Host ... -ForegroundColor Red` "Installation failed" message.
+- `ztna.exe` is zero bytes.
+- `ztna version` fails in a new terminal (PATH not updated).
+
+---
+
+## ST2 — Install Directory and PATH Verification
+
+**Objective:** Confirm binary is in the correct directory and PATH is set for the User scope.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, after ST1:
+   ```powershell
+   # Confirm install directory
+   Get-Item "$env:LOCALAPPDATA\Programs\QuickZTNA\ztna.exe" | Select-Object FullName, Length
+
+   # Confirm PATH contains the install dir
+   [Environment]::GetEnvironmentVariable("PATH", "User") -split ";" | Where-Object { $_ -like "*QuickZTNA*" }
+   ```
+
+**Expected output:**
+```
+FullName                                                   Length
+--------                                                   ------
+C:\Users\<user>\AppData\Local\Programs\QuickZTNA\ztna.exe  14xxxxxx
+
+C:\Users\<user>\AppData\Local\Programs\QuickZTNA
+```
+
+**Pass criteria:**
+- `ztna.exe` size is greater than 10 MB.
+- `%LOCALAPPDATA%\Programs\QuickZTNA` appears in the User-scope PATH.
+- No duplicate PATH entries for the old install directory `%LOCALAPPDATA%\Programs\ZTNA` (the script removes that legacy path).
+
+**Fail criteria:**
+- Binary size is 0 bytes.
+- PATH does not contain the install directory.
+- Old legacy directory `%LOCALAPPDATA%\Programs\ZTNA` still exists.
+
+---
+
+## ST3 — Windows Service Install (Elevated)
+
+**Objective:** Confirm that running as Administrator installs the `QuickZTNA` Windows service.
+
+**Steps:**
+
+1. Open PowerShell as Administrator on <MachineRef name="Win-A" />.
+2. Run the installer:
+   ```powershell
+   irm https://login.quickztna.com/install.ps1 | iex
+   ```
+3. Check the service:
+   ```powershell
+   Get-Service -Name QuickZTNA -ErrorAction SilentlyContinue
+   sc.exe query QuickZTNA
+   ```
+
+**Expected output of `sc.exe query QuickZTNA`:**
+```
+SERVICE_NAME: QuickZTNA
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+```
+
+**Pass criteria:**
+- Service `QuickZTNA` exists.
+- Service state is `RUNNING` or `START_PENDING` (acceptable immediately after install).
+- `ztna-svc.exe` exists at `%LOCALAPPDATA%\Programs\QuickZTNA\ztna-svc.exe`.
+
+**Fail criteria:**
+- `Get-Service QuickZTNA` returns a "Cannot find any service" error.
+- Service exists but is in `STOPPED` state with an error code.
+- `ztna-svc.exe` is absent from the install directory.
+
+---
+
+## ST4 — Re-install Stops Existing Processes
+
+**Objective:** Confirm the installer cleanly stops running `ztna` processes before overwriting the binary.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, start the VPN in the foreground:
+   ```powershell
+   Start-Process ztna -ArgumentList "up" -NoNewWindow
+   ```
+2. Verify the process is running:
+   ```powershell
+   Get-Process ztna -ErrorAction SilentlyContinue
+   ```
+3. Run the installer again:
+   ```powershell
+   irm https://login.quickztna.com/install.ps1 | iex
+   ```
+4. After the installer completes, confirm no stale `ztna` process:
+   ```powershell
+   Get-Process ztna -ErrorAction SilentlyContinue
+   ```
+
+**Expected installer behaviour (from source):**
+```powershell
+Stop-Service -Name "QuickZTNA" -ErrorAction SilentlyContinue
+Get-Process -Name "ztna", "ztna-svc" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+```
+
+**Pass criteria:**
+- Installer completes without a "file in use" access denied error.
+- `ztna.exe` is successfully overwritten.
+- No stale `ztna` process remains after installer finishes.
+
+**Fail criteria:**
+- Installer fails with "Access to the path is denied" when copying `ztna.exe`.
+- Process still running after install (not killed).
+
+---
+
+## ST5 — Pinned Version via ZTNA_VERSION
+
+**Objective:** Confirm that `$env:ZTNA_VERSION` causes the script to use the versioned download URL.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />:
+   ```powershell
+   $env:ZTNA_VERSION = "3.2.13"
+   irm https://login.quickztna.com/install.ps1 | iex
+   ```
+2. After completion:
+   ```powershell
+   ztna version
+   Remove-Item Env:\ZTNA_VERSION
+   ```
+
+**Expected download URL used by script:**
+```
+https://login.quickztna.com/api/releases/v3.2.13/quickztna-3.2.13-windows-amd64.exe
+```
+
+**Expected output of `ztna version`:**
+```
+ztna version 3.2.13 (built ..., windows/amd64)
+```
+
+**Pass criteria:**
+- Binary reports version `3.2.13`.
+- No "Installation failed" message in red.
+- `$env:ZTNA_VERSION` does not persist after the test (clean up manually if needed).
+
+**Fail criteria:**
+- Binary reports a different version (latest was installed instead of pinned).
+- 404 error fetching the versioned URL.
+
+---
+
+## Summary
+
+| Sub-test | What is verified | Pass signal |
+|----------|-----------------|-------------|
+| ST1 | Clean install, standard user | `ztna version` works; correct final message |
+| ST2 | Install directory and user PATH | Binary in correct path; PATH updated for User scope |
+| ST3 | Windows service install (elevated) | `QuickZTNA` service running |
+| ST4 | Re-install stops existing processes | No "file in use" error; process killed before copy |
+| ST5 | Pinned version via `ZTNA_VERSION` | Binary reports correct pinned version |

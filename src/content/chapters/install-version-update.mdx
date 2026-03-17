@@ -1,0 +1,321 @@
+---
+title: "Version Check & Auto-Update"
+topic: "Client Install & Setup"
+order: 109
+machines: ["Win-A", "Linux-C"]
+summary: "Verify ztna version prints the correct build string, ztna update --check queries the control plane version API, and ztna update downloads and applies a new binary when one is available."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+There are two commands involved:
+
+### `ztna version`
+Defined in `cmd_version.go`. Prints a single line with no network calls:
+```
+ztna version VERSION (built BUILDTIME, GOOS/GOARCH)
+```
+The `VERSION` and `BuildTime` values are injected at compile time via `-ldflags`. If the binary was built without ldflags, both values report `dev` or empty string. The current release version is `3.2.13`.
+
+### `ztna update`
+Defined in `cmd_update.go`. Supported flags:
+
+| Flag | Effect |
+|------|--------|
+| `--check` | Query the API and print update status; do not download |
+| `--json` | Output as JSON |
+| `--yes` | Skip the "Update to vX.Y.Z? [y/N]:" confirmation prompt |
+
+The command calls `POST https://login.quickztna.com/api/client-version` with body:
+```json
+{ "action": "check", "current_version": "3.2.13", "platform": "linux", "arch": "amd64" }
+```
+
+Note: `cmd_update.go` maps `darwin` to `"macos"` before sending. The platform field matches the values stored in the `client_versions` table (`linux`, `windows`, `macos`).
+
+The server response envelope:
+```json
+{
+  "success": true,
+  "data": {
+    "current_version": "3.2.13",
+    "latest_version": "3.2.13",
+    "update_available": false,
+    "download_url": "...",
+    "checksum_sha256": "...",
+    "release_notes": "...",
+    "published_at": "..."
+  }
+}
+```
+
+When `update_available` is `false`:
+```
+Current version: 3.2.13
+Latest version:  3.2.13
+
+You are up to date.
+```
+
+When `update_available` is `true`, the command prints release notes, prompts for confirmation (unless `--yes`), then downloads and applies the update via the `pkg/update` package. After applying:
+```
+Updated to X.Y.Z. Please restart any running ztna processes.
+```
+
+## Your Test Setup
+
+| Machine | Role | Notes |
+|---------|------|-------|
+| <MachineRef name="Win-A" /> | Windows version check | Run `ztna version` and `ztna update --check` |
+| <MachineRef name="Linux-C" /> | Linux version check and update apply | Primary test machine for full update flow |
+
+---
+
+## ST1 — ztna version Output Format
+
+**Objective:** Confirm `ztna version` prints the correct format on both platforms.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />:
+   ```bash
+   ztna version
+   ```
+2. On <MachineRef name="Win-A" />:
+   ```powershell
+   ztna version
+   ```
+
+**Expected output format:**
+```
+ztna version 3.2.13 (built 2026-03-13T10:00:00Z, linux/amd64)
+```
+```
+ztna version 3.2.13 (built 2026-03-13T10:00:00Z, windows/amd64)
+```
+
+**Pass criteria:**
+- Output matches the regex `ztna version \d+\.\d+\.\d+ \(built .+, (linux|windows|darwin)/(amd64|arm64)\)`.
+- Version is `3.2.13` (current release).
+- `GOOS/GOARCH` matches the actual OS and architecture of the machine.
+- Command exits 0.
+
+**Fail criteria:**
+- Output reads `ztna version dev (built , /)` — binary was built without `-ldflags` version injection.
+- Command not found.
+- Blank output.
+
+---
+
+## ST2 — ztna update --check (No Download)
+
+**Objective:** Confirm `ztna update --check` queries the version API and reports current/latest without downloading anything.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />:
+   ```bash
+   ztna update --check
+   ```
+2. Verify no files changed in the install directory:
+   ```bash
+   ls -la /usr/local/bin/ztna
+   ```
+
+**Expected output when already on latest:**
+```
+Current version: 3.2.13
+Latest version:  3.2.13
+
+You are up to date.
+```
+
+**Expected output when a newer version exists:**
+```
+Current version: 3.2.13
+Latest version:  3.2.14
+
+A new version is available!
+
+Release notes:
+...
+
+Download: https://login.quickztna.com/api/releases/v3.2.14/quickztna-3.2.14-linux-amd64
+```
+
+**Pass criteria:**
+- Command exits 0.
+- "Current version" line matches `ztna version` output.
+- When up to date: "You are up to date." is printed.
+- When update available: download URL is printed; binary is NOT replaced (no download without explicit `ztna update`).
+- Modification time on `/usr/local/bin/ztna` is unchanged.
+
+**Fail criteria:**
+- Command errors: "version check failed: ..." (API unreachable or bad response).
+- Binary is modified during `--check` run.
+- `latest_version` is empty.
+
+---
+
+## ST3 — ztna update --check --json
+
+**Objective:** Confirm JSON output mode is valid and contains all expected fields.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />:
+   ```bash
+   ztna update --check --json
+   ```
+2. Pipe through a JSON parser to validate structure:
+   ```bash
+   ztna update --check --json | python3 -m json.tool
+   ```
+
+**Expected JSON structure:**
+```json
+{
+  "current_version": "3.2.13",
+  "latest_version": "3.2.13",
+  "update_available": false,
+  "download_url": "...",
+  "checksum_sha256": "...",
+  "release_notes": "...",
+  "published_at": "..."
+}
+```
+
+**Pass criteria:**
+- Output is valid JSON (parser exits 0).
+- `current_version` matches `ztna version` output.
+- `update_available` is a boolean.
+- `latest_version` is a non-empty string.
+
+**Fail criteria:**
+- Output is not valid JSON.
+- `current_version` field is missing.
+- `update_available` is a string instead of boolean.
+
+---
+
+## ST4 — ztna update --yes (Full Update Apply)
+
+**Objective:** Confirm `ztna update --yes` downloads and applies an update without prompting, then reports the new version.
+
+**Pre-condition:** This test requires a newer version to be available in the `client_versions` table. If the current binary is already on the latest version, temporarily downgrade by installing an older binary first, then run the update.
+
+To simulate an older version for testing, install version 3.2.8:
+```bash
+ZTNA_VERSION=3.2.8 curl -fsSL https://login.quickztna.com/install.sh | sh
+ztna version
+```
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, with an older binary installed:
+   ```bash
+   ztna update --yes
+   ```
+2. After completion:
+   ```bash
+   ztna version
+   ```
+
+**Expected output during update:**
+```
+Current version: 3.2.8
+Latest version:  3.2.13
+
+A new version is available!
+
+Release notes:
+...
+Downloading update...
+  100% (14123456/14123456 bytes)
+Applying update...
+Updated to 3.2.13. Please restart any running ztna processes.
+```
+
+**Pass criteria:**
+- Download progress line is printed (percentage and byte count).
+- "Updated to 3.2.13." message is printed.
+- `ztna version` reports `3.2.13` after the update.
+- No confirmation prompt appears (skipped by `--yes`).
+
+**Fail criteria:**
+- "download failed: ..." error.
+- "apply failed: ..." error.
+- `ztna version` still reports old version after "Updated to" message.
+- Confirmation prompt appears despite `--yes` flag.
+
+---
+
+## ST5 — Version API Payload Validation
+
+**Objective:** Confirm the API call `POST /api/client-version` uses the correct fields: `action: "check"`, `platform`, and `arch`.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, manually call the version check API to verify the request/response contract:
+   ```bash
+   curl -fsSL -X POST https://login.quickztna.com/api/client-version \
+     -H "Content-Type: application/json" \
+     -d '{"action":"check","current_version":"3.2.13","platform":"linux","arch":"amd64"}' \
+     | python3 -m json.tool
+   ```
+2. Test with missing required fields:
+   ```bash
+   curl -fsSL -X POST https://login.quickztna.com/api/client-version \
+     -H "Content-Type: application/json" \
+     -d '{"action":"check","current_version":"3.2.13"}' \
+     | python3 -m json.tool
+   ```
+
+**Expected response for valid request:**
+```json
+{
+  "success": true,
+  "data": {
+    "current_version": "3.2.13",
+    "latest_version": "3.2.13",
+    "update_available": false,
+    ...
+  }
+}
+```
+
+**Expected response when `platform` is missing:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MISSING_FIELDS",
+    "message": "current_version and platform required"
+  }
+}
+```
+
+**Pass criteria:**
+- Valid request returns `"success": true`.
+- Missing `platform` returns `MISSING_FIELDS` error with HTTP 400.
+- `update_available` is a boolean, not a string.
+- No authentication header required (endpoint is public — no JWT needed per handler definition).
+
+**Fail criteria:**
+- Valid request returns HTTP 401 (endpoint should be unauthenticated).
+- `platform` field accepted when empty string (should be validated).
+- Response envelope uses a field name other than `success`/`data`/`error`.
+
+---
+
+## Summary
+
+| Sub-test | Machine | What is verified | Pass signal |
+|----------|---------|-----------------|-------------|
+| ST1 | Win-A + Linux-C | `ztna version` output format | Matches `ztna version X.Y.Z (built ...)` regex |
+| ST2 | Linux-C | `--check` queries API without downloading | Binary unchanged; "You are up to date." or URL printed |
+| ST3 | Linux-C | `--check --json` produces valid JSON | Parsed cleanly; all expected fields present |
+| ST4 | Linux-C | `--yes` applies update without prompt | New version reported; `ztna version` confirms |
+| ST5 | Linux-C | API payload contract validation | `MISSING_FIELDS` on bad request; success on valid |

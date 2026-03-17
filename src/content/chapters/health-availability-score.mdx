@@ -1,0 +1,286 @@
+---
+title: "Availability Score Calculation"
+topic: "Health & Monitoring"
+order: 82
+machines: ["Win-A", "Linux-C"]
+summary: "Understand and verify the client-side availability score algorithm — three tiers based on status and last_seen freshness — and how the org-wide average is calculated."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The availability score shown on the Health page is computed entirely client-side by the `getAvailabilityScore()` function in `HealthPage.tsx`. There is no backend endpoint for it — the function receives a `Machine` object and returns a number from 0 to 100.
+
+The exact algorithm from source:
+
+```
+status = "online":
+  if last_seen is null            → 100  (just came online, no heartbeat timestamp yet)
+  if last_seen < 5 minutes ago    → 100  (fresh — fully available)
+  if last_seen < 10 minutes ago   → 75   (stale heartbeat — partial availability)
+  if last_seen >= 10 minutes ago  → 50   (very stale — degraded availability)
+
+status = "pending"                → 0
+status = "offline"                → 0
+```
+
+The org-wide **Current Availability** percentage shown in the top-left summary card is:
+
+```
+avgAvailability = sum(getAvailabilityScore(m) for all m) / machines.length
+```
+
+Note: pending machines are included in the denominator (they contribute 0 to the numerator), which means pending machines drag the average down. The summary card shows a parenthetical note when pending machines are present.
+
+The data feeding this function comes from:
+```
+GET /api/db/machines?org_id=<org_id>&select=id,name,tailnet_ip,os,status,last_seen,created_at,version
+```
+
+The `last_seen` field is a UTC timestamp updated on every heartbeat in `machine-heartbeat.ts`:
+```sql
+UPDATE machines SET status = ?, last_seen = NOW() WHERE id = ?
+```
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser observation + API queries |
+| <MachineRef name="Linux-C" /> | VPN target — start/stop to produce different availability tiers |
+
+---
+
+## ST1 — Score = 100 for Fresh Online Machine
+
+**What it verifies:** A machine that has heartbeated within the last 5 minutes shows 100% availability.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, ensure the VPN is running:
+```bash
+ztna up
+ztna status
+```
+
+2. Wait for at least one heartbeat cycle (approximately 60 seconds) and query the `last_seen` field from <MachineRef name="Win-A" />:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "Linux-C",
+      "status": "online",
+      "last_seen": "2026-03-17T10:30:45.123Z"
+    }
+  ]
+}
+```
+
+3. Verify that `last_seen` is within the last 5 minutes (compare to current UTC time).
+
+4. Navigate to `/health` on <MachineRef name="Win-A" />. Find Linux-C's card row and confirm:
+   - Availability progress bar is filled to 100%
+   - Percentage label reads `100%`
+   - No `Stale` badge
+
+**Pass:** `last_seen` less than 5 minutes ago → availability bar shows 100%.
+
+**Fail / Common issues:**
+- Shows 75% despite recent activity — `last_seen` may not be updating. Verify the heartbeat is going through with `ztna status` on Linux-C.
+- Shows 0% — machine may be offline or pending. Check `status` field in the API response.
+
+---
+
+## ST2 — Score = 75 for Stale Heartbeat (5-10 Minutes)
+
+**What it verifies:** A machine that last sent a heartbeat between 5 and 10 minutes ago shows 75% availability and is not yet flagged as Stale.
+
+**Steps:**
+
+1. This test requires a machine that is still `online` but has a heartbeat gap of 5-10 minutes. The easiest way is to temporarily suspend the heartbeat process without cleanly stopping the VPN, or to query the DB directly for a machine in that window.
+
+2. From <MachineRef name="Win-A" />, compute the expected score by querying `last_seen`:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. Calculate the age of `last_seen` manually:
+```bash
+python3 -c "
+from datetime import datetime, timezone
+last_seen = '2026-03-17T10:25:00.000Z'
+age_min = (datetime.now(timezone.utc) - datetime.fromisoformat(last_seen.replace('Z','+00:00'))).total_seconds() / 60
+print(f'Age: {age_min:.1f} minutes')
+if age_min < 5: print('Expected score: 100')
+elif age_min < 10: print('Expected score: 75')
+else: print('Expected score: 50')
+"
+```
+
+4. On the Health page, verify that Linux-C shows:
+   - Availability bar at 75%
+   - Status badge still reads `online` (not `offline`)
+   - No `Stale` badge yet (Stale only appears at >10 minutes)
+
+**Expected:** Availability bar at approximately 75%, no Stale badge.
+
+**Pass:** Score matches the 75% tier for a 5-10 minute heartbeat gap.
+
+**Fail / Common issues:**
+- The 5-10 minute window is difficult to hit precisely in a live environment. If the heartbeat is working normally (60-second interval), the machine stays at 100%. To reliably test the 75% tier, pause the heartbeat process temporarily.
+
+---
+
+## ST3 — Score = 50 and Stale Badge for Very Stale Heartbeat (>10 Minutes)
+
+**What it verifies:** A machine that is nominally `online` but has not heartbeated in more than 10 minutes shows 50% availability and the `Stale` badge.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, kill the VPN process without using `ztna down` (to prevent the graceful offline heartbeat):
+```bash
+# Find the ztna process and kill it hard (no graceful shutdown)
+sudo pkill -9 ztna
+```
+
+2. Wait 10 minutes without restarting. The backend cleanup job (`cleanup-machines.ts`) runs periodically and marks machines offline after 3 minutes of no heartbeat. However, until that job runs, `status` may still be `online` in the DB.
+
+3. Alternatively, query a machine that has a known stale `last_seen` (more than 10 minutes ago) while `status` is still `online`:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+4. If you find a machine with `status = "online"` and `last_seen` more than 10 minutes ago, navigate to `/health` and confirm its row shows:
+   - Availability bar at approximately 50%
+   - Yellow dot (not green)
+   - `Stale` badge with yellow outline text
+
+**Expected:** 50% availability bar, yellow status dot, `Stale` badge.
+
+**Pass:** A machine in the very-stale state (>10 min gap, still online in DB) shows the correct 50% score and `Stale` badge.
+
+**Fail / Common issues:**
+- Machine transitions to `offline` before reaching the 10-minute window — the cleanup cron job may be running frequently. If the job marks machines offline after 3 minutes, you will never observe the 50% state in production. The 50% tier is a brief transitional state between the job runs.
+- `Stale` badge shown but availability is still 100% — check the browser's system clock versus server UTC. The score is computed using `Date.now()` in the browser.
+
+---
+
+## ST4 — Score = 0 for Offline and Pending Machines
+
+**What it verifies:** Both `offline` and `pending` machines contribute 0 to the availability calculation.
+
+**Steps:**
+
+1. Stop the VPN on <MachineRef name="Linux-C" /> gracefully:
+```bash
+ztna down
+```
+
+2. Wait up to 10 seconds for the offline heartbeat to propagate (or for the cleanup job to mark it offline).
+
+3. From <MachineRef name="Win-A" />, confirm Linux-C is `offline`:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "data": [
+    { "name": "Linux-C", "status": "offline" }
+  ]
+}
+```
+
+4. Navigate to `/health`. Linux-C's row should show:
+   - Availability bar at 0%
+   - Grey status dot
+   - Status badge: `offline`
+
+5. If any machines are in `pending` status (registered but not yet approved), they should also show 0% with a yellow pending dot.
+
+**Pass:** Offline and pending machines both show 0% availability.
+
+**Fail / Common issues:**
+- Availability still shows >0% after `ztna down` — the page may not have re-fetched yet. The WebSocket channel triggers a re-fetch on `UPDATE` events from the machines table. If WebSocket is not connected, the page will not update until manual refresh.
+
+---
+
+## ST5 — Org-Wide Average Availability Calculation
+
+**What it verifies:** The "Current Availability" percentage in the top-left summary card is the correct arithmetic mean of all per-machine scores, with pending machines included in the denominator.
+
+**Steps:**
+
+1. From <MachineRef name="Win-A" />, get the full machine list with status and last_seen:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Manually compute the expected average:
+```bash
+python3 -c "
+from datetime import datetime, timezone
+
+# Fill in from your API response:
+machines = [
+    {'name': 'Win-A',    'status': 'online',  'last_seen': '2026-03-17T10:30:40.000Z'},
+    {'name': 'Linux-C',  'status': 'online',  'last_seen': '2026-03-17T10:30:45.000Z'},
+    {'name': 'Win-B',    'status': 'offline', 'last_seen': '2026-03-17T09:00:00.000Z'},
+]
+
+def score(m):
+    if m['status'] == 'online':
+        if not m['last_seen']:
+            return 100
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(m['last_seen'].replace('Z','+00:00'))).total_seconds() / 60
+        if age < 5:  return 100
+        if age < 10: return 75
+        return 50
+    return 0
+
+scores = [score(m) for m in machines]
+avg = sum(scores) / len(machines)
+print('Scores:', scores)
+print(f'Average: {avg:.0f}%')
+"
+```
+
+3. Compare the script output to the Current Availability card on the Health page.
+
+4. If pending machines exist, the card label will show a parenthetical: `Current Availability (N pending excluded)` — but note that the code comment says excluded while the actual formula includes them with score 0 in the average denominator. The label wording is slightly misleading; test the actual number matches the formula with pending machines at 0.
+
+**Expected:** The page value matches the manually computed average (rounded to nearest integer).
+
+**Pass:** The displayed percentage matches `floor(sum of scores / total machine count)`.
+
+**Fail / Common issues:**
+- Off by one due to rounding — the code uses `toFixed(0)` which rounds to the nearest integer. Your manual calculation should also round.
+- Machines differ from expected — the page fetches once on load. If a machine's status changed after the initial fetch, the average will be stale until the next WebSocket-triggered re-fetch.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Score = 100 for fresh heartbeat | `last_seen` less than 5 min ago → 100% bar, no Stale badge |
+| ST2 | Score = 75 for 5-10 min gap | Heartbeat gap 5-10 min → 75% bar, status still online |
+| ST3 | Score = 50 + Stale badge for >10 min gap | Heartbeat gap over 10 min → 50% bar, yellow dot, Stale badge |
+| ST4 | Score = 0 for offline and pending | Offline and pending machines → 0% bar |
+| ST5 | Org-wide average calculation | Summary card percentage matches arithmetic mean including zeros |

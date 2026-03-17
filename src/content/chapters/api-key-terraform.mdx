@@ -1,0 +1,383 @@
+---
+title: "Terraform Provider API Compatibility"
+topic: "API Keys & Programmatic Access"
+order: 100
+machines: ["Win-A", "Linux-C"]
+summary: "Test all five Terraform API resources — machines, acl-rules, dns, users, settings — using the dedicated /api/terraform/* endpoint authenticated with an API key."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The `handleTerraformApi` handler in `backend/src/handlers/terraform-api.ts` provides a stable, API-key-authenticated REST interface designed for infrastructure-as-code tooling such as a Terraform provider. It exposes five resource types under `POST/GET/DELETE /api/terraform/*` and is registered at `app.all('/api/terraform/*', wrapWithUrl(env, handleTerraformApi))` in the router.
+
+Key facts from source code:
+
+- **Base path:** `/api/terraform/`
+- **Auth:** `X-Api-Key` header — handler hashes `apiKey.replace('ztna_', '')` and looks up in `api_keys` where `revoked = FALSE`; expiry is checked with `new Date(keyData.expires_at) < new Date()`
+- **Org scoping:** all resources are automatically scoped to `keyData.org_id` — no `org_id` query param needed
+- **Resources and methods:**
+  - `GET /api/terraform/machines` — list all machines (fields: `id`, `name`, `tailnet_ip`, `os`, `status`, `last_seen`, `tags`, `advertised_routes`, `ephemeral`, `created_at`)
+  - `GET /api/terraform/machines/:id` — get single machine
+  - `DELETE /api/terraform/machines/:id` — delete a machine
+  - `GET /api/terraform/acl-rules` — list all ACL rules ordered by `priority`
+  - `POST /api/terraform/acl-rules` — create ACL rule (fields: `name`, `source`, `destination`, `ports`, `protocol`, `action`, `priority`)
+  - `DELETE /api/terraform/acl-rules/:id` — delete ACL rule
+  - `GET /api/terraform/dns` — list DNS configs
+  - `GET /api/terraform/users` — list org members (`id`, `user_id`, `role`, `joined_at`)
+  - `GET /api/terraform/settings` — get org settings
+  - `PUT /api/terraform/settings` — update org settings (allowed fields: `allow_exit_nodes`, `allow_subnet_routing`, `key_expiry_days`)
+- **Validation on ACL rule POST:** `name` (string, max 100 chars), `source` (non-empty), `destination` (non-empty), `action` must be `"allow"` or `"deny"`, `protocol` must be `"tcp"`, `"udp"`, or `"*"`
+- **Error for unknown resource:** HTTP 404 with `available: ["machines", "acl-rules", "dns", "users", "settings"]`
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Windows workstation — dashboard, curl, API key management |
+| <MachineRef name="Linux-C" /> | Linux cloud node — `curl` calls simulating CI/CD or Terraform provider |
+
+Prerequisites:
+- A valid API key (`API_KEY`) with sufficient scope for the operations below
+- <MachineRef name="Win-A" /> is a registered machine in the org
+
+---
+
+## ST1 — Read All Terraform Resources
+
+**What it verifies:** The five GET-capable Terraform resources all return HTTP 200 with well-formed `data` payloads scoped to the API key's org.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, set the API key:
+
+```bash
+API_KEY="qztna_<your full key here>"
+BASE="https://login.quickztna.com/api/terraform"
+```
+
+2. List all five resources:
+
+```bash
+echo "=== machines ==="
+curl -s "$BASE/machines" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+
+echo "=== acl-rules ==="
+curl -s "$BASE/acl-rules" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+
+echo "=== dns ==="
+curl -s "$BASE/dns" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+
+echo "=== users ==="
+curl -s "$BASE/users" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+
+echo "=== settings ==="
+curl -s "$BASE/settings" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected:** All five return HTTP 200 with `"success": true`.
+
+- `machines`: `data.data` is an array. <MachineRef name="Win-A" /> should appear with `status: "online"` or `"offline"`.
+- `acl-rules`: `data.data` is an array ordered by `priority`.
+- `dns`: `data.data` is an array (may be empty if no DNS configs exist).
+- `users`: `data.data` is an array with at least one org member.
+- `settings`: `data` is a single object with `org_id`, `allow_exit_nodes`, `allow_subnet_routing`, `key_expiry_days`.
+
+**Pass:** All five return HTTP 200 with `success: true`. Arrays are present (may be empty for dns/acl-rules). Settings object is non-null.
+
+**Fail / Common issues:**
+- One or more return HTTP 404 `"Unknown resource"` — check the exact path spelling; `acl-rules` uses a hyphen, not underscore.
+- `settings` returns `data: null` — the org may not have a row in `org_settings` yet.
+
+---
+
+## ST2 — Create and Delete an ACL Rule via Terraform API
+
+**What it verifies:** The `POST /api/terraform/acl-rules` endpoint validates all required fields and creates a rule. `DELETE /api/terraform/acl-rules/:id` removes it.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, create an ACL rule:
+
+```bash
+CREATE_RESP=$(curl -s -X POST "$BASE/acl-rules" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"name\": \"terraform-test-rule\",
+    \"source\": \"100.0.0.0/8\",
+    \"destination\": \"100.64.0.1/32\",
+    \"ports\": \"443\",
+    \"protocol\": \"tcp\",
+    \"action\": \"allow\",
+    \"priority\": 50
+  }")
+echo "$CREATE_RESP" | python3 -m json.tool
+
+ACL_ID=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+echo "Created ACL rule ID: $ACL_ID"
+```
+
+**Expected (HTTP 201):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "created": true,
+    "id": "<uuid>"
+  }
+}
+```
+
+2. Verify the rule appears in the list:
+
+```bash
+curl -s "$BASE/acl-rules" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+Find the row with `"name": "terraform-test-rule"` and `"priority": 50`.
+
+3. Delete the rule:
+
+```bash
+curl -s -X DELETE "$BASE/acl-rules/$ACL_ID" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "deleted": true
+  }
+}
+```
+
+4. Confirm it no longer appears in the list:
+
+```bash
+curl -s "$BASE/acl-rules" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Pass:** POST returns HTTP 201 with an `id`. Rule appears in GET list. DELETE returns HTTP 200. Rule no longer in list after deletion.
+
+**Fail / Common issues:**
+- `INVALID_INPUT` on POST — verify `action` is exactly `"allow"` or `"deny"` and `protocol` is `"tcp"`, `"udp"`, or `"*"`.
+- DELETE returns HTTP 405 `"Method not allowed"` — DELETE requires the resource ID in the path (`/api/terraform/acl-rules/<id>`); a DELETE to `/api/terraform/acl-rules` (no ID) falls through to the default 405.
+
+---
+
+## ST3 — ACL Rule Validation Rejects Invalid Inputs
+
+**What it verifies:** The four server-side validations in `terraform-api.ts` for `name`, `source`, `destination`, `action`, and `protocol` each return `INVALID_INPUT` (400).
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, test each invalid case:
+
+```bash
+# Missing name
+curl -s -X POST "$BASE/acl-rules" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"source\": \"10.0.0.0/8\", \"destination\": \"10.0.0.1/32\", \"action\": \"allow\"}" \
+  | python3 -m json.tool
+```
+
+**Expected:** HTTP 400, `"code": "INVALID_INPUT"`, `"message": "name is required and must be a string with max 100 characters"`.
+
+```bash
+# Invalid action
+curl -s -X POST "$BASE/acl-rules" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"bad-action\", \"source\": \"10.0.0.0/8\", \"destination\": \"10.0.0.1\", \"action\": \"permit\"}" \
+  | python3 -m json.tool
+```
+
+**Expected:** HTTP 400, `"message": "action must be \"allow\" or \"deny\""`.
+
+```bash
+# Invalid protocol
+curl -s -X POST "$BASE/acl-rules" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"bad-proto\", \"source\": \"10.0.0.0/8\", \"destination\": \"10.0.0.1\", \"action\": \"allow\", \"protocol\": \"icmp\"}" \
+  | python3 -m json.tool
+```
+
+**Expected:** HTTP 400, `"message": "protocol must be \"tcp\", \"udp\", or \"*\""`.
+
+```bash
+# Empty source
+curl -s -X POST "$BASE/acl-rules" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"empty-src\", \"source\": \"\", \"destination\": \"10.0.0.1\", \"action\": \"allow\"}" \
+  | python3 -m json.tool
+```
+
+**Expected:** HTTP 400, `"message": "source is required and must be a non-empty string"`.
+
+**Pass:** All four invalid cases return HTTP 400 with `INVALID_INPUT` and specific error messages matching the source code.
+
+**Fail / Common issues:**
+- Any invalid input returns HTTP 200 with `created: true` — the validation block at `terraform-api.ts` lines 59–73 is not running. Verify the request body is valid JSON and the handler version is current.
+
+---
+
+## ST4 — Update and Read Org Settings
+
+**What it verifies:** The `PUT /api/terraform/settings` endpoint updates the three allowed org settings fields. Unknown fields are silently ignored. Changes are immediately visible via `GET /api/terraform/settings`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, read current settings:
+
+```bash
+API_KEY="qztna_<your full key here>"
+BASE="https://login.quickztna.com/api/terraform"
+
+curl -s "$BASE/settings" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+Note the current values of `allow_exit_nodes`, `allow_subnet_routing`, and `key_expiry_days`.
+
+2. Update all three allowed fields:
+
+```bash
+curl -s -X PUT "$BASE/settings" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"allow_exit_nodes\": true,
+    \"allow_subnet_routing\": true,
+    \"key_expiry_days\": 45,
+    \"unknown_field\": \"should be ignored\"
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "updated": true
+  }
+}
+```
+
+3. Re-read settings to confirm the changes:
+
+```bash
+curl -s "$BASE/settings" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected:** `allow_exit_nodes: true`, `allow_subnet_routing: true`, `key_expiry_days: 45`. The `unknown_field` does not appear — it was silently ignored by the handler's field allowlist check at `terraform-api.ts` line 105.
+
+4. Restore the original values to avoid impacting other tests:
+
+```bash
+curl -s -X PUT "$BASE/settings" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"allow_exit_nodes\": false,
+    \"allow_subnet_routing\": false,
+    \"key_expiry_days\": 90
+  }" | python3 -m json.tool
+```
+
+**Pass:** PUT returns HTTP 200 `updated: true`. GET shows updated values. Unknown field is absent from the settings row.
+
+**Fail / Common issues:**
+- `settings` returns null after PUT — the org has no row in `org_settings`. The UPDATE runs but affects 0 rows. In this case, a row should be pre-created via the org settings UI.
+- PUT returns 405 — ensure the method is `PUT` not `POST`; only GET and PUT are handled for the `settings` resource.
+
+---
+
+## ST5 — Machine Deletion via Terraform API
+
+**What it verifies:** `DELETE /api/terraform/machines/:id` removes a machine from the database. This simulates Terraform `terraform destroy` for a machine resource.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, list machines via the Terraform API and identify a test machine to delete. Do not delete <MachineRef name="Win-A" /> or <MachineRef name="Linux-C" /> — create a dedicated test machine or use an offline/stale machine.
+
+2. On <MachineRef name="Linux-C" />, list machines:
+
+```bash
+curl -s "$BASE/machines" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+3. Identify a machine you are prepared to delete. Save its `id` as `DEL_MACHINE_ID`.
+
+```bash
+DEL_MACHINE_ID="<target machine uuid>"
+```
+
+4. Confirm the machine exists:
+
+```bash
+curl -s "$BASE/machines/$DEL_MACHINE_ID" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected:** HTTP 200 with the machine object.
+
+5. Delete it:
+
+```bash
+curl -s -X DELETE "$BASE/machines/$DEL_MACHINE_ID" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "deleted": true
+  }
+}
+```
+
+6. Confirm it is gone:
+
+```bash
+curl -s "$BASE/machines/$DEL_MACHINE_ID" -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected:** HTTP 200 with `"data": null`.
+
+7. Attempt to use GET for a DELETE operation (wrong method):
+
+```bash
+curl -s -X GET "$BASE/machines/$DEL_MACHINE_ID" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected:** HTTP 200 with `"data": null` — GET on a missing resource returns null, not an error.
+
+**Pass:** DELETE returns HTTP 200 `deleted: true`. Subsequent GET returns null. Using GET instead of DELETE on a missing machine returns null (not 200 with a machine object, and not 404).
+
+**Fail / Common issues:**
+- DELETE returns HTTP 405 — make sure the ID is appended to the URL path. `DELETE /api/terraform/machines` (no ID) falls through to the 405 return in `terraform-api.ts` line 122.
+- Machine reappears in the list — the `ztna up` client for that machine may have re-registered. API key deletion does not block re-registration if the machine still has a valid auth key.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | All 5 Terraform resources readable | HTTP 200 for `machines`, `acl-rules`, `dns`, `users`, `settings` |
+| ST2 | ACL rule create and delete | HTTP 201 on POST; appears in GET list; HTTP 200 on DELETE; absent after |
+| ST3 | ACL rule input validation | HTTP 400 `INVALID_INPUT` for missing name, bad action, bad protocol, empty source |
+| ST4 | Settings read and update | PUT returns `updated: true`; GET reflects changes; unknown fields ignored |
+| ST5 | Machine deletion via Terraform API | HTTP 200 `deleted: true`; subsequent GET returns null |

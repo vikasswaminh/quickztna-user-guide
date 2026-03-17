@@ -1,0 +1,188 @@
+---
+title: "Update Org Name"
+topic: "Organization Settings & Network Config"
+order: 121
+machines: ["Win-A"]
+summary: "Update the organization name via the API and verify the change propagates — the dashboard Network Name field is read-only in the UI."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The `organizations` table stores the canonical org name in the `name` column. Updating it is handled by `handlers/org-management.ts`, action `update_org`:
+
+- **Endpoint**: `POST /api/org-management` with `action: "update_org"`, `org_id`, and `name`
+- **Authorization**: `isOrgAdmin` — only `owner` or `admin` roles can update
+- **Fields accepted**: `name` (string) and `domain` (string or null)
+- **DB write**: `UPDATE organizations SET name = ?, updated_at = NOW() WHERE id = ?`
+- **Response**: `{ "updated": true }` on success
+
+**Important UI fact**: The "Network Name" input in `SettingsPage.tsx` (Settings > General tab) is rendered with the `disabled` attribute. It displays the current org name but does not allow in-UI editing. Org name changes are therefore an API-only operation, accessible only via `POST /api/org-management`.
+
+There is no `update_org` button or form in the dashboard — this is intentional. The test validates the API contract directly.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin/Owner — browser session + curl |
+
+Prerequisites: You have an `owner` or `admin` role in the organization. You have the org's `id` and a valid JWT access token (obtained from the browser DevTools Application > Local Storage, key `access_token`).
+
+---
+
+## ST1 — Verify Network Name is Read-Only in the Dashboard
+
+**What it verifies:** The Settings page renders the org name in a disabled input — no edit controls are presented.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as an org admin.
+2. Navigate to **Settings** (sidebar) — this opens the `AdminSettingsPage` at the **General** tab.
+3. Locate the **Network Name** field in the **General** card.
+4. Attempt to click into the input and type a new value.
+
+**Expected behavior:**
+- The input field has a muted/greyed background (`bg-muted/50` CSS class).
+- The cursor shows the "not-allowed" pointer. Keyboard input is ignored.
+- The label below reads: "Set during organization creation and cannot be changed"
+
+**Pass:** The field is non-editable and the help text is visible.
+
+**Fail / Common issues:**
+- Field is editable — the `disabled` prop may have been removed from the `Input` component in `SettingsPage.tsx`.
+
+---
+
+## ST2 — Update Org Name via API (Success Path)
+
+**What it verifies:** The `update_org` action in `handleOrgManagement` correctly writes the new name to the `organizations` table.
+
+**Steps:**
+1. Open browser DevTools on `https://login.quickztna.com`, go to Application > Local Storage, copy the `access_token` value.
+2. Note the current org name shown on the Settings page (e.g., "Acme Corp").
+3. Send the update request:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org","org_id":"<org_id>","name":"Acme Corp Updated"}'
+```
+
+4. Reload the Settings page in the browser.
+
+**Expected behavior:**
+- HTTP 200
+- Response body:
+```json
+{
+  "success": true,
+  "data": {
+    "updated": true
+  }
+}
+```
+- After page reload, the **Network Name** field displays "Acme Corp Updated"
+
+**Pass:** Response shows `updated: true` and the Settings page reflects the new name after reload.
+
+**Fail / Common issues:**
+- HTTP 401 `UNAUTHORIZED` — token is expired or missing. Refresh the page and recopy the token.
+- HTTP 403 `FORBIDDEN` — your account does not have `admin` or `owner` role in this org.
+- HTTP 400 `MISSING_FIELDS` — `org_id` is absent from the request body.
+
+---
+
+## ST3 — Org Name Update Does Not Affect Slug or Tailnet Domain
+
+**What it verifies:** Renaming the org leaves the `slug` column and the tailnet domain unchanged — the Tailnet Domain field on the Settings page must still read the original slug-based domain.
+
+**Steps:**
+1. Before the name change, note the value in the **Tailnet Domain** field on the Settings page (e.g., `acme-corp.zt.net`).
+2. Update the org name via API as in ST2 (e.g., to "Acme Corp Renamed").
+3. Reload the Settings page.
+
+**Expected behavior:**
+- **Network Name**: shows "Acme Corp Renamed"
+- **Tailnet Domain**: still shows the original value (e.g., `acme-corp.zt.net`) — unchanged
+
+**Pass:** Domain is unaffected by a name change.
+
+**Fail / Common issues:**
+- Domain changes — the `update_org` handler does accept a `domain` field separately, but the `slug` column is never modified by `update_org`. If the domain changed, check whether `domain` was accidentally sent in the request body.
+
+---
+
+## ST4 — Non-Admin Cannot Update Org Name
+
+**What it verifies:** A user with the `member` role cannot update the org name — the `isOrgAdmin` guard rejects them.
+
+**Steps:**
+1. Log in as a user with `member` role in the org.
+2. Copy their access token from Local Storage.
+3. Send the same `update_org` request:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <member_access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org","org_id":"<org_id>","name":"Unauthorized Rename"}'
+```
+
+**Expected behavior:**
+- HTTP 403
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin required"
+  }
+}
+```
+
+**Pass:** Member is blocked from renaming the org.
+
+**Fail / Common issues:**
+- HTTP 200 with `updated: true` — the `isOrgAdmin` check is missing or bypassed.
+
+---
+
+## ST5 — Restore Original Org Name
+
+**What it verifies:** The name change is fully reversible and the system accepts any subsequent rename.
+
+**Steps:**
+1. Using an admin token, send `update_org` with the original name:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org","org_id":"<org_id>","name":"Acme Corp"}'
+```
+
+2. Reload the Settings page.
+
+**Expected behavior:**
+- HTTP 200, `updated: true`
+- Network Name field shows the restored original name
+
+**Pass:** Org name is restored. No side effects visible in the dashboard.
+
+**Fail / Common issues:**
+- The name field is empty after the page reloads — the `OrgContext` may cache the old name. A full page reload (Ctrl+Shift+R) clears the cache and shows the current DB value.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Dashboard read-only field | Network Name input is `disabled`, no edit possible |
+| ST2 | API `update_org` success | 200 `updated: true`, page reflects new name |
+| ST3 | Slug/domain unaffected | Tailnet domain unchanged after name update |
+| ST4 | Non-admin blocked | 403 `FORBIDDEN` for `member` role |
+| ST5 | Name restore | Reversible — original name re-applied successfully |

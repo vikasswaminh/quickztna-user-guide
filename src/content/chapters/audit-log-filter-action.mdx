@@ -1,0 +1,254 @@
+---
+title: "Filter by Action Type"
+topic: "Audit Log"
+order: 72
+machines: ["Win-A"]
+summary: "Use the Action Type dropdown to filter audit entries by action category prefix — verify Loki label selector and pipeline filter behaviour."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Every audit entry is written to Loki with a stream label `action_prefix` set to the first segment of the dot-separated action string. For example, `auth.login` produces `action_prefix="auth"`, and `machine.self_service_setup` produces `action_prefix="machine"`.
+
+The `buildLogQL()` function in `services/loki.ts` uses this label in the Loki stream selector when `action_category` is set:
+
+```
+{job="audit", org_id="...", action_prefix="auth"}
+```
+
+When the user selects an action category in the UI, `AuditLogPage.tsx` sends `action_category: "auth"` (without a trailing dot) to the `search_audit_logs` handler. The handler passes it as `action_category` in `AuditQueryParams`, which `buildLogQL()` maps to the `action_prefix` label selector.
+
+When a specific full action name is set via `action` (not `action_category`), `buildLogQL()` adds a pipeline filter instead:
+
+```
+{job="audit", org_id="..."} |= "auth.login"
+```
+
+The `filters.action_categories` field in the response is populated by `getDistinctValues(org_id, 'action_prefix')`, which queries the Loki label API (`/loki/api/v1/label/action_prefix/values`) for the last 720 hours to discover which prefixes exist for the org.
+
+Note: the Action Type dropdown in the UI sends the value with a trailing dot appended (e.g., `"auth."`) as the `action_category` body field, but `buildLogQL()` receives it and uses it as a label value match — the handler strips nothing, so the label selector becomes `action_prefix="auth."`. In practice the label is stored without the dot, so selecting a category from the dropdown uses the `action_category` path correctly because the frontend strips the dot when constructing the filter (the `SelectItem` value is `"auth."` but the handler receives it as-is and the label stored in Loki is `"auth"` — if the dropdown filter does not match, fall back to the raw `action` pipeline filter described in ST3).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser (dashboard) + PowerShell API calls |
+
+**Prerequisites:**
+- Audit events from at least two different action categories exist (e.g., `auth.*` and `machine.*`)
+- The Filters panel is visible (click the Filters button on the Audit Log page)
+
+---
+
+## ST1 -- Action Category Dropdown Populates From Loki
+
+**What it verifies:** The `filters.action_categories` array in the API response is non-empty, and the Action Type dropdown in the UI reflects real categories from Loki.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, navigate to `https://login.quickztna.com/audit-log`.
+
+2. Click the Filters button. The filter bar appears with three controls: a date range selector, a Resource Type dropdown, and an Action Type dropdown.
+
+3. Click the Action Type dropdown. Observe the items listed.
+
+**Expected:** The dropdown includes at least the following categories (depending on which actions have been performed):
+- `auth`
+- `machine`
+- `acl_rules` (if ACL rules have been created)
+- `api_key` or `auth_key` (if keys have been created)
+
+4. Verify via API that the categories come from Loki:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    page      = 0
+    page_size = 1
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$resp.data.filters.action_categories
+```
+
+**Expected:** An array of strings such as `auth`, `machine`, `acl_rules`.
+
+**Pass:** The dropdown is non-empty and matches the `action_categories` array from the API.
+
+**Fail / Common issues:**
+- Dropdown shows only "All Actions" -- no `action_prefix` label values exist in Loki yet. Perform a login or machine action first, then wait a few seconds for Loki to index the entry.
+- API returns `action_categories: []` -- `getDistinctValues` returned an empty array. This means Loki's label API returned no values for `action_prefix` in the last 720 hours. Check Loki connectivity from the API container.
+
+---
+
+## ST2 -- Filter by the "auth" Action Category
+
+**What it verifies:** Selecting the `auth` category from the dropdown sends `action_category: "auth"` to the API and narrows the table to only authentication events.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, ensure the Filters panel is open.
+
+2. In the Action Type dropdown, select `auth`.
+
+3. Observe the table. All visible rows should have an action that starts with `auth.`.
+
+4. Confirm via the API that the filter is applied correctly:
+
+```powershell
+$body = @{
+    action          = "search_audit_logs"
+    org_id          = $ORG_ID
+    action_category = "auth"
+    page            = 0
+    page_size       = 50
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$resp.data.logs | ForEach-Object { $_.action }
+```
+
+**Expected:** All printed actions begin with `auth.` — for example `auth.login`, `auth.mfa_enabled`, `auth.password_reset_requested`.
+
+**Pass:** Every row in the table (and every entry in the API response) has an action starting with `auth.`.
+
+**Fail / Common issues:**
+- Non-auth rows still appear -- the Loki label selector `action_prefix="auth"` may not be filtering correctly if the label was not stored as `auth` (without a trailing dot). Try using the search bar with `auth.` as the search term, which falls back to the `|= "auth."` pipeline filter.
+- Table shows "No events match your filters" even though auth events exist -- the `action_prefix` label in Loki may differ. Call the Loki label API directly to verify: `GET http://localhost:3100/loki/api/v1/label/action_prefix/values`.
+
+---
+
+## ST3 -- Filter by a Specific Full Action Name via Search
+
+**What it verifies:** Entering a full action name like `machine.self_service_setup` in the search box produces a Loki pipeline filter (`|= "machine.self_service_setup"`) that matches only that exact event type.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, clear any active dropdown filters (select "All Actions").
+
+2. In the search box, type `machine.self_service_setup` and press Enter.
+
+3. Observe the table. Only rows with the action `machine.self_service_setup` should be visible.
+
+4. Verify via API:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "machine.self_service_setup"
+    page      = 0
+    page_size = 50
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$resp.data.logs | Select-Object action, resource_type, created_at
+```
+
+**Expected:** All returned entries have `action: "machine.self_service_setup"`.
+
+**Pass:** All rows match the full action name.
+
+**Fail / Common issues:**
+- Zero results -- no machine setup has been performed via `ztna up` or the client setup flow. Register a machine with an auth key first.
+- Extra rows appear -- the `|= "machine.self_service_setup"` filter matches anywhere in the log line (JSON body), so if another event's `details` field contained the string `machine.self_service_setup`, it would also match. This is expected Loki substring behaviour.
+
+---
+
+## ST4 -- Combine Action Category and Search Filters
+
+**What it verifies:** Setting both `action_category` and `search` applies both the Loki label selector and the pipeline filter simultaneously, narrowing results further.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, set the Action Type dropdown to `machine`.
+
+2. In the search box, type `offline` and press Enter.
+
+3. Observe the table. Only machine-category events whose log line contains the word "offline" should be visible — specifically `machine.marked_offline` or `machine.cleanup_deleted` entries.
+
+4. Verify via API:
+
+```powershell
+$body = @{
+    action          = "search_audit_logs"
+    org_id          = $ORG_ID
+    action_category = "machine"
+    search          = "offline"
+    page            = 0
+    page_size       = 50
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$resp.data.total
+$resp.data.logs | Select-Object action
+```
+
+**Expected:** `total` is a small number (0 or more). All returned rows have actions in the `machine.*` namespace, and their serialised log line contains the substring "offline".
+
+**Pass:** Results are scoped to machine events containing "offline"; unrelated events are excluded.
+
+**Fail / Common issues:**
+- `total` is 0 -- no machines have gone offline yet in this org. Run `ztna down` on any registered machine, wait one heartbeat cycle (up to 90 seconds for the cron to mark it offline), then re-run the test.
+- Results include non-machine events -- this would be a `buildLogQL` bug. The label selector `action_prefix="machine"` should prevent it.
+
+---
+
+## ST5 -- Clear All Filters Restores Full Result Set
+
+**What it verifies:** The "Clear all" button resets `search`, `action_category`, `resource_type`, and `datePreset` to their defaults, and the table returns the full (unfiltered) event list.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, set at least two filters: select `auth` in the Action Type dropdown and type `login` in the search box, then press Enter. Note the row count in the heading.
+
+2. Confirm the Filters button shows an "Active" badge next to it.
+
+3. Click the "Clear all" link (ghost button, appears to the right of the Filters button when any filter is active).
+
+4. Observe the table reloads. The heading should show the full event count from ST1 (or higher if new events have arrived).
+
+5. Confirm the Action Type dropdown reverts to "All Actions" and the search box is empty.
+
+6. Confirm the "Active" badge disappears from the Filters button.
+
+**Pass:** All filters reset, full event count is restored, Active badge disappears.
+
+**Fail / Common issues:**
+- "Active" badge remains after clicking Clear all -- this is a UI state bug. Reload the page as a workaround.
+- Row count after clearing is lower than before filtering -- new events may not have been generated since the first load. This is not a failure; the count should be equal to or greater than the pre-filter count.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | Action category dropdown populated from Loki label API | `action_categories` array non-empty; matches Loki `action_prefix` values |
+| ST2 | Selecting a category filters to that `action_prefix` | All rows start with `auth.`; Loki label selector applied |
+| ST3 | Search box creates a Loki pipeline filter for full action name | Only `machine.self_service_setup` rows returned |
+| ST4 | Combining category and search narrows results further | Both label selector and pipeline filter applied simultaneously |
+| ST5 | Clear all resets all filters | Full event count restored; Active badge removed |

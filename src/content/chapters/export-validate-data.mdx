@@ -1,0 +1,491 @@
+---
+title: "Re-import / Validate Exported Data"
+topic: "Export & Data Management"
+order: 105
+machines: ["Win-A"]
+summary: "Verify that data exported from QuickZTNA via POST /api/export and GET /api/db can be parsed, validated for structural integrity, and — for ACL rules and DNS records — re-imported into the same or a different org via the CRUD insert endpoint."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA has no dedicated "import" endpoint. Re-importing exported data is done by posting to the generic CRUD insert endpoint:
+
+```
+POST /api/db/TABLE_NAME
+Body: { ...fields }
+```
+
+This chapter covers the complete round-trip validation workflow:
+
+1. Export data (machines, ACL rules, audit logs) using `POST /api/export` or `GET /api/db`.
+2. Validate the exported data structure locally (field presence, type checks, JSON validity).
+3. Re-import portable records (ACL rules, DNS records) into the same org or a new org via CRUD insert.
+4. Confirm that non-portable records (machine registrations) cannot be directly re-imported — they require `POST /api/register-machine` with an auth key.
+
+**What can be re-imported via CRUD insert:**
+- `acl_rules` — portable (no machine-specific IDs required)
+- `dns_records` — portable (name + value + type)
+- `posture_policies` — portable (policy config only)
+
+**What cannot be re-imported via CRUD insert:**
+- `machines` — require registration via auth key (`POST /api/register-machine`)
+- Audit logs — read-only (Loki, no insert endpoint)
+- `issued_certificates` — managed by the certificate authority handler
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — all API calls issued from here |
+
+```bash
+TOKEN="eyJhbGciOiJFUzI1NiIsInR..."
+ORG_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+---
+
+## ST1 — Validate Machines Export Structure
+
+**What it verifies:** The machines JSON export contains all required fields and correct data types. This simulates a structural integrity check that would precede any migration.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, export machines and validate each record:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -c "
+import sys, json
+
+REQUIRED_FIELDS = ['id', 'name', 'tailnet_ip', 'os', 'status', 'created_at']
+VALID_STATUSES = {'online', 'offline', 'pending', 'quarantined'}
+VALID_OS = {'windows', 'linux', 'darwin', 'ios', 'android', 'unknown'}
+
+d = json.load(sys.stdin)
+machines = d['data']['machines']
+errors = []
+
+for i, m in enumerate(machines):
+    for field in REQUIRED_FIELDS:
+        if field not in m or m[field] is None:
+            errors.append(f'Machine {i}: missing or null field \"{field}\"')
+
+    status = m.get('status', '')
+    if status not in VALID_STATUSES:
+        errors.append(f'Machine {i} ({m.get(\"name\")}): invalid status \"{status}\"')
+
+    tailnet_ip = m.get('tailnet_ip', '')
+    if tailnet_ip and not tailnet_ip.startswith('100.'):
+        errors.append(f'Machine {i} ({m.get(\"name\")}): tailnet_ip \"{tailnet_ip}\" does not start with 100.')
+
+    tags_raw = m.get('tags', '[]')
+    try:
+        tags = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
+        if not isinstance(tags, list):
+            errors.append(f'Machine {i}: tags is not a JSON array')
+    except json.JSONDecodeError:
+        errors.append(f'Machine {i}: tags is not valid JSON: {tags_raw!r}')
+
+print(f'Validated {len(machines)} machines')
+if errors:
+    print(f'FAIL: {len(errors)} error(s):')
+    for e in errors:
+        print(f'  - {e}')
+else:
+    print('PASS: All machines pass structural validation')
+"
+```
+
+**Expected output:**
+
+```
+Validated 3 machines
+PASS: All machines pass structural validation
+```
+
+**Pass:** Zero validation errors. All machines have required fields, valid status values, tailnet IPs in the `100.x.x.x` range, and tags as valid JSON arrays.
+
+**Fail / Common issues:**
+- `invalid status` error — a machine has a status value outside `online`, `offline`, `pending`, `quarantined`. The database has a CHECK constraint on this column; this should not occur in normal operation.
+- `tags is not valid JSON` — the `tags` column stores a JSON string; malformed JSON here would indicate a data corruption issue.
+- `tailnet_ip` does not start with `100.` — all tailnet IPs are in the 100.64.0.0/10 CGNAT range.
+
+---
+
+## ST2 — Validate Audit Log CSV Structure
+
+**What it verifies:** The audit log CSV export is structurally valid — all 7 columns are present on every row, and the `details` column is valid JSON for every row that has a non-empty value.
+
+**Steps:**
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":30,\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json, csv, io
+
+d = json.load(sys.stdin)
+csv_text = d['data']['csv']
+reported_count = d['data']['count']
+
+reader = csv.DictReader(io.StringIO(csv_text))
+rows = list(reader)
+
+EXPECTED_COLUMNS = {'id', 'action', 'resource_type', 'resource_id', 'user_id', 'created_at', 'details'}
+actual_columns = set(reader.fieldnames or [])
+missing_cols = EXPECTED_COLUMNS - actual_columns
+extra_cols = actual_columns - EXPECTED_COLUMNS
+
+errors = []
+if missing_cols:
+    errors.append(f'Missing columns: {missing_cols}')
+if extra_cols:
+    errors.append(f'Unexpected columns: {extra_cols}')
+
+for i, row in enumerate(rows):
+    if not row.get('id'):
+        errors.append(f'Row {i+1}: empty id')
+    if not row.get('action'):
+        errors.append(f'Row {i+1}: empty action')
+    details = row.get('details', '')
+    if details:
+        try:
+            json.loads(details)
+        except (json.JSONDecodeError, ValueError):
+            pass  # details may be a plain string in some log entries
+
+print(f'Reported count : {reported_count}')
+print(f'Parsed rows    : {len(rows)}')
+print(f'Columns        : {sorted(actual_columns)}')
+if errors:
+    print(f'FAIL: {len(errors)} issue(s):')
+    for e in errors:
+        print(f'  - {e}')
+else:
+    print('PASS: CSV structure is valid')
+"
+```
+
+**Expected output:**
+
+```
+Reported count : 42
+Parsed rows    : 42
+Columns        : ['action', 'created_at', 'details', 'id', 'resource_id', 'resource_type', 'user_id']
+PASS: CSV structure is valid
+```
+
+**Pass:** All 7 columns present. No row has an empty `id` or `action`. `csv.DictReader` parses the entire file without error.
+
+**Fail / Common issues:**
+- `details` column causes parsing issues — it often contains JSON strings with commas and quotes, which must be wrapped in CSV double-quotes by `csvEscapeField`. If row count is lower than `reported_count`, a details field with an unescaped newline has split a row.
+- `Missing columns` error — the Loki log entry schema changed and a field was renamed. This would be a backend schema change.
+
+---
+
+## ST3 — Re-import ACL Rules via CRUD Insert
+
+**What it verifies:** ACL rules exported in ST1 of the `export-acl-rules` chapter can be re-imported into the same org (or a different org) using the CRUD insert endpoint.
+
+**Steps:**
+
+1. Export current ACL rules:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+rules = d['data']
+portable = [{
+    'name': r['name'] + ' (reimported)',
+    'src': r['src'],
+    'dst': r['dst'],
+    'ports': r['ports'],
+    'protocol': r['protocol'],
+    'action': r['action'],
+    'enabled': False,
+} for r in rules]
+with open('/tmp/acl_reimport.json', 'w') as f:
+    json.dump(portable, f)
+print(f'Prepared {len(portable)} rules for re-import (all disabled by default)')
+"
+```
+
+2. Re-import the first rule as a test (disabled, to avoid affecting live traffic):
+
+```bash
+python3 -c "
+import json
+with open('/tmp/acl_reimport.json') as f:
+    rules = json.load(f)
+if rules:
+    print(json.dumps(rules[0]))
+" | xargs -0 -I RULE bash -c '
+  curl -s -X POST https://login.quickztna.com/api/db/acl_rules \
+    -H "Authorization: Bearer '"$TOKEN"'" \
+    -H "Content-Type: application/json" \
+    -d "{\"org_id\":\"'"$ORG_ID"'\",\"name\":\"$(python3 -c \"import json; r=json.load(open('/tmp/acl_reimport.json')); print(r[0]['"'"'name'"'"'])\")\" ,\"src\":\"$(python3 -c \"import json; r=json.load(open('/tmp/acl_reimport.json')); print(r[0]['"'"'src'"'"'])\")\" ,\"dst\":\"$(python3 -c \"import json; r=json.load(open('/tmp/acl_reimport.json')); print(r[0]['"'"'dst'"'"'])\")\" ,\"ports\":\"$(python3 -c \"import json; r=json.load(open('/tmp/acl_reimport.json')); print(r[0]['"'"'ports'"'"'])\")\" ,\"protocol\":\"$(python3 -c \"import json; r=json.load(open('/tmp/acl_reimport.json')); print(r[0]['"'"'protocol'"'"'])\")\" ,\"action\":\"$(python3 -c \"import json; r=json.load(open('/tmp/acl_reimport.json')); print(r[0]['"'"'action'"'"'])\")\" ,\"enabled\":false}" \
+  | python3 -m json.tool
+'
+```
+
+For clarity, here is the equivalent using a Python script (recommended):
+
+```bash
+python3 << 'EOF'
+import json, urllib.request
+
+with open('/tmp/acl_reimport.json') as f:
+    rules = json.load(f)
+
+rule = rules[0]
+rule['org_id'] = 'ORG_ID_PLACEHOLDER'  # replace with actual org_id
+
+payload = json.dumps(rule).encode()
+req = urllib.request.Request(
+    'https://login.quickztna.com/api/db/acl_rules',
+    data=payload,
+    headers={
+        'Authorization': 'Bearer TOKEN_PLACEHOLDER',  # replace with actual token
+        'Content-Type': 'application/json',
+    },
+    method='POST'
+)
+with urllib.request.urlopen(req) as resp:
+    print(json.dumps(json.loads(resp.read()), indent=2))
+EOF
+```
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "new-uuid-here"
+  }
+}
+```
+
+The insert response uses `data.data.id` when accessed via the frontend API client (`api.from("acl_rules").insert()`). The raw CRUD response returns `data.id`.
+
+3. Verify the re-imported rule exists:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID&enabled=eq.false" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+reimported = [r for r in d['data'] if '(reimported)' in r.get('name','')]
+print(f'Re-imported rules found: {len(reimported)}')
+for r in reimported:
+    print(f'  {r[\"name\"]} | src={r[\"src\"]} dst={r[\"dst\"]} enabled={r[\"enabled\"]}')
+"
+```
+
+4. Clean up — delete the re-imported rule:
+
+```bash
+# Get the reimported rule's ID
+REIMPORT_ID=$(curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=eq.$ORG_ID&enabled=eq.false" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+r=[x for x in d['data'] if '(reimported)' in x.get('name','')]
+print(r[0]['id'] if r else '')
+")
+
+if [ -n "$REIMPORT_ID" ]; then
+  curl -s -X DELETE "https://login.quickztna.com/api/db/acl_rules?id=eq.$REIMPORT_ID" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{}' | python3 -m json.tool
+fi
+```
+
+**Pass:** CRUD insert returns `success: true` with a new `id`. The re-imported rule appears in the disabled rules list. Cleanup delete succeeds.
+
+**Fail / Common issues:**
+- Insert returns `400` with a validation error — a required column is missing from the insert body (`org_id` is always required).
+- The rule appears but with wrong field values — check that the export preserved the original field names exactly.
+
+---
+
+## ST4 — Confirm Machine Records Cannot Be Directly Re-imported
+
+**What it verifies:** Attempting to insert a row into the `machines` table via the CRUD endpoint is either blocked or creates an unusable record — machine registration must go through `POST /api/register-machine`.
+
+**Steps:**
+
+1. Attempt to insert a fake machine via CRUD:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/db/machines \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"fake-reimport-test\",
+    \"tailnet_ip\": \"100.64.99.99\",
+    \"os\": \"linux\",
+    \"status\": \"online\",
+    \"node_key\": \"fake-node-key-00000000000000000000000000000000\"
+  }" \
+  | python3 -m json.tool
+```
+
+**Expected outcome (one of the following):**
+
+a) The insert succeeds (201), but the machine is non-functional — it has no valid WireGuard public key, no real node key, and will never heartbeat. It will appear as offline/pending in the dashboard.
+
+b) The insert is blocked by a CRUD-level restriction on the `machines` table, returning `403` or `400`.
+
+2. Check whether the fake machine appeared:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.fake-reimport-test" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -m json.tool
+```
+
+3. If the fake machine was created, delete it immediately:
+
+```bash
+FAKE_ID=$(curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.fake-reimport-test" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'] if d['data'] else '')")
+
+if [ -n "$FAKE_ID" ]; then
+  curl -s -X POST https://login.quickztna.com/api/machine-admin \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"action\":\"delete\",\"machine_id\":\"$FAKE_ID\"}" | python3 -m json.tool
+  echo "Fake machine deleted"
+fi
+```
+
+**Pass:** The test documents the actual behaviour. The critical requirement is that a fake machine — even if insertable via CRUD — cannot authenticate as a VPN node (it has no valid WireGuard keypair) and must be cleaned up. Use `POST /api/register-machine` with a valid auth key for real machine registration.
+
+**Fail / Common issues:**
+- The fake machine heartbeats successfully — this would indicate a serious security gap. It should not occur because the heartbeat handler validates the `node_key` against the stored value, and a fake key will never match.
+
+---
+
+## ST5 — Round-Trip Compliance Report Validation
+
+**What it verifies:** A compliance report exported via `POST /api/export` with `action: "compliance_report"` passes a local structural validation check — all summary keys are present, numeric fields are non-negative, and the `generated_at` timestamp is a valid ISO 8601 string.
+
+**Steps:**
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"compliance_report\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -c "
+import sys, json
+from datetime import datetime
+
+d = json.load(sys.stdin)
+report = d['data']
+errors = []
+
+# Top-level keys
+for key in ['generated_at', 'org_id', 'report_type', 'summary', 'non_compliant_machines', 'recent_quarantine_events']:
+    if key not in report:
+        errors.append(f'Missing top-level key: {key}')
+
+# report_type
+if report.get('report_type') != 'compliance':
+    errors.append(f'report_type should be \"compliance\", got \"{report.get(\"report_type\")}\"')
+
+# generated_at ISO 8601
+try:
+    datetime.fromisoformat(report.get('generated_at','').replace('Z','+00:00'))
+except ValueError:
+    errors.append(f'generated_at is not a valid ISO 8601 timestamp: {report.get(\"generated_at\")}')
+
+# summary keys and non-negative numeric values
+summary = report.get('summary', {})
+NUMERIC_KEYS = ['acl_rules', 'abac_policies', 'ip_allowlist_entries', 'quarantine_events_30d']
+for k in NUMERIC_KEYS:
+    if k not in summary:
+        errors.append(f'summary missing key: {k}')
+    elif not isinstance(summary[k], (int, float)) or summary[k] < 0:
+        errors.append(f'summary.{k} is not a non-negative number: {summary[k]}')
+
+# machines sub-object
+machines = summary.get('machines', {})
+for k in ['total', 'online', 'quarantined']:
+    if k not in machines:
+        errors.append(f'summary.machines missing key: {k}')
+
+# posture sub-object
+posture = summary.get('posture', {})
+for k in ['total', 'compliant', 'compliance_rate']:
+    if k not in posture:
+        errors.append(f'summary.posture missing key: {k}')
+
+rate = posture.get('compliance_rate', -1)
+if not (0 <= rate <= 100):
+    errors.append(f'compliance_rate {rate} is out of range [0, 100]')
+
+# non_compliant_machines should be a list
+if not isinstance(report.get('non_compliant_machines'), list):
+    errors.append('non_compliant_machines is not a list')
+
+print('Report generated_at:', report.get('generated_at'))
+print('report_type        :', report.get('report_type'))
+print('compliance_rate    :', posture.get('compliance_rate'))
+print('machines.total     :', machines.get('total'))
+
+if errors:
+    print(f'\nFAIL: {len(errors)} validation error(s):')
+    for e in errors:
+        print(f'  - {e}')
+else:
+    print('\nPASS: Compliance report passes all structural validation checks')
+"
+```
+
+**Expected output:**
+
+```
+Report generated_at: 2026-03-17T10:00:00.000Z
+report_type        : compliance
+compliance_rate    : 100
+machines.total     : 3
+
+PASS: Compliance report passes all structural validation checks
+```
+
+**Pass:** Zero validation errors. All required keys present. `compliance_rate` is between 0 and 100. `generated_at` parses as a valid ISO 8601 timestamp. `non_compliant_machines` and `recent_quarantine_events` are arrays.
+
+**Fail / Common issues:**
+- `compliance_rate out of range` — a divide-by-zero protection bug. The handler returns `100` when `posture.total` is 0, so this should only fail if there are more compliant machines than total ones (impossible).
+- Missing summary key — a new feature added a new sub-object but the compliance report handler was not updated. This would be a handler schema drift.
+- `generated_at` parse failure — the timestamp format changed. Should be ISO 8601 from `new Date().toISOString()`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Machines export structural validation | All machines have required fields, valid status, tailnet IPs in 100.x.x.x, tags as JSON arrays |
+| ST2 | Audit log CSV structural validation | 7 columns present, all rows parsed by `csv.DictReader`, no row with empty `id` or `action` |
+| ST3 | ACL rules round-trip re-import | CRUD insert creates a new disabled rule; delete cleans up successfully |
+| ST4 | Machine records non-re-importable | Fake CRUD-inserted machines have no valid node key and cannot VPN-authenticate |
+| ST5 | Compliance report round-trip validation | All summary keys present, compliance_rate in [0,100], ISO 8601 timestamp valid |

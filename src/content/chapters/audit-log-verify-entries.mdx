@@ -1,0 +1,433 @@
+---
+title: "Verify Audit Entries for Key Actions"
+topic: "Audit Log"
+order: 75
+machines: ["Win-A", "Linux-C"]
+summary: "Perform specific control-plane actions and confirm the correct audit entries appear in Loki — covering auth, machine, ACL, auth-key, and API-key events."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Every handler that calls `logAudit()` (from `services/loki.ts`) writes an audit entry when a specific action completes. This chapter triggers five categories of real actions and verifies that the correct audit entries appear in the log.
+
+The `logAudit()` signature is:
+
+```ts
+logAudit(org_id, action, resource_type, resource_id?, user_id?, details?, ip_address?)
+```
+
+The Loki push payload stores `action`, `resource_type`, `resource_id`, `user_id`, `details`, and `ip_address` as a JSON line inside the stream labelled `job="audit"`, `org_id`, `action_prefix`, `resource_type`.
+
+Key action strings verified in this chapter:
+
+| Handler file | Action string | Trigger |
+|---|---|---|
+| `handlers/auth.ts` | `auth.login` | Email/password login |
+| `handlers/client-setup.ts` | `machine.self_service_setup` | Machine registered via `ztna up` |
+| `handlers/cleanup-machines.ts` | `machine.marked_offline` | Heartbeat timeout (machine goes offline) |
+| `handlers/api-key-auth.ts` | `auth_key.created` | New auth key created |
+| `handlers/api-key-auth.ts` | `auth_key.revoked` | Auth key revoked |
+| `handlers/db-crud.ts` | `acl_rules.created` | ACL rule inserted |
+| `handlers/db-crud.ts` | `acl_rules.deleted` | ACL rule deleted |
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser (dashboard) + PowerShell API calls |
+| <MachineRef name="Linux-C" /> | CLI machine registration (`ztna up`) to generate machine audit events |
+
+**Prerequisites:**
+- Both machines authenticated; `ztna up` works on <MachineRef name="Linux-C" />
+- Admin-level user JWT available on <MachineRef name="Win-A" />
+
+---
+
+## ST1 -- Verify auth.login Entry After Login
+
+**What it verifies:** A fresh login creates an `auth.login` entry in Loki with the correct `resource_type: "user"` and `details` containing the user's email and MFA status.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, log out of the dashboard by clicking your user avatar and selecting Sign Out (or navigate to `/auth` directly).
+
+2. Log back in with your email and password.
+
+3. After the dashboard loads, navigate to `/audit-log`.
+
+4. The most recent entry (top row) should be `auth.login`.
+
+5. Verify via API that the entry has the correct shape:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "auth.login"
+    page      = 0
+    page_size = 5
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$latest = $resp.data.logs[0]
+Write-Host "Action:        $($latest.action)"
+Write-Host "Resource type: $($latest.resource_type)"
+Write-Host "User ID:       $($latest.user_id)"
+Write-Host "Details:       $($latest.details | ConvertTo-Json)"
+```
+
+**Expected:**
+```
+Action:        auth.login
+Resource type: user
+User ID:       <your-user-uuid>
+Details:       { "email": "you@example.com", "mfa": false }
+```
+
+6. Confirm `details.email` matches the account you just logged in with.
+
+7. Confirm `ip_address` is non-null (it should be your client's IP as seen by the server):
+
+```powershell
+Write-Host "IP address: $($latest.ip_address)"
+```
+
+**Pass:** `action` is `auth.login`, `resource_type` is `user`, `details.email` matches the logged-in user, `ip_address` is non-null.
+
+**Fail / Common issues:**
+- Most recent entry is not `auth.login` -- the 30-second auto-refresh may not have run yet. Wait 35 seconds, or manually search for `auth.login` in the search box.
+- `ip_address` is null -- the request arrived without `X-Forwarded-For` or `X-Real-IP` headers. This happens in local development but not in production behind Caddy.
+
+---
+
+## ST2 -- Verify machine.self_service_setup Entry
+
+**What it verifies:** Running `ztna up` on <MachineRef name="Linux-C" /> (which triggers `handleClientSetup`) creates a `machine.self_service_setup` audit entry with the machine name, tailnet IP, and peer count.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, bring the VPN tunnel up:
+
+```bash
+ztna up
+```
+
+Wait for the status line "Connected." to appear.
+
+2. On <MachineRef name="Win-A" />, navigate to `/audit-log` and search for `machine.self_service_setup`.
+
+3. Verify the entry via API:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "machine.self_service_setup"
+    page      = 0
+    page_size = 5
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$e = $resp.data.logs[0]
+Write-Host "Action:       $($e.action)"
+Write-Host "Resource ID:  $($e.resource_id)"
+Write-Host "Details:"
+$e.details | ConvertTo-Json
+```
+
+**Expected details object:**
+```json
+{
+  "name": "linux-c",
+  "os": "linux",
+  "tailnet_ip": "100.x.x.x",
+  "peer_count": 1,
+  "reactivated": false
+}
+```
+
+4. Confirm `resource_type` is `"machine"` and `resource_id` is the machine UUID.
+
+5. Verify the machine UUID matches the one in the Machines page:
+
+```powershell
+$machineId = $e.resource_id
+$m = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&id=eq.$machineId" `
+    -Headers @{ Authorization = "Bearer $TOKEN" }
+Write-Host "Machine name: $($m.data[0].name)"
+```
+
+**Pass:** `action` is `machine.self_service_setup`, `resource_type` is `machine`, `details.os` is `linux`, `details.tailnet_ip` is populated.
+
+**Fail / Common issues:**
+- Entry does not appear -- `ztna up` may have used the registration path (`handleRegisterMachine`) instead of the client setup path if the machine was registered with an auth key (not browser login). The registration handler logs `machine.registered` (from the `db-crud.ts` generic handler), not `machine.self_service_setup`. Search for `machine.registered` instead.
+- `details.peer_count` is 0 -- the machine connected but no other machines were online at the time. This is correct.
+
+---
+
+## ST3 -- Verify auth_key.created and auth_key.revoked Entries
+
+**What it verifies:** Creating and revoking an auth key in the dashboard each produce a corresponding Loki entry.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, navigate to `/settings` and find the Auth Keys section (or navigate to `/auth-log` and use the Settings sidebar link).
+
+2. Click "Generate Key" or "Create Auth Key". Accept the defaults. Note the new key's prefix (e.g., `tskey-auth-xxx`).
+
+3. Navigate to `/audit-log` and search for `auth_key.created`.
+
+4. Verify the entry:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "auth_key.created"
+    page      = 0
+    page_size = 5
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$e = $resp.data.logs[0]
+$e.details | ConvertTo-Json
+```
+
+**Expected details:**
+```json
+{
+  "name": "My Key",
+  "reusable": false,
+  "ephemeral": false,
+  "expiry_days": 90,
+  "allowed_tags": null,
+  "allowed_cidrs": null
+}
+```
+
+5. Now revoke the key you just created. On the Settings page, click Revoke next to the key.
+
+6. Wait 5 seconds and reload the Audit Log page. Search for `auth_key.revoked`.
+
+7. Verify the revocation entry:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "auth_key.revoked"
+    page      = 0
+    page_size = 5
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$e = $resp.data.logs[0]
+Write-Host "machines_quarantined: $($e.details.machines_quarantined)"
+```
+
+**Expected:** `action` is `auth_key.revoked`, `details.machines_quarantined` is 0 (or a positive integer if machines were using the key).
+
+**Pass:** Both `auth_key.created` and `auth_key.revoked` entries exist; creation details include the key name and expiry; revocation details include `machines_quarantined`.
+
+**Fail / Common issues:**
+- `auth_key.created` not found -- the key was created via the CRUD API (`POST /api/db/auth_keys`), which logs `auth_keys.created` (table name, plural). Search for `auth_keys.created` instead.
+- `machines_quarantined` is null instead of 0 -- the revoking code path may have omitted the details. This is a minor discrepancy in the handler; the entry still exists.
+
+---
+
+## ST4 -- Verify acl_rules.created and acl_rules.deleted Entries
+
+**What it verifies:** Creating and deleting an ACL rule via the CRUD endpoint each produce a `acl_rules.created` / `acl_rules.deleted` entry logged by `handlers/db-crud.ts`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a test ACL rule via the API:
+
+```powershell
+$rule = @{
+    org_id      = $ORG_ID
+    src         = "tag:test"
+    dst         = "tag:target"
+    proto       = "tcp"
+    ports       = "8080"
+    action      = "allow"
+    description = "audit-log test rule"
+} | ConvertTo-Json
+
+$created = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/db/acl_rules" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $rule
+
+$ruleId = $created.data.id
+Write-Host "Created rule ID: $ruleId"
+```
+
+2. Wait 5 seconds, then search for `acl_rules.created` in the Audit Log:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "acl_rules.created"
+    page      = 0
+    page_size = 5
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$resp.data.logs[0] | Select-Object action, resource_type, resource_id
+```
+
+**Expected:** `action: "acl_rules.created"`, `resource_type: "acl_rules"`, `resource_id` is the new rule's UUID.
+
+3. Now delete the rule:
+
+```powershell
+Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/db/acl_rules?id=eq.$ruleId&org_id=eq.$ORG_ID" `
+    -Method DELETE `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body "{}"
+```
+
+4. Search for `acl_rules.deleted`:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "acl_rules.deleted"
+    page      = 0
+    page_size = 5
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$resp.data.logs[0].details | ConvertTo-Json
+```
+
+**Expected details for deletion:**
+```json
+{ "filters": ["id=eq.<rule-uuid>", "org_id=eq.<org-uuid>"] }
+```
+
+**Pass:** Both `acl_rules.created` (with resource_id = the new rule's UUID) and `acl_rules.deleted` (with filters array) entries exist in Loki.
+
+**Fail / Common issues:**
+- `resource_id` is null for the created entry -- the `db-crud.ts` handler only sets `resource_id` to `insertedRows[0]?.id`. If the insert returned no rows, the ID may be null. Verify the rule was actually created by checking `$created.data.id`.
+- `acl_rules.deleted` entry shows `filters: []` -- the DELETE request was sent without `_filters` in the body or without URL query parameters. The CRUD handler logs `body._filters || []`. Ensure the DELETE body is `{}` (not empty) and the `id` filter is in the URL.
+
+---
+
+## ST5 -- Verify machine.marked_offline Entry After Tunnel Down
+
+**What it verifies:** Stopping the VPN tunnel on <MachineRef name="Linux-C" /> and waiting for the heartbeat timeout causes the cleanup cron to log `machine.marked_offline`.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, stop the tunnel:
+
+```bash
+ztna down
+```
+
+2. The cleanup cron (`handlers/cleanup-machines.ts`) runs periodically and marks machines offline when their last heartbeat is stale (typically within 90 seconds of the heartbeat timeout). Wait up to 3 minutes.
+
+3. On <MachineRef name="Win-A" />, search the Audit Log for `machine.marked_offline`:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    search    = "machine.marked_offline"
+    page      = 0
+    page_size = 5
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$e = $resp.data.logs[0]
+Write-Host "Action:    $($e.action)"
+Write-Host "Resource:  $($e.resource_type) / $($e.resource_id)"
+Write-Host "Details:   $($e.details | ConvertTo-Json)"
+```
+
+**Expected:**
+```
+Action:    machine.marked_offline
+Resource:  machine / <linux-c-machine-uuid>
+Details:   { "name": "linux-c", "reason": "heartbeat_timeout" }
+```
+
+4. Confirm `user_id` on this entry is null (the cleanup cron runs without a user context):
+
+```powershell
+Write-Host "User ID: $($e.user_id)"
+```
+
+**Expected:** `user_id` is null or empty.
+
+5. Cross-check by verifying the machine status changed to `offline` in the database:
+
+```powershell
+$m = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.linux-c" `
+    -Headers @{ Authorization = "Bearer $TOKEN" }
+Write-Host "Status: $($m.data[0].status)"
+```
+
+**Expected:** `status: "offline"`.
+
+**Pass:** `machine.marked_offline` entry exists with correct machine UUID in `resource_id`; `details.reason` is `heartbeat_timeout`; `user_id` is null; machine status is `offline` in the database.
+
+**Fail / Common issues:**
+- Entry does not appear after 3 minutes -- the cleanup cron may not have fired. The cron interval is configured in `cron.ts`. Check the API container logs: `docker logs quickztna-api-1 --tail 50 | grep cleanup`.
+- `user_id` is not null -- this would be unexpected for a cron-driven event. The `logAudit` call in `cleanup-machines.ts` passes `null` for `user_id`.
+- Machine status still shows `online` -- the cleanup cron may be running on a longer interval. Wait an additional 2 minutes and re-check.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | Login creates `auth.login` entry with email and IP | `details.email` matches logged-in user; `ip_address` non-null |
+| ST2 | `ztna up` on Linux-C creates `machine.self_service_setup` | `resource_type: machine`; `details.tailnet_ip` populated |
+| ST3 | Auth key create/revoke produces paired audit entries | `auth_key.created` with name/expiry; `auth_key.revoked` with `machines_quarantined` |
+| ST4 | ACL rule create/delete produces CRUD audit entries | `acl_rules.created` with rule UUID; `acl_rules.deleted` with filters array |
+| ST5 | Tunnel down leads to `machine.marked_offline` from cron | `details.reason: heartbeat_timeout`; `user_id` is null; DB status is `offline` |

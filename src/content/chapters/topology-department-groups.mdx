@@ -1,0 +1,269 @@
+---
+title: "Topology with Department Groups"
+topic: "Topology Visualization"
+order: 89
+machines: ["Win-A"]
+summary: "Verify that department-level network boundaries are correctly represented in topology data: each department is an isolated org with its own machine inventory, and the parent org can enumerate all departments."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA supports two levels of network grouping that appear in topology data:
+
+**1. Segmentation Groups** (available on all plans)
+Logical groupings of machines within a single org, stored in the `segmentation_groups` and `segmentation_group_members` tables. Used as `group:NAME` selectors in ACL rules. Managed via the Segmentation page (`/segmentation`) and `SegmentationPage` component (`src/pages/SegmentationPage.tsx`).
+
+**2. Departments** (requires `org_groups` feature, Business plan or higher)
+Fully isolated sub-organizations. Each department is a separate row in the `organizations` table with `org_role = 'child'` and a reference to the parent org via the `org_groups` table. Each department has its own machines, ACLs, DNS records, and policies — they do not share network space with the parent or sibling departments. Managed via the Departments page (`/departments`) and `DepartmentsPage` component (`src/pages/DepartmentsPage.tsx`).
+
+Department management is handled by the `org-groups` handler invoked via `api.functions.invoke("org-groups", ...)` with these actions:
+- `list_departments` — returns all departments in the group plus `is_parent` flag and group metadata
+- `enable_departments` — creates an `org_groups` record making the current org a parent
+- `create_department` — creates a child org with a slug derived from the department name
+- `delete_department` — removes the child org (machines must be removed first)
+
+The `DepartmentsPage` shows each department with its name, slug, and a `Parent` or `Department` badge based on `org_role`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser — logged in as org owner, API testing |
+
+**Prerequisite:** The org has the `org_groups` feature enabled (Business plan or higher). To check: open the Billing page (`/billing`) or call the feature-check endpoint.
+
+---
+
+## ST1 -- Feature Gate Check for Departments
+
+**What it verifies:** The Departments page correctly gates access behind the `org_groups` feature flag. An org without the feature sees an upgrade card; an org with the feature sees the department management UI.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, check the current org's feature set:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/functions/feature-check" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\": \"$ORG_ID\"}" | python3 -m json.tool
+```
+
+**Expected:** The `data.features` array lists enabled features. Check whether `org_groups` is present.
+
+2. Open `https://login.quickztna.com/departments` in the browser.
+
+**If `org_groups` is NOT in the feature list:**
+
+**Expected:** A `FeatureUpgradeCard` is rendered with:
+- Title: "Departments"
+- Description: "Create isolated department networks with independent machines, ACLs, DNS, and policies."
+- Required plan: "Business"
+
+The management UI is not shown.
+
+**If `org_groups` IS in the feature list:**
+
+**Expected:** The department management UI is shown (either an "Enable Departments" button if not yet enabled, or the department list if already enabled).
+
+**Pass:** Feature gate correctly blocks or allows access based on plan.
+
+---
+
+## ST2 -- Enable Departments and Verify Parent Org Structure
+
+**What it verifies:** Clicking "Enable Departments" creates an org group record, making the current org a parent. The Departments page updates to show the parent structure and an empty department list.
+
+**Prerequisite:** The org has `org_groups` feature and departments have NOT been enabled yet.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/departments`.
+
+2. The page shows an "Enable Departments" button under the description text.
+
+3. Click "Enable Departments".
+
+**Expected:** A loading spinner appears on the button, then a toast notification: "Departments enabled — Group 'ORG_NAME' created". The page re-fetches and now shows the parent org structure.
+
+4. Verify via the `list_departments` action:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/org-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"list_departments\",
+    \"org_id\": \"$ORG_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": {
+    "departments": [
+      {
+        "id": "uuid",
+        "name": "CURRENT_ORG_NAME",
+        "slug": "current-org-slug",
+        "org_role": "parent"
+      }
+    ],
+    "is_parent": true,
+    "group": {
+      "id": "uuid",
+      "name": "CURRENT_ORG_NAME"
+    }
+  }
+}
+```
+
+**Pass:** `is_parent` is `true`. The parent org appears in the departments list with `org_role = "parent"`. Group metadata is populated.
+
+---
+
+## ST3 -- Create Department and Verify Isolated Network Boundary
+
+**What it verifies:** Creating a department creates a new child org with its own isolated network namespace. The department appears in the parent's department list.
+
+**Prerequisite:** Departments are enabled (ST2 completed).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/departments`.
+
+2. Click "Create Department".
+
+3. Enter "Engineering" as the department name and press Enter or click "Create".
+
+**Expected:** A loading spinner appears, then toast: "Department created — 'Engineering' is ready. Switch to it from the org picker."
+
+4. The department list now shows two entries:
+   - Parent org with "Parent" badge
+   - "Engineering" department with "Department" badge and slug (e.g. `engineering`)
+
+5. Verify via API:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/org-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"list_departments\",
+    \"org_id\": \"$ORG_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** Two entries in `departments`. The child has `org_role = "child"` and `name = "Engineering"`.
+
+6. Use the org switcher in the top navigation to switch to the "Engineering" department.
+
+**Expected:** The dashboard loads with 0 machines (the Engineering department is a brand-new org with no machines registered). The Machines page shows "0 devices in your network".
+
+**Pass:** Department created with isolated network. Switching to the department shows a clean, empty machine inventory.
+
+---
+
+## ST4 -- Department Topology is Separate from Parent Topology
+
+**What it verifies:** Machines registered in the parent org are not visible in the child department, and vice versa. Each department has its own independent topology.
+
+**Prerequisite:** Engineering department created (ST3 completed). Win-A, Win-B, and Linux-C are registered in the parent org.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, while switched to the parent org, verify the parent machine count:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** 3 machines (Win-A, Win-B, Linux-C).
+
+2. Get the Engineering department's org ID by querying org memberships after switching to it in the browser:
+```bash
+curl -s "https://login.quickztna.com/api/user-orgs" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Look for the Engineering org in the response and note its `id`.
+
+3. Query machines for the Engineering org ID:
+```bash
+ENG_ORG_ID="ENGINEERING_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ENG_ORG_ID&select=name" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Empty array -- `"data": []`. No machines exist in the Engineering department.
+
+4. Verify that ACL rules from the parent org are also absent in the Engineering org:
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=$ENG_ORG_ID&select=name" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Empty array.
+
+**Pass:** The Engineering department has 0 machines and 0 ACL rules -- completely isolated from the parent org's topology.
+
+---
+
+## ST5 -- Delete Department and Verify Parent Topology Unchanged
+
+**What it verifies:** Deleting a department removes it from the department list. The parent org's machines and ACL rules are not affected.
+
+**Prerequisite:** Engineering department is empty (no machines registered in it).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, switch back to the parent org using the org switcher.
+
+2. Open `https://login.quickztna.com/departments`.
+
+3. Click the trash icon on the "Engineering" department row.
+
+4. A confirmation dialog appears: "Delete 'Engineering'? Machines must be removed first."
+
+5. Confirm the deletion.
+
+**Expected:** Toast: "Department deleted". The Engineering entry disappears from the list. Only the parent org row remains.
+
+6. Verify via API that the department is gone:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/org-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"list_departments\",
+    \"org_id\": \"$ORG_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** Only the parent org entry remains in `departments`.
+
+7. Verify that the parent org's machines are still present:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Win-A, Win-B, and Linux-C are all still present and unchanged.
+
+**Pass:** Department deleted successfully. Parent org topology (machines, ACL rules) is completely unaffected.
+
+**Fail / Common issues:**
+- Deletion fails with an error message about machines -- if the Engineering department has any machines registered, they must be removed from that org first before the department can be deleted.
+- Department does not appear in the org switcher after creation -- the `refetchOrgs()` call in `DepartmentsPage` refreshes the org list; if it does not update, reload the page.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Feature gate for Departments | Upgrade card shown without `org_groups`; management UI shown with feature |
+| ST2 | Enable Departments makes org a parent | `is_parent = true`; parent org in departments list |
+| ST3 | Create Department creates isolated network | Child org created; empty machine inventory; visible in org switcher |
+| ST4 | Department topology is separate from parent | Parent has 3 machines; Engineering has 0; ACL rules also isolated |
+| ST5 | Delete Department leaves parent topology intact | Department removed; parent machines and ACLs unchanged |

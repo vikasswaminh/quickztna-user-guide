@@ -1,0 +1,372 @@
+---
+title: "Export Audit Log"
+topic: "Export & Data Management"
+order: 104
+machines: ["Win-A"]
+summary: "Verify that POST /api/export with action 'audit_logs' returns Loki-backed audit entries in both JSON and CSV formats, that the days parameter controls the lookback window, that admin gating is enforced, and that CSV columns are injection-safe."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Audit logs in QuickZTNA are stored in **Loki**, not PostgreSQL. The `handleExportData` handler in `backend/src/handlers/export-data.ts` reads them via `queryAuditLogs` from `services/loki.ts`.
+
+The `audit_logs` action is invoked with:
+
+```
+POST /api/export
+Body: { "action": "audit_logs", "org_id": "...", "days": N, "format": "csv" | omit }
+```
+
+**Key implementation details:**
+- `days` is parsed with `parseInt`; non-numeric or absent values default to `30`.
+- The Loki query uses `date_from = now - days * 86400000ms` and a hard limit of `10000` entries.
+- Requires `isOrgAdmin` — plain members receive `403`.
+
+**JSON response** (`format` omitted):
+
+```json
+{ "logs": [ { "id", "action", "resource_type", "resource_id", "user_id", "created_at", "details" } ], "count": N }
+```
+
+**CSV response** (`"format": "csv"`):
+
+```
+id,action,resource_type,resource_id,user_id,created_at,details
+```
+
+The CSV is built with `csvSafe` + `csvEscapeField` on every cell — the same injection-protection logic used for the machines export.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — all API calls issued from here |
+
+Before running these tests, perform a few admin actions on the dashboard to generate recent audit events (e.g. rename a machine, create an ACL rule, revoke an auth key).
+
+```bash
+TOKEN="eyJhbGciOiJFUzI1NiIsInR..."
+ORG_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+---
+
+## ST1 — Export Audit Logs as JSON (Default Window)
+
+**What it verifies:** The `audit_logs` action returns log entries from Loki in JSON format, using a 30-day default window when `days` is omitted.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('success:', d['success'])
+print('count:', d['data']['count'])
+print('log count:', len(d['data']['logs']))
+if d['data']['logs']:
+    first = d['data']['logs'][0]
+    print('First entry keys:', list(first.keys()))
+    print('First entry action:', first.get('action'))
+"
+```
+
+**Expected output:**
+
+```
+success: True
+count: 42
+log count: 42
+First entry keys: ['id', 'action', 'resource_type', 'resource_id', 'user_id', 'created_at', 'details']
+First entry action: machine.registered
+```
+
+**Pass:** `success: true`, `data.logs` is a non-empty array (assuming recent activity), `data.count` equals `len(data.logs)`. Each log entry has all seven expected fields.
+
+**Fail / Common issues:**
+- `count: 0` — no audit events in the past 30 days for this org. Perform a dashboard action (e.g., rename a machine) and re-run.
+- Loki connectivity issue surfaces as 500 — check that the API container can reach Loki on the monitoring VM (`188.166.155.128`).
+- `403 FORBIDDEN "Admin required"` — the token is for a non-admin user.
+
+---
+
+## ST2 — Export Audit Logs with Custom Days Window
+
+**What it verifies:** The `days` parameter narrows the lookback window. A shorter window returns fewer entries than a longer one.
+
+**Steps:**
+
+```bash
+# Last 1 day
+COUNT_1D=$(curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":1}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['count'])")
+
+# Last 90 days
+COUNT_90D=$(curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":90}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['count'])")
+
+echo "1-day count : $COUNT_1D"
+echo "90-day count: $COUNT_90D"
+
+# 90-day window must have at least as many entries as the 1-day window
+python3 -c "
+one = int('$COUNT_1D')
+ninety = int('$COUNT_90D')
+assert ninety >= one, f'FAIL: 90d ({ninety}) < 1d ({one})'
+print(f'PASS: 90-day ({ninety}) >= 1-day ({one})')
+"
+```
+
+**Expected output:**
+
+```
+1-day count : 5
+90-day count: 87
+PASS: 90-day (87) >= 1-day (5)
+```
+
+Also verify the default (no `days`) matches the 30-day window:
+
+```bash
+COUNT_30D=$(curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":30}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['count'])")
+
+COUNT_DEFAULT=$(curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['count'])")
+
+echo "30-day explicit : $COUNT_30D"
+echo "Default (no days): $COUNT_DEFAULT"
+```
+
+**Pass:** `days:90` returns a count greater than or equal to `days:1`. Default (omitted) count matches `days:30` count (within the same second of execution).
+
+**Fail / Common issues:**
+- All windows return the same count — there are fewer than 10,000 total log entries, so the limit is not reached. This is expected for a small org.
+- Default count differs from 30-day count — there was activity between the two calls. Re-run back-to-back to minimise this window.
+
+---
+
+## ST3 — Export Audit Logs as CSV
+
+**What it verifies:** When `"format": "csv"` is sent, the response contains a `csv` string with the correct 7-column header and one data row per log entry.
+
+**Steps:**
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":7,\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+csv_text = d['data']['csv']
+count = d['data']['count']
+lines = [l for l in csv_text.split('\n') if l.strip()]
+header = lines[0]
+data_rows = lines[1:]
+
+print('Header:', header)
+print('Reported count:', count)
+print('Data row count:', len(data_rows))
+print('Match:', count == len(data_rows))
+
+if data_rows:
+    print('Sample row:', data_rows[0])
+"
+```
+
+**Expected output:**
+
+```
+Header: id,action,resource_type,resource_id,user_id,created_at,details
+Reported count: 12
+Data row count: 12
+Match: True
+Sample row: abc123,machine.registered,machine,def456,usr789,2026-03-16T14:22:01.000Z,{}
+```
+
+Save the CSV and parse it:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":7,\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json, csv, io
+d = json.load(sys.stdin)
+reader = csv.DictReader(io.StringIO(d['data']['csv']))
+rows = list(reader)
+print(f'Parsed {len(rows)} rows via csv.DictReader')
+print('Columns:', reader.fieldnames)
+"
+```
+
+**Expected:**
+
+```
+Parsed 12 rows via csv.DictReader
+Columns: ['id', 'action', 'resource_type', 'resource_id', 'user_id', 'created_at', 'details']
+```
+
+**Pass:** Header is exactly `id,action,resource_type,resource_id,user_id,created_at,details`. Row count matches `data.count`. `csv.DictReader` parses all rows without error.
+
+**Fail / Common issues:**
+- `details` column contains JSON with commas — these should be quoted by `csvEscapeField`. If `csv.DictReader` fails, the quoting is broken.
+- Row count is 0 but count field is non-zero — the `csv` string may only contain the header. This would be a handler bug.
+
+---
+
+## ST4 — Verify Audit Log Entry Fields
+
+**What it verifies:** Each audit log entry returned by the JSON export contains meaningful, non-null values for the core fields.
+
+**Steps:**
+
+Trigger a known audit event first — rename a machine:
+
+```bash
+MACHINE_ID=$(curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&select=id,name" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])")
+
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"rename\",\"machine_id\":\"$MACHINE_ID\",\"name\":\"audit-test-rename\"}" \
+  | python3 -m json.tool
+```
+
+Now export the last 1 day of audit logs and find the rename event:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":1}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+logs = d['data']['logs']
+rename_events = [l for l in logs if 'rename' in l.get('action','').lower() or 'name' in str(l.get('details','')).lower()]
+if rename_events:
+    print('Found rename event:')
+    print(json.dumps(rename_events[0], indent=2))
+else:
+    print(f'No rename event found. Total events in last 1 day: {len(logs)}')
+    if logs:
+        print('Most recent event:', json.dumps(logs[0], indent=2))
+"
+```
+
+**Expected:** The rename action generates an audit log entry. The entry should have:
+- `action` — a non-empty string (e.g. `machine.renamed` or similar)
+- `resource_type` — `"machine"`
+- `resource_id` — the machine UUID
+- `user_id` — the admin's user UUID
+- `created_at` — a recent ISO 8601 timestamp
+- `details` — a JSON string with the rename context
+
+Rename the machine back after testing:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"rename\",\"machine_id\":\"$MACHINE_ID\",\"name\":\"Win-A\"}" | python3 -m json.tool
+```
+
+**Pass:** The rename action appears in the audit log export within the 1-day window. The entry has non-null `action`, `resource_type`, `resource_id`, `created_at`.
+
+**Fail / Common issues:**
+- No rename event found — Loki indexing may have a short delay. Wait 30 seconds and re-run.
+- `resource_id` is null for the rename event — the handler may not be recording the machine ID. This would be an audit logging gap.
+
+---
+
+## ST5 — Confirm 10,000-Entry Limit Does Not Silently Truncate
+
+**What it verifies:** When the org has fewer than 10,000 audit log entries, the export returns all entries. The response accurately reflects the true total without silent truncation.
+
+**Steps:**
+
+```bash
+# Export with maximum days window to get the largest possible set
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":365}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+count = d['data']['count']
+log_count = len(d['data']['logs'])
+print(f'Reported count : {count}')
+print(f'Returned entries: {log_count}')
+if count >= 10000:
+    print('WARNING: Count is at or near the 10,000-entry limit. Some entries may have been truncated.')
+    print('Reduce the days window to retrieve sub-sets of the log.')
+elif count == log_count:
+    print('PASS: count matches returned entries (no truncation)')
+else:
+    print(f'FAIL: count ({count}) != returned entries ({log_count})')
+"
+```
+
+**Expected output (small org):**
+
+```
+Reported count : 87
+Returned entries: 87
+PASS: count matches returned entries (no truncation)
+```
+
+**Expected output (large org at limit):**
+
+```
+Reported count : 10000
+Returned entries: 10000
+WARNING: Count is at or near the 10,000-entry limit. Some entries may have been truncated.
+Reduce the days window to retrieve sub-sets of the log.
+```
+
+If the org is large and the limit is reached, narrow the window with shorter `days` values and make multiple calls to retrieve all entries in chunks.
+
+**Pass:** For orgs with fewer than 10,000 log entries in the given window, `count` equals the length of `logs`. No silent discrepancy between the two values.
+
+**Fail / Common issues:**
+- `count` is 10,000 exactly and the org is known to have more entries — the hard limit has been reached. Use a shorter `days` value to get sub-ranges.
+- `count` differs from `len(logs)` with count less than 10,000 — this would be a handler bug where `count` is computed differently from the returned array length.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | JSON export (default window) | 7-field log entries returned, count matches array length |
+| ST2 | Custom days window | `days:90` count >= `days:1` count; default matches `days:30` |
+| ST3 | CSV export format | Header is `id,action,resource_type,resource_id,user_id,created_at,details`; parseable by `csv.DictReader` |
+| ST4 | Audit entry field validation | Rename action produces a log entry with non-null `action`, `resource_type`, `resource_id` |
+| ST5 | 10,000-entry limit | Count matches returned entries for orgs below the limit; warning issued at limit |

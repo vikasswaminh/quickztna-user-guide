@@ -1,0 +1,326 @@
+---
+title: "Use API Key for Authenticated Requests"
+topic: "API Keys & Programmatic Access"
+order: 97
+machines: ["Win-A"]
+summary: "Authenticate programmatic API requests using the X-Api-Key header, observe usage tracking, and verify the key context returned by verifyApiKey."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Once an API key is generated, it is passed via the `X-Api-Key` header on every request. This chapter tests the `verifyApiKey` function in `backend/src/handlers/api-key-auth.ts` and its integration with the Terraform API handler (`backend/src/handlers/terraform-api.ts`).
+
+Key facts from source code:
+
+- **Authentication header:** `X-Api-Key: qztna_<64 hex chars>`
+- **Verification function:** `verifyApiKey(request, env)` — queries `api_keys` table by `SHA256(full_key)` where `revoked = FALSE AND expires_at > NOW()`
+- **Rate limiting:** enforced per-key per minute via Valkey key `apikey:<key_id>` using `checkRateLimit`
+- **Usage tracking:** on every valid use, the backend runs `UPDATE api_keys SET last_used_at = NOW(), usage_count = usage_count + 1 WHERE id = ?`
+- **Terraform endpoint (uses API key auth):** `POST/GET /api/terraform/*` — handler: `handleTerraformApi` in `terraform-api.ts`
+- **Terraform auth path:** reads `X-Api-Key` header, hashes with `sha256(apiKey.replace('ztna_', ''))`, queries `api_keys`
+- **Note on prefix stripping:** `terraform-api.ts` strips the `ztna_` prefix before hashing; `verifyApiKey` in `api-key-auth.ts` hashes the full key as-is. When using the Terraform endpoint, pass the full key including `qztna_` prefix — the handler strips `ztna_` leaving `q` + the hex portion, which must match what was stored during creation via `create_api_key` (which hashes the full `qztna_<hex>` string). Use the Terraform endpoint for Terraform-style calls.
+- **Available Terraform resources:** `machines`, `acl-rules`, `dns`, `users`, `settings`
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | API calls using the generated key |
+
+Prerequisites: You have a valid `qztna_` API key created in the previous chapter (`api-key-generate`). Store it as `API_KEY` in your shell.
+
+---
+
+## ST1 — List Machines via Terraform Endpoint
+
+**What it verifies:** The API key authenticates successfully and returns machine data scoped to the key's org.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, set your API key in the shell:
+
+```bash
+API_KEY="qztna_<your full key here>"
+```
+
+2. List all machines for the org:
+
+```bash
+curl -s -X GET "https://login.quickztna.com/api/terraform/machines" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected response (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "data": [
+      {
+        "id": "<uuid>",
+        "name": "win-a",
+        "tailnet_ip": "100.x.x.x",
+        "os": "windows",
+        "status": "online",
+        "last_seen": "<timestamp>",
+        "tags": null,
+        "advertised_routes": null,
+        "ephemeral": false,
+        "created_at": "<timestamp>"
+      }
+    ]
+  }
+}
+```
+
+**Pass:** HTTP 200. The `data.data` array contains machines belonging to the API key's org. Fields returned are: `id`, `name`, `tailnet_ip`, `os`, `status`, `last_seen`, `tags`, `advertised_routes`, `ephemeral`, `created_at`.
+
+**Fail / Common issues:**
+- HTTP 401 with `"Missing X-API-Key header"` — the header name is `X-Api-Key` (mixed case); some clients send it differently. Verify the exact header name.
+- HTTP 401 with `"Invalid or revoked API key"` — the key was entered incorrectly or was revoked. Double-check the full `qztna_` prefixed value.
+
+---
+
+## ST2 — Get a Single Machine by ID
+
+**What it verifies:** The Terraform endpoint supports retrieving individual resources by ID using path parameter routing.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, first list machines (ST1) to obtain a machine ID. Copy one UUID from the `id` field.
+
+2. Retrieve that specific machine:
+
+```bash
+MACHINE_ID="<uuid from step 1>"
+
+curl -s -X GET "https://login.quickztna.com/api/terraform/machines/$MACHINE_ID" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected response (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "name": "win-a",
+    "tailnet_ip": "100.x.x.x",
+    "os": "windows",
+    "status": "online",
+    "last_seen": "<timestamp>",
+    "tags": null,
+    "advertised_routes": null,
+    "ephemeral": false,
+    "created_at": "<timestamp>"
+  }
+}
+```
+
+Note: When a single resource is returned, `data` is the object directly (not wrapped in `{ data: [...] }`).
+
+3. Request a non-existent machine ID:
+
+```bash
+curl -s -X GET "https://login.quickztna.com/api/terraform/machines/00000000-0000-0000-0000-000000000000" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected:** HTTP 200 with `"data": null` — the DB returns null for a missing row.
+
+**Pass:** Known ID returns the machine object. Unknown ID returns HTTP 200 with null data.
+
+**Fail / Common issues:**
+- HTTP 404 for missing machine — the handler does not return 404 for missing single-resource lookups; it returns 200 with null. A 404 would indicate the resource path itself is not recognized.
+
+---
+
+## ST3 — List ACL Rules via Terraform Endpoint
+
+**What it verifies:** The `acl-rules` Terraform resource returns all ACL rules for the org ordered by priority.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, fetch ACL rules:
+
+```bash
+curl -s -X GET "https://login.quickztna.com/api/terraform/acl-rules" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected response (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "data": [
+      {
+        "id": "<uuid>",
+        "org_id": "<uuid>",
+        "name": "allow-internal",
+        "source": "100.0.0.0/8",
+        "destination": "100.0.0.0/8",
+        "ports": "*",
+        "protocol": "tcp",
+        "action": "allow",
+        "priority": 100
+      }
+    ]
+  }
+}
+```
+
+2. Also check the other available resources:
+
+```bash
+# DNS configs
+curl -s -X GET "https://login.quickztna.com/api/terraform/dns" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+
+# Org members (users)
+curl -s -X GET "https://login.quickztna.com/api/terraform/users" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+
+# Org settings
+curl -s -X GET "https://login.quickztna.com/api/terraform/settings" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Pass:** All four endpoints return HTTP 200 with `success: true` and a `data` array. The ACL rules are ordered by `priority`.
+
+**Fail / Common issues:**
+- HTTP 404 with `"Unknown resource"` and `available` list — the path segment after `/api/terraform/` must be exactly one of: `machines`, `acl-rules`, `dns`, `users`, `settings`. Check for typos (e.g., `acl_rules` vs `acl-rules`).
+
+---
+
+## ST4 — Usage Count Increments on Each Request
+
+**What it verifies:** Every authenticated API key request increments `usage_count` and updates `last_used_at` in the `api_keys` table.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, note the current usage count (requires a JWT token for CRUD access):
+
+```bash
+TOKEN="YOUR_JWT_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+KEY_ID="<uuid of your API key>"
+
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&id=eq.$KEY_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Note the `usage_count` value (e.g., `5`).
+
+2. Make 3 requests using the API key:
+
+```bash
+for i in 1 2 3; do
+  curl -s "https://login.quickztna.com/api/terraform/machines" \
+    -H "X-Api-Key: $API_KEY" > /dev/null
+  echo "Request $i done"
+done
+```
+
+3. Check the usage count again:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&id=eq.$KEY_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Pass:** `usage_count` increased by exactly 3. `last_used_at` is a recent timestamp.
+
+**Fail / Common issues:**
+- `usage_count` did not increase — the key may not have authenticated correctly (check for 401 responses in the loop output).
+- `usage_count` increased by more than 3 — another process may be using the same key concurrently.
+
+---
+
+## ST5 — Missing or Malformed Header Returns 401
+
+**What it verifies:** Requests without the `X-Api-Key` header, with an empty key, and with a structurally valid but non-existent key all return appropriate 401 errors.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, make a request with no API key header:
+
+```bash
+curl -s -X GET "https://login.quickztna.com/api/terraform/machines" \
+  | python3 -m json.tool
+```
+
+**Expected (HTTP 401):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Missing X-API-Key header"
+  }
+}
+```
+
+2. Make a request with a plausible but non-existent key:
+
+```bash
+curl -s -X GET "https://login.quickztna.com/api/terraform/machines" \
+  -H "X-Api-Key: qztna_0000000000000000000000000000000000000000000000000000000000000000" \
+  | python3 -m json.tool
+```
+
+**Expected (HTTP 401):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Invalid or revoked API key"
+  }
+}
+```
+
+3. Make a request to an unknown Terraform resource with a valid key:
+
+```bash
+curl -s -X GET "https://login.quickztna.com/api/terraform/nonexistent" \
+  -H "X-Api-Key: $API_KEY" | python3 -m json.tool
+```
+
+**Expected (HTTP 404):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Unknown resource",
+    "available": ["machines", "acl-rules", "dns", "users", "settings"]
+  }
+}
+```
+
+**Pass:** Missing header returns 401 with `"Missing X-API-Key header"`. Non-existent key returns 401 with `"Invalid or revoked API key"`. Unknown resource path returns 404 with the `available` list.
+
+**Fail / Common issues:**
+- All three return 200 — a middleware is intercepting before the Terraform handler.
+- Unknown resource returns 405 instead of 404 — the request method may be POST instead of GET.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | API key authenticates and lists machines | HTTP 200, machine array scoped to org |
+| ST2 | Single resource lookup by ID | HTTP 200 with object for known ID, null for unknown |
+| ST3 | ACL rules, DNS, users, settings resources | HTTP 200 for all four Terraform resources |
+| ST4 | Usage count increments per request | `usage_count` increases by number of requests made |
+| ST5 | Missing/invalid key returns 401 | Correct 401 codes; unknown resource returns 404 with available list |

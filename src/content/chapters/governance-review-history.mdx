@@ -1,0 +1,326 @@
+---
+title: "Access Review History"
+topic: "Governance & JIT Access"
+order: 69
+machines: ["Win-A"]
+summary: "List historical access review campaigns, inspect per-campaign decisions, and verify that revoke decisions are reflected in machine and ACL rule state."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+After access reviews are completed (or while they are in progress), administrators need to audit what was reviewed, what decisions were made, and whether enforcement actions were taken. This chapter tests the `list_review_campaigns` and `get_review_decisions` actions in `handleGovernance` (`backend/src/handlers/governance.ts`), routed via `POST /api/governance`.
+
+**`list_review_campaigns`** (any org member):
+- Returns up to 50 campaigns for the org, ordered by `created_at DESC`.
+- Each row includes: `id`, `name`, `description`, `status`, `reviewer_user_id`, `due_date`, `started_at`, `completed_at`, `created_by`, `created_at`.
+- Statuses: `'pending'`, `'active'`, `'completed'`, `'cancelled'` (defined as CHECK constraint on `access_review_campaigns`).
+
+**`get_review_decisions`** (any org member):
+- Returns all decision rows for a specific campaign, joined with `machines.name` as `machine_name`.
+- Decision values: `'approve'`, `'revoke'`, `'modify'`, or `null` (unreviewed).
+- Each row includes: `decision`, `notes`, `decided_at`, `resource_type`, `resource_id`, `machine_name`.
+
+**Enforcement side-effects** (written during `submit_review_decision`):
+- `decision = 'revoke'` + `resource_type = 'acl_rule'` sets `acl_rules.enabled = false`.
+- `decision = 'revoke'` + `resource_type = 'machine'` sets `machines.status = 'offline'`.
+- Neither of these side-effects is re-applied when reading history -- they were applied at decision-submit time.
+
+**DB tables queried:** `access_review_campaigns`, `access_review_decisions`, `machines`, `acl_rules`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | PowerShell for all API calls and state verification |
+
+**Prerequisites:** At least one completed access review campaign from Chapter 66. If no completed campaign exists, create a new one and submit all decisions before running this chapter.
+
+---
+
+## ST1 -- List All Campaigns and Check Status Values
+
+**What it verifies:** `list_review_campaigns` returns all campaigns for the org with correct fields, in newest-first order.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, list all review campaigns:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_review_campaigns",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "campaigns": [
+      {
+        "id": "<uuid>",
+        "org_id": "YOUR_ORG_ID",
+        "name": "Q1 2026 Access Review",
+        "description": "Quarterly review of all machine and ACL rule access",
+        "status": "completed",
+        "reviewer_user_id": "<uuid>",
+        "due_date": "2026-04-01T00:00:00.000Z",
+        "started_at": null,
+        "completed_at": "2026-03-17T...",
+        "created_by": "<uuid>",
+        "created_at": "2026-03-17T..."
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+2. Verify the list is ordered newest first (the campaign created most recently in Chapter 66 should appear first).
+
+3. Verify at least one campaign shows `status: "completed"` with a non-null `completed_at`.
+
+4. If you only ran Chapter 66, create a second campaign now to confirm ordering:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_review_campaign",
+    "org_id": "YOUR_ORG_ID",
+    "name": "Ad-hoc Review March 2026",
+    "reviewer_user_id": "YOUR_USER_UUID",
+    "due_date": "2026-03-31T00:00:00Z"
+  }'
+```
+
+Re-list campaigns and confirm this new one appears first (newest `created_at`).
+
+**Pass:** `list_review_campaigns` returns campaigns with all expected fields. Campaigns are ordered newest first. Completed campaigns have non-null `completed_at`.
+
+**Fail / Common issues:**
+- `campaigns: []` -- no campaigns exist for this org. Run Chapter 66 first.
+- `status` values other than `'pending'`, `'active'`, `'completed'`, `'cancelled'` -- these would violate the CHECK constraint and cannot exist.
+- `completed_at: null` on a `'completed'` campaign -- the `submit_review_decision` auto-complete path sets `completed_at = NOW()` via the UPDATE. If the campaign was manually set to `'completed'` via a CRUD write, `completed_at` may be null.
+
+---
+
+## ST2 -- Inspect Decisions for a Completed Campaign
+
+**What it verifies:** `get_review_decisions` returns all decision rows for the campaign with the correct `decided_at`, `decision`, and `machine_name` join.
+
+**Steps:**
+
+1. Using the `campaign_id` of the completed campaign from Chapter 66, fetch all decisions:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_review_decisions",
+    "org_id": "YOUR_ORG_ID",
+    "campaign_id": "COMPLETED_CAMPAIGN_UUID"
+  }'
+```
+
+**Expected:** All decision rows have a non-null `decision` and non-null `decided_at`. No row should have `decision: null`.
+
+2. Verify `machine_name` is populated for rows where `resource_type: "machine"`:
+   - Machine decisions should show `machine_name: "Win-A"` (or the actual machine name).
+   - ACL rule decisions should show `machine_name: null` (no machine is associated).
+
+3. Count the total decisions. They should match the `machines_to_review + rules_to_review` count from Chapter 66 -- ST1.
+
+4. Check that decisions are ordered by `resource_type` then `created_at`:
+   - Machine decisions (`resource_type: "machine"`) should appear grouped before or after ACL rule decisions (`resource_type: "acl_rule"`), per the ORDER BY clause.
+
+**Pass:** All decisions for a completed campaign are non-null. `machine_name` is populated for machine decisions and null for ACL rule decisions. Decision count matches the original campaign creation response.
+
+**Fail / Common issues:**
+- Some rows still show `decision: null` -- those decisions were never submitted, meaning the campaign should not be `'completed'`. The auto-complete only fires when `COUNT(*) WHERE decision IS NULL = 0`.
+- `machine_name: null` for a machine decision -- the LEFT JOIN on `machines m ON m.id = ard.machine_id` returned null. This means the machine was deleted after the campaign was created. This is expected behavior (decisions use SET NULL on machine delete per the cascade policy).
+
+---
+
+## ST3 -- Verify Revoke Decision Enforcement on Machine
+
+**What it verifies:** A machine that received `decision: "revoke"` during a review has `status: "offline"` in the `machines` table.
+
+**Steps:**
+
+1. From the completed campaign's decisions, identify any row with `resource_type: "machine"` and `decision: "revoke"`. Note its `resource_id` (the machine UUID).
+
+   If no such row exists, create a new campaign with at least one machine, then submit a revoke decision for it before proceeding.
+
+2. On <MachineRef name="Win-A" />, check the machine's current status:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/machines?org_id=YOUR_ORG_ID&id=eq.REVOKED_MACHINE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `status: "offline"`. The machine was set to offline at the time the revoke decision was submitted.
+
+3. Verify the decision row's `decided_at` timestamp matches approximately when the machine status changed (within seconds):
+   - `decided_at` in `access_review_decisions` is the same moment the status was updated.
+
+4. Confirm the machine is not quarantined (only the JIT revoke path and emergency lockdown set `'quarantined'`; access review revoke sets `'offline'`):
+
+**Expected:** `status: "offline"`, not `"quarantined"`.
+
+5. To restore the machine for further testing:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/machine-admin" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "approve",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "REVOKED_MACHINE_UUID"
+  }'
+```
+
+Or use the CRUD API to set the status back to `'online'`.
+
+**Pass:** Machine with a `'revoke'` decision has `status: "offline"`. Machine is not `'quarantined'`. The decision row's `decided_at` is timestamped at the time of the status change.
+
+**Fail / Common issues:**
+- Machine is still `'online'` after a revoke decision -- the handler only runs the `UPDATE machines SET status = 'offline'` inside the `if (decision === 'revoke')` block. If the decision was submitted with a typo (e.g., `"Revoke"` with a capital R), it would not match and the machine would not be updated. Decision values are case-sensitive.
+- Machine shows `'quarantined'` instead of `'offline'` -- this would mean a different operation (emergency lockdown or risk-based quarantine) was applied. Check the audit logs.
+
+---
+
+## ST4 -- Verify Revoke Decision Enforcement on ACL Rule
+
+**What it verifies:** An ACL rule that received `decision: "revoke"` is `enabled: false` in `acl_rules`.
+
+**Steps:**
+
+1. From the completed campaign's decisions, identify any row with `resource_type: "acl_rule"` and `decision: "revoke"`. Note its `resource_id` (the ACL rule UUID).
+
+2. On <MachineRef name="Win-A" />, check the ACL rule's current state:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.REVOKED_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `enabled: false`.
+
+3. Confirm the rule's `name` and `source`/`destination` fields are intact -- revocation only sets `enabled = false`, it does not delete the rule or alter its other fields.
+
+4. Re-enable the rule for further testing:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "_filters": {"id": "REVOKED_RULE_UUID", "org_id": "YOUR_ORG_ID"},
+    "enabled": true
+  }'
+```
+
+Note: CRUD PATCH uses `_filters` in the request body for WHERE conditions (not URL query params).
+
+5. Verify the rule is re-enabled:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.REVOKED_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `enabled: true`.
+
+**Pass:** Revoked ACL rule shows `enabled: false`. Other rule fields are unchanged. The rule can be re-enabled via CRUD PATCH.
+
+**Fail / Common issues:**
+- Rule is deleted instead of disabled -- this would be a regression. The handler only runs `UPDATE acl_rules SET enabled = false`, never `DELETE`.
+- Rule shows `enabled: true` -- the `decision === 'revoke'` check may have been against a `resource_type: 'machine'` row (which runs the machine status UPDATE, not the ACL rule UPDATE). Verify you are looking at a row with `resource_type: "acl_rule"`.
+
+---
+
+## ST5 -- Missing campaign_id Returns Error
+
+**What it verifies:** `get_review_decisions` requires `campaign_id` and returns HTTP 400 when it is absent.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, call `get_review_decisions` without providing a `campaign_id`:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_review_decisions",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "MISSING_FIELDS",
+    "message": "campaign_id required"
+  }
+}
+```
+
+2. Call with a non-existent campaign UUID:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_review_decisions",
+    "org_id": "YOUR_ORG_ID",
+    "campaign_id": "00000000-0000-0000-0000-000000000000"
+  }'
+```
+
+**Expected:** HTTP 200, `data.decisions: []` (empty array, not an error). The query returns no rows because the campaign UUID does not match any `access_review_decisions` rows.
+
+3. Confirm `list_review_campaigns` does not require any additional parameters beyond `org_id`:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_review_campaigns",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** HTTP 200 with campaigns list (no error even if zero campaigns exist -- returns `campaigns: []`).
+
+**Pass:** Missing `campaign_id` in `get_review_decisions` returns HTTP 400 `MISSING_FIELDS`. Non-existent campaign UUID returns empty `decisions` array (not 404). `list_review_campaigns` without extra params returns HTTP 200.
+
+**Fail / Common issues:**
+- Non-existent campaign UUID returns HTTP 404 -- this is not the current handler behavior. The query uses `WHERE campaign_id = ? AND org_id = ?` and returns an empty result set rather than a 404. If you see 404, a middleware layer may be intercepting the request.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | `list_review_campaigns` returns all campaigns newest-first with correct status values and `completed_at` timestamps |
+| ST2 | `get_review_decisions` returns all decisions with non-null `decided_at` for completed campaigns; `machine_name` is joined for machine decisions |
+| ST3 | A machine with `decision: "revoke"` shows `status: "offline"` (not quarantined) |
+| ST4 | An ACL rule with `decision: "revoke"` shows `enabled: false`; rule can be re-enabled via CRUD PATCH |
+| ST5 | Missing `campaign_id` returns HTTP 400 `MISSING_FIELDS`; non-existent UUID returns empty array, not 404 |

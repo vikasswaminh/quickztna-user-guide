@@ -1,0 +1,265 @@
+---
+title: "Health Page Machine List"
+topic: "Health & Monitoring"
+order: 81
+machines: ["Win-A"]
+summary: "Verify the Health page machine list — data source, column rendering, status badges, availability score bar, and heartbeat timestamp display."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Health page at `/health` is served by `HealthPage.tsx`. On mount it calls the generic CRUD API to fetch all machines for the current org:
+
+```
+GET /api/db/machines?org_id=<org_id>&select=id,name,tailnet_ip,os,status,last_seen,created_at,version&order=status&ascending=true
+```
+
+This maps directly to `db-crud.ts` — no dedicated health handler is involved. The page then renders each machine inside a card row containing:
+
+- Status dot (green = online, yellow = stale or pending, grey = offline)
+- Machine name and tailnet IP (from `machines.tailnet_ip`) and OS
+- Availability percentage bar (computed client-side by `getAvailabilityScore()`)
+- Last Heartbeat column (computed from `machines.last_seen`)
+- Last Seen column (only shown when status is `online` and `last_seen` is non-null)
+- Version badge (from `machines.version`)
+- `Stale` badge when status is `online` but `last_seen` is more than 10 minutes old
+
+The four summary cards at the top of the page are also computed client-side from the same machine list:
+- **Current Availability** — average `getAvailabilityScore()` across all machines (pending machines included in denominator)
+- **Healthy** — count of machines with `status = "online"`
+- **Offline** — count of machines with `status = "offline"`
+- **Stale (>10m)** — count of online machines whose `last_seen` is more than 10 minutes ago
+
+No backend health handler is called for this list view. The DERP relay section is a separate on-demand check covered in subsequent chapters.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + API access — navigate to Health page and run curl checks |
+
+---
+
+## ST1 — Health Page Loads and Shows Machine List
+
+**What it verifies:** The page issues the correct CRUD query and renders each machine as a card row.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, log in to `https://login.quickztna.com` and navigate to **Health** in the sidebar.
+
+2. Observe the "Machine Health Overview" card at the bottom. Each registered machine should appear as a bordered card row.
+
+3. Verify the columns visible for each row:
+   - Machine name and tailnet IP (monospace)
+   - OS label
+   - Status badge (`online` / `offline` / `pending`)
+   - Availability progress bar with percentage
+   - Last Heartbeat (e.g. "45s ago")
+   - Last Seen (e.g. "45s ago" or "—" if offline)
+   - Client version (e.g. "v3.2.8") if reported
+
+4. Cross-check against the raw API response from <MachineRef name="Win-A" />:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=id,name,tailnet_ip,os,status,last_seen,created_at,version&order=status&ascending=true" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "uuid",
+      "name": "Linux-C",
+      "tailnet_ip": "100.64.0.3",
+      "os": "linux",
+      "status": "online",
+      "last_seen": "2026-03-17T10:30:45.123Z",
+      "created_at": "2026-03-01T08:00:00.000Z",
+      "version": "3.2.8"
+    },
+    {
+      "id": "uuid",
+      "name": "Win-A",
+      "tailnet_ip": "100.64.0.1",
+      "os": "windows",
+      "status": "online",
+      "last_seen": "2026-03-17T10:30:40.000Z",
+      "created_at": "2026-03-01T08:00:00.000Z",
+      "version": "3.2.8"
+    }
+  ]
+}
+```
+
+**Pass:** Page renders one card row per machine. Each row's name, IP, OS, status, and version match the API response. No blank rows or loading spinners remain after page load.
+
+**Fail / Common issues:**
+- Spinner persists indefinitely — the CRUD query may have failed. Open browser DevTools, check the Network tab for the `/api/db/machines` request, and verify the response.
+- `No machines to monitor` message — either no machines are registered or the `org_id` context is wrong. Verify `currentOrg` is set by checking the org selector in the header.
+
+---
+
+## ST2 — Summary Stat Cards Are Accurate
+
+**What it verifies:** The four summary cards (Availability %, Healthy, Offline, Stale) reflect the correct counts computed from the machine list.
+
+**Steps:**
+
+1. Note the current machine states by running the API query from ST1.
+
+2. From the API response, manually compute the expected values:
+   - **Healthy** = count of rows where `status = "online"`
+   - **Offline** = count of rows where `status = "offline"`
+   - **Stale** = count where `status = "online"` AND `last_seen` is more than 10 minutes before current time
+   - **Availability %** = average of `getAvailabilityScore()` per machine:
+     - `online` + `last_seen` less than 5 minutes ago → 100
+     - `online` + `last_seen` between 5 and 10 minutes ago → 75
+     - `online` + `last_seen` more than 10 minutes ago → 50
+     - `pending` or `offline` → 0
+
+3. Compare computed values against the four cards on the Health page.
+
+**Expected:** All four cards match the manually computed values.
+
+**Pass:** All four summary cards display the correct counts and availability percentage.
+
+**Fail / Common issues:**
+- Availability shows 0% with all machines online — check that `last_seen` is not `null` for any machines. If `last_seen` is null but status is `online`, the function returns 100 (not 0), so the aggregate should still be non-zero.
+- Stale count is unexpectedly high — check if the org has machines that are nominally `online` but haven't sent a heartbeat in over 10 minutes. Run `ztna up` on those machines.
+
+---
+
+## ST3 — Status Dot and Stale Badge Logic
+
+**What it verifies:** The coloured status dot and the `Stale` badge appear correctly based on the `status` field and heartbeat freshness.
+
+**Steps:**
+
+1. From <MachineRef name="Win-A" />, ensure at least one machine is online and heartbeating normally (dot should be green, no Stale badge).
+
+2. Stop the VPN on a test machine to make it offline:
+```bash
+ztna down
+```
+
+3. Refresh the Health page on <MachineRef name="Win-A" /> and observe the offline machine's row:
+   - Dot should turn grey (muted)
+   - Status badge should read `offline`
+   - No `Stale` badge (Stale only applies to online machines)
+
+4. To observe the `Stale` state without waiting, query a machine that has `status = "online"` but a stale `last_seen` via the API:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Check whether any machine's `last_seen` is more than 10 minutes before the current UTC time. If so, its row on the Health page should show:
+- Yellow dot
+- `Stale` badge (yellow outline text)
+- Status badge still reads `online`
+
+**Expected:** Dot colours, badges, and status labels all reflect the actual machine state.
+
+**Pass:** Green dot for fresh-online machines. Grey dot for offline. Yellow dot and `Stale` badge for online machines with heartbeat gap greater than 10 minutes.
+
+**Fail / Common issues:**
+- Dot stays green even after `ztna down` — the page may have stale React state. Refresh the browser. The page re-fetches on each WebSocket event (covered in chapter 83).
+- Stale badge never appears — the machine may be heartbeating frequently enough (every 30-60 seconds) that the 10-minute threshold is never crossed. Artificially set `last_seen` in the DB for testing, or simply wait.
+
+---
+
+## ST4 — Machine Version Field Display
+
+**What it verifies:** The `version` field stored on the machine record (updated on each heartbeat via `machine-heartbeat.ts`) is displayed correctly in the Health page row.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, check the installed CLI version:
+```powershell
+ztna version
+```
+
+**Expected output:**
+```
+ztna version 3.2.8
+```
+
+2. On <MachineRef name="Win-A" />, query the machines table for the version field:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,version" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": [
+    { "name": "Win-A", "version": "3.2.8" },
+    { "name": "Linux-C", "version": "3.2.8" }
+  ]
+}
+```
+
+3. Navigate to the Health page. Each online machine's row should show `v3.2.8` in small muted text on the right side of the row header.
+
+4. For a machine where version is not yet set (null), no version badge should appear (the code gates on `m.version &&`).
+
+**Pass:** Version label matches the value from the DB. Machines with null version show no version text.
+
+**Fail / Common issues:**
+- Version is `null` after the machine has been running for a while — the client sends `version` in heartbeat body only if the binary was built with the `-ldflags "-X main.Version=..."` flag. A `version dev` build also sends the string `dev`.
+- Version mismatch between CLI and DB — the DB value is updated on each heartbeat. If the CLI was just upgraded, it may take one heartbeat cycle (up to 60 seconds) for the DB to reflect the new version.
+
+---
+
+## ST5 — Empty State When No Machines Are Registered
+
+**What it verifies:** The page handles the zero-machine case gracefully with a proper empty state message.
+
+**Steps:**
+
+1. To simulate this without deleting real machines, create a temporary org via the dashboard (Settings → Organizations → New) or use the API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"create","name":"Empty Test Org"}' | python3 -m json.tool
+```
+
+2. Switch to the new org using the org selector in the app header.
+
+3. Navigate to `/health`.
+
+4. Observe the "Machine Health Overview" card.
+
+**Expected:** The card body shows: `No machines to monitor`
+
+5. Also verify the four summary cards show zeroes: Availability `0%`, Healthy `0`, Offline `0`, Stale `0`.
+
+6. Clean up by switching back to your primary org.
+
+**Pass:** Empty state message renders. Summary cards all show zero. No JavaScript errors in browser console.
+
+**Fail / Common issues:**
+- Cards show stale data from the previous org — the page re-fetches when `currentOrg` changes (the `useEffect` depends on `currentOrg`). If org switching doesn't trigger a re-fetch, verify `OrgContext` is correctly updating `currentOrg`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Machine list loads via CRUD API | All machines rendered; API response matches page display |
+| ST2 | Summary stat cards compute correctly | Healthy / Offline / Stale / Availability % match manual calculation |
+| ST3 | Status dot and Stale badge logic | Green / grey / yellow dots and Stale badge appear per heartbeat freshness rules |
+| ST4 | Version field display | `version` from DB shown as `vX.Y.Z` label; null version shows nothing |
+| ST5 | Empty state | `No machines to monitor` shown when org has no machines; all stat cards at zero |

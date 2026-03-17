@@ -1,0 +1,393 @@
+---
+title: "Session Recording Verification"
+topic: "Remote Shell"
+order: 113
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that remote shell sessions produce session recording entries in the database and that recording data is stored in Cloudflare R2, including settings, lifecycle, and playback retrieval."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Session recording is managed by `handleSessionRecording` in `backend/src/handlers/session-recording.ts`. It is a separate feature from the remote shell itself, gated by the `session_recording` feature flag (distinct from `remote_management`). The endpoint is:
+
+```
+POST https://login.quickztna.com/api/session-recording
+```
+
+The Go agent can also report recordings directly via a separate node-key-authenticated route:
+
+```
+POST https://login.quickztna.com/api/session-recording-agent
+```
+
+The recording lifecycle has these states: `active` → `completed`. Storage is two-tier:
+1. **PostgreSQL** (`session_recordings` table) -- metadata: `id`, `org_id`, `machine_id`, `user_id`, `session_type`, `status`, `started_at`, `ended_at`, `duration_seconds`, `metadata` (JSON), `r2_key`
+2. **Cloudflare R2** (`quickztna` bucket) -- recording JSON at `session-recordings/ORG_ID/SESSION_ID/recording.json`; chunk files at `recordings/ORG_ID/SESSION_ID/chunk-N.cast`
+
+The `complete` action writes a summary JSON to R2 at `session-recordings/{org_id}/{session_id}/recording.json` and stores the R2 key back in the database. The `get` action fetches both the DB row and the R2 data in a single response.
+
+Org-level settings (`get_settings` / `update_settings`) control whether recording is enabled, the retention period (1-365 days), and the storage mode (`platform` or custom). Settings live in `org_settings.recording_enabled`, `recording_retention_days`, `recording_storage_mode`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | API caller, dashboard browser |
+| <MachineRef name="Linux-C" /> | Machine whose sessions are being recorded |
+
+Prerequisites:
+- The org must have the `session_recording` feature enabled (check Billing page).
+- The caller must be an org member for most actions; `list`, `delete`, `update_settings`, `cleanup` require admin role.
+- A valid JWT is required for all actions.
+
+---
+
+## ST1 -- Enable Session Recording and Verify Settings
+
+**What it verifies:** `get_settings` returns current recording configuration, and `update_settings` persists changes to `org_settings`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, fetch current settings:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_settings",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "recording_enabled": false,
+    "retention_days": 90,
+    "storage_mode": "platform"
+  },
+  "error": null
+}
+```
+
+2. Enable recording and set a 30-day retention:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "update_settings",
+    "org_id": "YOUR_ORG_ID",
+    "recording_enabled": true,
+    "retention_days": 30,
+    "storage_mode": "platform"
+  }'
+```
+
+**Expected:** HTTP 200, `data.updated: true`.
+
+3. Fetch settings again to confirm persistence:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "get_settings", "org_id": "YOUR_ORG_ID"}'
+```
+**Expected:** `recording_enabled: true`, `retention_days: 30`, `storage_mode: "platform"`.
+
+4. Verify retention clamping: attempt to set `retention_days: 0` and `retention_days: 400`:
+```powershell
+# retention_days: 0 should be clamped to 1
+# retention_days: 400 should be clamped to 365
+```
+**Expected:** Values are clamped by `Math.max(1, Math.min(365, retention_days))` in the handler.
+
+**Pass:** Settings persist correctly. Retention is clamped to range 1-365.
+
+**Fail / Common issues:**
+- HTTP 403 `FORBIDDEN` on `update_settings` -- only org admins can update settings. The `get_settings` action does not require admin role.
+- `recording_enabled` remains false after update -- ensure the `org_settings` row exists for the org. It is created during org setup migrations.
+
+---
+
+## ST2 -- Start and Complete a Recording
+
+**What it verifies:** The `start` action creates an `active` session recording row; `complete` transitions it to `completed` and writes a summary to R2.
+
+**Steps:**
+1. Start a recording for a shell session on Linux-C:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "start",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID",
+    "session_type": "ssh"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": {
+    "session_id": "UUID",
+    "status": "active"
+  },
+  "error": null
+}
+```
+Note the `session_id`. HTTP status is 201.
+
+2. Complete the recording after simulating a session:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "complete",
+    "org_id": "YOUR_ORG_ID",
+    "session_id": "SESSION_UUID",
+    "duration_seconds": 120,
+    "recording_url": "https://example.com/recording.cast",
+    "transcript_lines": 42
+  }'
+```
+
+**Expected:** HTTP 200, `data.completed` equals the session UUID.
+
+3. Fetch the recording detail to confirm R2 storage:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get",
+    "org_id": "YOUR_ORG_ID",
+    "session_id": "SESSION_UUID"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": {
+    "recording": {
+      "id": "SESSION_UUID",
+      "status": "completed",
+      "duration_seconds": 120,
+      "r2_key": "session-recordings/YOUR_ORG_ID/SESSION_UUID/recording.json",
+      "machine_name": "Linux-C"
+    },
+    "r2_data": {
+      "session_id": "SESSION_UUID",
+      "duration_seconds": 120,
+      "recording_url": "https://example.com/recording.cast",
+      "transcript_lines": 42,
+      "completed_at": "2026-03-17T..."
+    }
+  },
+  "error": null
+}
+```
+
+**Pass:** Recording row shows `status: "completed"`, `r2_key` is set, and `r2_data` is populated from R2.
+
+**Fail / Common issues:**
+- `r2_data: null` even though `r2_key` is set -- R2 write is best-effort (wrapped in try/catch). If R2 credentials are misconfigured, the DB row is still updated but R2 data is absent. Check `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` environment variables on the production server.
+- HTTP 403 `FORBIDDEN` on `complete` -- only the session owner or an org admin can complete a recording. Ensure the calling user's `user_id` matches `session_recordings.user_id`.
+
+---
+
+## ST3 -- Upload Recording Chunk
+
+**What it verifies:** The `upload_chunk` action stores individual `.cast` file chunks in R2 at `recordings/ORG_ID/SESSION_ID/chunk-N.cast` and updates the session's metadata.
+
+**Steps:**
+1. Start a recording (as in ST2, Step 1). Note the `session_id`.
+2. Upload chunk 0:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "upload_chunk",
+    "org_id": "YOUR_ORG_ID",
+    "session_id": "SESSION_UUID",
+    "chunk_index": 0,
+    "chunk_data": "[0, \"o\", \"$ \"]"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": {
+    "stored": "recordings/YOUR_ORG_ID/SESSION_UUID/chunk-0.cast",
+    "chunk_index": 0
+  },
+  "error": null
+}
+```
+
+3. Upload chunk 1:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "upload_chunk",
+    "org_id": "YOUR_ORG_ID",
+    "session_id": "SESSION_UUID",
+    "chunk_index": 1,
+    "chunk_data": "[1.2, \"o\", \"hello\\n\"]"
+  }'
+```
+**Expected:** `stored` is `recordings/YOUR_ORG_ID/SESSION_UUID/chunk-1.cast`.
+
+4. Confirm chunk path naming: the R2 key pattern is `recordings/{org_id}/{session_id}/chunk-{chunk_index}.cast`.
+
+**Pass:** Each chunk returns the correct R2 key. `chunk_index` defaults to `0` if not provided.
+
+**Fail / Common issues:**
+- `chunk_data` missing -- the handler requires both `session_id` and `chunk_data`. Sending `chunk_data: null` returns HTTP 400 `MISSING_FIELDS`.
+
+---
+
+## ST4 -- List Recordings and Verify Statistics
+
+**What it verifies:** The `list` action returns paginated recordings with a stats breakdown by status, and correctly joins machine names.
+
+**Steps:**
+1. Ensure at least two recordings exist (one `active`, one `completed`) from ST2 and ST3.
+2. On <MachineRef name="Win-A" />, list all recordings for the org:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list",
+    "org_id": "YOUR_ORG_ID",
+    "limit": 20,
+    "offset": 0
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": {
+    "recordings": [
+      {
+        "id": "...",
+        "status": "completed",
+        "duration_seconds": 120,
+        "machine_name": "Linux-C",
+        "session_type": "ssh",
+        "started_at": "..."
+      }
+    ],
+    "stats": [
+      { "status": "completed", "count": 1, "total_duration": 120 },
+      { "status": "active", "count": 1, "total_duration": 0 }
+    ]
+  },
+  "error": null
+}
+```
+
+3. Filter by machine:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+**Expected:** Only recordings for Linux-C are returned.
+
+4. Filter by status:
+```powershell
+-d '{"action": "list", "org_id": "YOUR_ORG_ID", "status": "completed"}'
+```
+**Expected:** Only `completed` recordings.
+
+5. Verify the `machine_name` field is populated via the LEFT JOIN to the `machines` table (it may be `null` if the machine was deleted -- this is expected because recordings use `SET NULL` on machine deletion).
+
+**Pass:** Recordings listed in descending `started_at` order. Stats show correct counts and total durations. Machine name is present for existing machines.
+
+**Fail / Common issues:**
+- HTTP 403 on `list` -- only admins can list recordings. Regular members cannot call the `list` action.
+- `machine_name: null` for a recording -- the machine has been deleted. This is correct behavior; recordings are preserved with a null `machine_id` reference.
+
+---
+
+## ST5 -- Agent-Reported Recording via Node Key
+
+**What it verifies:** The agent-side recording endpoint (`/api/session-recording-agent`) accepts session data with `node_key` authentication and creates a `completed` recording record directly.
+
+**Steps:**
+1. Obtain the node key for <MachineRef name="Linux-C" />. On Linux-C:
+```bash
+ztna status --json | jq .node_key
+```
+Note: the node key is a long hex string. The backend hashes it with SHA-256 and looks up `machines.node_key_hash`.
+
+2. Submit a recording report from <MachineRef name="Linux-C" /> (or simulate from Win-A with the node key):
+```bash
+curl -s -X POST "https://login.quickztna.com/api/session-recording-agent" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "node_key": "NODE_KEY_HEX",
+    "session_type": "ssh",
+    "session_data": {
+      "transcript": "[0, \"o\", \"$ uname\\n\"]\n[0.5, \"o\", \"Linux linux-c\\n\"]",
+      "duration_seconds": 30
+    }
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": {
+    "session_id": "UUID",
+    "status": "completed"
+  },
+  "error": null
+}
+```
+HTTP status is 201.
+
+3. Verify the recording appears in the `list` action with `status: "completed"` and `duration_seconds: 30`.
+4. Confirm the recording's `metadata` contains `reported_by_agent: true` and `machine_name: "Linux-C"`.
+
+**Pass:** Agent-reported recording is created with `status: "completed"` in one step, no `start`/`complete` cycle required. The `user_id` is set to `machine.owner_id`.
+
+**Fail / Common issues:**
+- HTTP 401 `UNAUTHORIZED` -- the node key hash does not match any machine. Use the exact node key string as returned by `ztna status --json`, not the public key.
+- Duration is 0 -- the asciicast transcript does not have a valid last line with a timestamp. The handler tries to parse `lastLine[0]` as a float; a malformed transcript skips duration extraction.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | `get_settings` returns defaults; `update_settings` persists changes; retention is clamped to 1-365 days |
+| ST2 | `start` creates an `active` recording; `complete` transitions to `completed` and writes summary to R2 at `session-recordings/{org}/{session}/recording.json` |
+| ST3 | `upload_chunk` stores `.cast` chunks in R2 at `recordings/{org}/{session}/chunk-N.cast` and updates session metadata |
+| ST4 | `list` returns recordings with machine names (LEFT JOIN), filtered by machine or status; stats provide per-status counts and total duration |
+| ST5 | `/api/session-recording-agent` accepts node-key auth and creates a completed recording in one step; `reported_by_agent: true` is set in metadata |

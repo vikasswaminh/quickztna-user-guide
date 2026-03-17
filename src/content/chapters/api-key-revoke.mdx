@@ -1,0 +1,366 @@
+---
+title: "Revoke API Key"
+topic: "API Keys & Programmatic Access"
+order: 99
+machines: ["Win-A"]
+summary: "Revoke an API key via the revoke_api_key action and verify the key is immediately rejected for all subsequent requests; also test the rotate_api_key action."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+API key revocation is handled by the `revoke_api_key` action in `backend/src/handlers/api-key-auth.ts`. Revocation sets `revoked = TRUE` in the `api_keys` table. The `verifyApiKey` function queries with `revoked = FALSE`, so revoked keys are immediately rejected on the next request. This chapter also tests `rotate_api_key`, which atomically revokes an old key and issues a new one with the same configuration.
+
+Key facts from source code:
+
+- **Endpoint:** `POST /api/key-management` (alias: `POST /api/api-keys`)
+- **Revoke action:** `"revoke_api_key"` — sets `revoked = TRUE WHERE id = ? AND org_id = ?`
+- **Required fields for revoke:** `action`, `org_id`, `key_id`
+- **Revoke response:** `{ revoked: "<key_id>" }` (HTTP 200)
+- **Rotate action:** `"rotate_api_key"` — revokes the old key, creates a new key with the same `name`, `scopes`, and `rate_limit_rpm`; new key always gets 30-day expiry
+- **Rotate response:** `{ id, key, key_prefix, name, old_key_revoked: "<old_key_id>" }` (HTTP 201)
+- **Auth:** JWT required, caller must be org admin or owner
+- **UI revoke path:** `APIKeysPage.tsx` uses `api.from("api_keys").eq("org_id", ...).eq("id", ...).update({ revoked: true })` — a CRUD PATCH directly to `api_keys`
+- **Effect of revocation:** `verifyApiKey` queries `WHERE key_hash = ? AND revoked = FALSE AND expires_at > NOW()` — a revoked key returns no rows, so the function returns null
+- **No cascade effect:** unlike `revoke_auth_key` (which quarantines machines), `revoke_api_key` has no side effects on machines or other resources
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + API calls (admin user) |
+
+Prerequisites: You have a valid JWT token (`TOKEN`) and org ID (`ORG_ID`).
+
+---
+
+## ST1 — Revoke an API Key via the Management Endpoint
+
+**What it verifies:** The `revoke_api_key` action sets `revoked = TRUE` and the key is immediately unusable.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a short-lived key to revoke:
+
+```bash
+TOKEN="YOUR_JWT_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+CREATE_RESP=$(curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"to-be-revoked\",
+    \"expiry_days\": 1
+  }")
+echo "$CREATE_RESP" | python3 -m json.tool
+
+# Extract key and id (requires python3 or jq)
+REVOKE_KEY=$(echo "$CREATE_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['key'])")
+REVOKE_KEY_ID=$(echo "$CREATE_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['id'])")
+echo "Key ID: $REVOKE_KEY_ID"
+```
+
+2. Confirm the key works before revocation:
+
+```bash
+curl -s "https://login.quickztna.com/api/terraform/machines" \
+  -H "X-Api-Key: $REVOKE_KEY" | python3 -m json.tool
+```
+
+**Expected:** HTTP 200.
+
+3. Revoke the key:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"revoke_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"$REVOKE_KEY_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "revoked": "<key_id>"
+  }
+}
+```
+
+4. Attempt to use the revoked key:
+
+```bash
+curl -s "https://login.quickztna.com/api/terraform/machines" \
+  -H "X-Api-Key: $REVOKE_KEY" | python3 -m json.tool
+```
+
+**Expected (HTTP 401):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Invalid or revoked API key"
+  }
+}
+```
+
+**Pass:** Revoke returns HTTP 200 with the key ID. Subsequent use of the revoked key returns HTTP 401 immediately.
+
+**Fail / Common issues:**
+- `MISSING_FIELDS` (400) — `key_id` was not included in the revoke request body.
+- Revoked key still returns 200 — the `verifyApiKey` function uses `revoked = FALSE` in its query; if the CRUD PATCH path was used instead (from the UI), confirm it correctly sets `revoked = true` and not a truthy string.
+
+---
+
+## ST2 — Revoke via Dashboard UI
+
+**What it verifies:** The trash icon in the `APIKeysPage` triggers a CRUD PATCH update (not the `revoke_api_key` action) and immediately removes the key from the list.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a key via the dashboard:
+   - Navigate to `https://login.quickztna.com/api-keys`
+   - Click "Create API Key", enter name `"ui-revoke-test"`, leave scopes empty, click "Generate Key"
+   - Copy the key, click "Done"
+
+2. In the API Keys table, locate `"ui-revoke-test"`. Click the red trash icon in its row.
+
+3. A confirmation dialog appears: "Revoke API key? This action cannot be undone. The API key will be permanently revoked." Click "Revoke".
+
+4. Confirm the row disappears from the table immediately (the UI calls `fetchKeys()` after a successful revoke).
+
+5. Verify via the CRUD API that the key is revoked (not deleted — the row remains with `revoked = true`):
+
+```bash
+# Query with revoked=eq.true to find the row
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&revoked=eq.true" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Confirm the `"ui-revoke-test"` row appears in the results with `revoked: true`.
+
+**Pass:** Row disappears from the UI table after confirmation. The DB row has `revoked: true`. The key is not physically deleted.
+
+**Fail / Common issues:**
+- Row does not disappear — the CRUD PATCH may have failed silently. Check browser DevTools Network tab for a failed PATCH to `/api/db/api_keys`.
+- Row does not appear in `revoked=eq.true` query — the UI may have sent a DELETE instead of a PATCH update.
+
+---
+
+## ST3 — Revoking a Non-Existent Key Succeeds Silently
+
+**What it verifies:** The `revoke_api_key` action uses `UPDATE ... WHERE id = ? AND org_id = ?` without checking if the row was actually found. Revoking a non-existent (or already-revoked) key does not return an error.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, attempt to revoke a UUID that does not exist:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"revoke_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"00000000-0000-0000-0000-000000000000\"
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 200):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "revoked": "00000000-0000-0000-0000-000000000000"
+  }
+}
+```
+
+2. Revoke the same key twice (use `$REVOKE_KEY_ID` from ST1 which is already revoked):
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"revoke_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"$REVOKE_KEY_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 200):** Same shape response — the UPDATE runs but affects 0 rows, which is not an error.
+
+**Pass:** Both requests return HTTP 200 with the `revoked` field set to the provided `key_id`. No 404 or error is returned.
+
+**Fail / Common issues:**
+- Returns HTTP 404 — the handler would need explicit row-count checking; the current implementation does not check `changes` on the UPDATE result.
+
+---
+
+## ST4 — Rotate an API Key
+
+**What it verifies:** The `rotate_api_key` action revokes the old key and atomically creates a new key with the same `name`, `scopes`, and `rate_limit_rpm`. The new key always has a 30-day expiry regardless of the original.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a key to rotate:
+
+```bash
+ROTATE_RESP=$(curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"rotation-candidate\",
+    \"scopes\": [\"machines\", \"acl\"],
+    \"rate_limit_rpm\": 120,
+    \"expiry_days\": 7
+  }")
+echo "$ROTATE_RESP" | python3 -m json.tool
+
+OLD_KEY_ID=$(echo "$ROTATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+OLD_KEY=$(echo "$ROTATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['key'])")
+echo "Old key ID: $OLD_KEY_ID"
+```
+
+2. Rotate the key:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"rotate_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"$OLD_KEY_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<new uuid>",
+    "key": "qztna_<new 64 hex chars>",
+    "key_prefix": "qztna_xxxxxxxx...",
+    "name": "rotation-candidate",
+    "old_key_revoked": "<old_key_id>"
+  }
+}
+```
+
+3. Confirm the old key is rejected:
+
+```bash
+curl -s "https://login.quickztna.com/api/terraform/machines" \
+  -H "X-Api-Key: $OLD_KEY" | python3 -m json.tool
+```
+
+**Expected:** HTTP 401 `"Invalid or revoked API key"`.
+
+4. Verify the new key works and inherits the same configuration:
+
+```bash
+NEW_KEY="qztna_<new key from step 2>"
+
+curl -s "https://login.quickztna.com/api/terraform/machines" \
+  -H "X-Api-Key: $NEW_KEY" | python3 -m json.tool
+```
+
+**Expected:** HTTP 200.
+
+5. Query the new key's DB row to confirm it inherited `scopes` and `rate_limit_rpm`:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&revoked=eq.false" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Find the row named `"rotation-candidate"` (the revoked=false one) and confirm `scopes` is `["machines","acl"]` and `rate_limit_rpm` is 120. Confirm `expires_at` is approximately 30 days from now (not 7).
+
+**Pass:** Rotate returns HTTP 201 with new key. Old key returns 401. New key returns 200. Scopes and rate limit are preserved. Expiry resets to 30 days.
+
+**Fail / Common issues:**
+- Rotating an already-revoked key returns HTTP 404 with `"API key not found or already revoked"` — this is expected and correct behavior (the handler checks `revoked = FALSE` before rotating).
+
+---
+
+## ST5 — Attempt to Rotate a Non-Existent or Already-Revoked Key
+
+**What it verifies:** The `rotate_api_key` action explicitly checks that the target key exists and is not already revoked before proceeding. Unlike `revoke_api_key`, it returns 404 for missing keys.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, attempt to rotate a non-existent key:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"rotate_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"00000000-0000-0000-0000-000000000000\"
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 404):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "API key not found or already revoked"
+  }
+}
+```
+
+2. Attempt to rotate the key that was already rotated in ST4 (the `old_key_id` is now revoked):
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"rotate_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"$OLD_KEY_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 404):** Same `NOT_FOUND` error — the old key is revoked so `revoked = FALSE` in the SELECT returns no rows.
+
+**Pass:** Both requests return HTTP 404 with `NOT_FOUND`. No new key is created for either request.
+
+**Fail / Common issues:**
+- Returns HTTP 200 for the already-revoked key — the handler's SELECT at `api-key-auth.ts` line 166 includes `AND revoked = FALSE`; if missing, it would find the row and proceed.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Revoke via management endpoint | HTTP 200; revoked key returns 401 immediately |
+| ST2 | Revoke via dashboard UI | Row disappears from UI; DB row has `revoked: true` |
+| ST3 | Revoking non-existent key is idempotent | HTTP 200 for both non-existent and double-revoke |
+| ST4 | Rotate key preserves config, resets expiry | Old key rejected 401; new key works; scopes/rpm inherited; expiry = 30d |
+| ST5 | Rotating revoked/missing key returns 404 | HTTP 404 `NOT_FOUND` for non-existent and already-revoked keys |

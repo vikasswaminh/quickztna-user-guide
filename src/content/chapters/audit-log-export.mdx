@@ -1,0 +1,232 @@
+---
+title: "Export Audit Log"
+topic: "Audit Log"
+order: 74
+machines: ["Win-A"]
+summary: "Export the audit log as CSV, JSON, and PDF — verify file contents, column headers, and that active filters are respected."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Audit Log page provides three client-side export buttons — CSV, JSON, and PDF — rendered in the page header. All three export functions operate on the `logs` array that is currently loaded in the React state (`AuditLogPage.tsx`). They do not make a second API call; they serialise whatever is on the current page.
+
+Key implementation details:
+
+- **CSV** (`exportCSV`): constructs a comma-separated string with six columns: Time, Action, Resource Type, Resource ID, User ID, Details. Each cell is double-quote-escaped. Uses `URL.createObjectURL` to trigger a browser download as `audit-log.csv`.
+- **JSON** (`exportJSON`): serialises the `logs` array with `JSON.stringify(logs, null, 2)` and downloads as `audit-log.json`.
+- **PDF** (`exportPDF`): uses `jsPDF` (lazy-imported) to produce a landscape A4 document with four columns: Time, Action, Resource, Details. The header line reads "Audit Log Report" and includes a "Generated: / Total events: N" subtitle. Downloads as `audit-log.pdf`.
+
+Because exports reflect only the current page (50 rows by default), testing exports on a filtered view verifies that the filters affect export output.
+
+There is also a separate server-side export endpoint at `POST /api/export` (handled by `handlers/export-data.ts`), but the Audit Log page does not use it — the three buttons are purely client-side operations on the Loki-fetched data already in memory.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser (dashboard) — all export actions are browser-side |
+
+**Prerequisites:**
+- At least five audit events loaded on the page
+- Browser downloads are not blocked (check that `login.quickztna.com` is not in the browser's blocked-downloads list)
+
+---
+
+## ST1 -- Export as CSV and Verify Structure
+
+**What it verifies:** The CSV export downloads a file with the correct six-column header and one data row per visible log entry.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, navigate to `https://login.quickztna.com/audit-log`. Wait for the table to load.
+
+2. Note the number of rows visible in the table (up to 50, or the total event count if fewer than 50).
+
+3. Click the CSV button in the top-right of the page.
+
+4. The browser downloads `audit-log.csv`. Open it in Notepad or any text editor.
+
+5. Verify the first line (header row):
+```
+"Time","Action","Resource Type","Resource ID","User ID","Details"
+```
+
+6. Count the data rows (lines after the header). The count must equal the number of rows visible in the table.
+
+7. Inspect the first data row:
+- Column 1 (Time): an ISO 8601 timestamp, e.g. `"2026-03-17T09:00:00.000Z"`
+- Column 2 (Action): an audit action string, e.g. `"auth.login"`
+- Column 3 (Resource Type): a resource type, e.g. `"user"`
+- Column 4 (Resource ID): a UUID or empty string
+- Column 5 (User ID): a UUID or empty string
+- Column 6 (Details): a JSON string, e.g. `"{""email"":""you@example.com"",""mfa"":false}"`
+
+Note: double quotes inside values are escaped as `""` (standard CSV escaping).
+
+**Pass:** Header matches exactly; data row count equals visible table row count; timestamps are ISO strings; Details is a JSON-escaped string.
+
+**Fail / Common issues:**
+- Browser blocks the download -- check `chrome://settings/content/automaticDownloads` or equivalent. Allow downloads from `login.quickztna.com`.
+- CSV has fewer rows than the table -- some `log` entries may have a null or undefined `action` field; the table filters these with `logs.filter(log => log && log.action)` but the CSV export iterates all `logs`. This is an edge case; confirm by checking if the difference equals the count of null-action entries.
+- Details column shows `"{}"` or `"—"` -- the details object was empty for that event. This is correct behaviour.
+
+---
+
+## ST2 -- Export as JSON and Verify Structure
+
+**What it verifies:** The JSON export downloads a valid JSON array where each element has all expected `AuditLog` fields.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, with the Audit Log page loaded (same state as ST1), click the JSON button.
+
+2. The browser downloads `audit-log.json`. Open it in a text editor or browser JSON viewer.
+
+3. Confirm the file is a JSON array (starts with `[` and ends with `]`).
+
+4. Inspect the first element. It must have these fields:
+```json
+{
+  "id": "1742000000000000000",
+  "action": "auth.login",
+  "resource_type": "user",
+  "resource_id": "abc123",
+  "details": { "email": "you@example.com", "mfa": false },
+  "user_id": "abc123",
+  "created_at": "2026-03-17T09:00:00.000Z"
+}
+```
+
+5. Confirm the array length equals the number of rows shown in the table.
+
+6. Validate the JSON is well-formed using PowerShell:
+
+```powershell
+$content = Get-Content "$env:USERPROFILE\Downloads\audit-log.json" -Raw
+$parsed  = $content | ConvertFrom-Json
+Write-Host "Entry count: $($parsed.Count)"
+Write-Host "First action: $($parsed[0].action)"
+Write-Host "First created_at: $($parsed[0].created_at)"
+```
+
+**Pass:** JSON parses without error; entry count matches the table; every entry has `action`, `resource_type`, and `created_at` fields.
+
+**Fail / Common issues:**
+- `ConvertFrom-Json` throws a parse error -- the `details` field may contain a raw string (not an object) if the Loki entry was malformed. This is a data quality issue, not an export bug.
+- `id` field contains a large integer string (e.g., `"1742000000000000000"`) rather than a UUID -- this is expected. The `id` is the Loki nanosecond timestamp used as a pseudo-ID, as documented in `services/loki.ts`.
+
+---
+
+## ST3 -- Export as PDF and Verify Content
+
+**What it verifies:** The PDF export downloads a landscape-orientation document with the correct title, subtitle, column headers, and data rows.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, with the Audit Log page loaded, click the PDF button.
+
+2. The browser downloads `audit-log.pdf` (jsPDF loads lazily on first click; allow 2-3 seconds).
+
+3. Open `audit-log.pdf` in a PDF viewer (Edge, Acrobat, or browser built-in).
+
+4. Verify the first page:
+   - Title text: "Audit Log Report"
+   - Subtitle includes "Generated:" followed by a date/time and "Total events:" followed by the total count
+   - Four column headers: "Time", "Action", "Resource", "Details"
+   - A horizontal rule under the column headers
+   - Data rows below, one per log entry
+
+5. If there are more than approximately 37 entries on a landscape A4 page (190mm usable height / 5mm per row), confirm a second page is generated.
+
+6. Verify the "Total events: N" in the subtitle matches the `total` count shown in the page heading (this is the Loki total, not just the current page).
+
+**Pass:** PDF opens without error; correct title and subtitle; four columns are present; rows are populated.
+
+**Fail / Common issues:**
+- PDF button does nothing for 10+ seconds -- jsPDF failed to lazy-load. Check the browser console (`F12 → Console`) for a network error on the jsPDF chunk.
+- "Total events: 0" in the subtitle -- the `total` state was 0 when the export ran. This happens if the page had not fully loaded. Wait for the table to render before clicking PDF.
+- Text truncation in the Details column -- the PDF export slices the `details` JSON to 80 characters (`JSON.stringify(log.details).slice(0, 80)`). This is by design and is not a defect.
+
+---
+
+## ST4 -- Export Respects Active Filters
+
+**What it verifies:** When a filter (action category or date range) is active, the export contains only the filtered rows currently visible in the table, not all events.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open the Filters panel and select "Today" as the date preset.
+
+2. Note the (smaller) event count in the heading.
+
+3. Export as CSV by clicking the CSV button.
+
+4. Open the downloaded `audit-log.csv` and count the data rows.
+
+5. Confirm the row count matches the filtered count displayed in the heading (not the unfiltered total).
+
+6. Confirm every row's Time column contains today's date:
+
+```powershell
+$csv   = Import-Csv "$env:USERPROFILE\Downloads\audit-log.csv"
+$today = (Get-Date).ToString("yyyy-MM-dd")
+$csv | ForEach-Object {
+    if ($_.Time -notlike "*$today*") {
+        Write-Host "FAIL: $($_.Time) is not today"
+    }
+}
+```
+
+7. Repeat steps 3-6 with JSON and PDF exports.
+
+**Pass:** All exported rows are from today; export row count matches the filtered table count.
+
+**Fail / Common issues:**
+- Export contains more rows than the filtered count -- the export always exports the full `logs` React state for the current page, which is the same data as the filtered table. If counts differ, the table's filter render (`.filter(log => log && log.action)`) may be excluding null-action entries that the CSV export includes.
+- Export contains zero rows despite events visible in the table -- this would indicate a state timing issue. Try exporting again after the page fully stabilises.
+
+---
+
+## ST5 -- Export Page 2 Contains Correct Events
+
+**What it verifies:** Navigating to page 2 and exporting gives page-2 entries, not page-1 entries — confirming exports are tied to the current React page state.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, ensure more than 50 events exist (generate them in the ST4 section of the previous chapter if needed).
+
+2. Load the Audit Log page. Note the first entry's `created_at` timestamp (the most recent event).
+
+3. Click Next to advance to page 2. Wait for the table to reload.
+
+4. Note the first entry on page 2 — it should be older than the entries on page 1.
+
+5. Click the JSON button to export page 2.
+
+6. Open `audit-log.json` and check the first entry's `created_at`:
+
+```powershell
+$j = Get-Content "$env:USERPROFILE\Downloads\audit-log.json" -Raw | ConvertFrom-Json
+Write-Host "Page-2 first entry: $($j[0].created_at)"
+```
+
+7. Confirm the `created_at` is earlier than the page-1 first entry recorded in step 2.
+
+**Pass:** Page-2 export contains events that are older than those on page 1; the export reflects the current page, not all pages.
+
+**Fail / Common issues:**
+- Page-2 export contains the same events as page-1 -- the `logs` state was not updated before the export triggered. Ensure the page-2 load completed (table must show different rows) before clicking the export button.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | CSV export has correct header and row count | Six-column header; row count equals visible table rows; timestamps are ISO strings |
+| ST2 | JSON export is valid and complete | Parses without error; entry count matches table; all AuditLog fields present |
+| ST3 | PDF export renders with correct layout | Title, subtitle with total count, four columns, data rows |
+| ST4 | Exports respect active filters | Exported rows match filtered count; no out-of-range events included |
+| ST5 | Exporting from page 2 gives page-2 events | Page-2 entries are older than page-1 entries |

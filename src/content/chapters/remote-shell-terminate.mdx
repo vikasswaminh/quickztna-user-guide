@@ -1,0 +1,247 @@
+---
+title: "Terminate Remote Shell Session"
+topic: "Remote Shell"
+order: 115
+machines: ["Win-A", "Linux-C"]
+summary: "Test all paths that terminate a remote shell session: user-initiated close, server-side disconnect, agent stream end, session timeout, and recording cleanup after termination."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Session termination is handled in `createRemoteShellWsHandler` within `backend/src/handlers/remote-shell-ws.ts`. The `onClose` handler runs on every disconnect path and performs two actions:
+
+1. **Closes the agent HTTP request** -- calls `agentReq.end()` then `agentReq.destroy()`. This sends EOF on the agent's stdin, which signals the PTY to terminate the shell process.
+2. **Writes an audit log entry** -- calls `logAudit` with action `remote.shell_disconnected`, `resource_type: "machine"`, including the `machine_name` in metadata.
+
+There are four termination paths:
+
+| Path | Trigger | WS Close Code |
+|------|---------|--------------|
+| User-initiated | Browser closes tab, clicks X button, or calls `ws.close(1000)` | 1000 (normal) |
+| Agent stream end | Agent PTY exits (shell `exit` command, process killed) | 1000 |
+| Agent connection error | Agent HTTP request errors or agent process crashes | 1011 |
+| Session timeout | 4-hour hard limit (`timeout: 4 * 60 * 60 * 1000` ms on the agent HTTP request) | 1000 |
+
+The `onError` handler also calls `agentReq.end()` and `agentReq.destroy()` to prevent HTTP connection leaks.
+
+The `RemoteTerminal` component (`src/components/remote/RemoteTerminal.tsx`) handles close codes:
+- Code `1000` -- displays `"Session ended."` in yellow
+- Code `>=4000` -- displays `"Connection rejected: REASON"` in red
+- Other codes -- displays `"Disconnected (code: CODE). REASON"` in yellow
+
+After disconnection, the component shows a "Reconnect" button that triggers a new `create_session` + WebSocket cycle.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard browser (xterm.js terminal) |
+| <MachineRef name="Linux-C" /> | Target machine, Go agent running PTY |
+
+Prerequisites:
+- <MachineRef name="Linux-C" /> is online with the Go agent running.
+- Org is on Workforce plan with `remote_management` enabled.
+- Caller is an org admin with a valid JWT.
+- An active terminal session is open (from chapter 111/112 setup).
+
+---
+
+## ST1 -- User-Initiated Close via Dashboard UI
+
+**What it verifies:** Clicking the X button in the `RemoteTerminal` header closes the WebSocket with code 1000, triggers `onClose`, ends the agent HTTP request, and writes the `remote.shell_disconnected` audit entry.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open the Remote Management page (`/remote-management`).
+2. Select <MachineRef name="Linux-C" /> from the machine dropdown and click "Connect".
+3. Wait for the terminal header to show the green "Connected" status.
+4. Run a command to confirm the session is live:
+```bash
+echo "session active"
+```
+5. Click the X button (close icon) in the terminal header bar.
+6. Observe the terminal is unmounted and the machine-selection view is restored.
+7. In browser DevTools (Network tab, WS filter), confirm the WebSocket frame sequence:
+   - Last frame from browser: close frame with code 1000
+   - Server sends close frame with code 1000
+
+8. Check the Audit Log page for a `remote.shell_disconnected` entry:
+   - `resource_type: "machine"`
+   - `resource_id: LINUX_C_MACHINE_ID`
+   - `metadata.machine_name: "Linux-C"`
+
+**Pass:** WebSocket closes with code 1000. Audit entry `remote.shell_disconnected` appears in Loki within 15 seconds. The component unmounts cleanly, leaving no dangling WebSocket or HTTP connection.
+
+**Fail / Common issues:**
+- Audit entry missing -- `onClose` fires only when the WebSocket close event is received by the server. If the browser tab is force-killed, the server may not receive a close frame and relies on TCP RST to detect the disconnect. Loki ingestion may be delayed by up to 30 seconds.
+- Terminal component not unmounting -- check that `onClose` prop is wired correctly in `RemoteManagementPage.tsx` (`closeTerminal` sets `terminalSession` to null).
+
+---
+
+## ST2 -- Session Termination by Typing `exit` in the Shell
+
+**What it verifies:** When the remote shell process exits (user types `exit`), the agent closes the response stream, which triggers the `agentRes.on('end')` handler on the backend, which closes the WebSocket with code 1000.
+
+**Steps:**
+1. Open an active terminal session to <MachineRef name="Linux-C" /> (as in ST1 steps 1-4).
+2. In the terminal, type:
+```bash
+exit
+```
+3. Press Enter.
+4. Observe the terminal output:
+```
+Session ended.
+```
+(written in yellow by the `ws.onclose` handler when code is 1000)
+5. Confirm the terminal header changes from green to grey ("Disconnected").
+6. The "Reconnect" button appears.
+7. Check browser DevTools WebSocket frames: the server sent a close frame with code 1000 and reason `"Shell session ended"`.
+
+**Pass:** Typing `exit` causes the agent to end its stdout stream, which propagates through the backend as `agentRes.on('end')` → `rawWs.close(1000, 'Shell session ended')`. The terminal displays `"Session ended."` in yellow.
+
+**Fail / Common issues:**
+- Terminal remains connected after `exit` -- the shell may have spawned a sub-shell. Type `exit` again or press Ctrl+D.
+- `agentRes.on('end')` not firing -- the agent may keep the HTTP response open even after the PTY exits. This is a Go agent behavior; verify the agent version is v3.2.8+.
+
+---
+
+## ST3 -- Agent Connection Failure (Unreachable Machine)
+
+**What it verifies:** When the backend cannot reach the agent at `tailnet_ip:2222` (e.g., the machine goes offline mid-session), the HTTP request error propagates to the WebSocket as close code 1011.
+
+**Steps:**
+1. Open an active terminal session to <MachineRef name="Linux-C" />.
+2. While the session is active, on <MachineRef name="Linux-C" />, stop the VPN tunnel:
+```bash
+ztna down
+```
+This makes the tailnet IP unreachable.
+3. Wait up to 30 seconds for the backend's HTTP request to <MachineRef name="Linux-C" />:2222 to time out or error.
+4. Observe the terminal output on <MachineRef name="Win-A" />:
+```
+Disconnected (code: 1011). Agent connection error
+```
+or for a connection timeout:
+```
+Session timed out.
+```
+5. The terminal header should turn to grey/red.
+6. The "Reconnect" button appears.
+
+7. Click "Reconnect" while Linux-C is still offline. Observe the reconnect attempt fails at the `create_session` step with `MACHINE_OFFLINE` (HTTP 400), shown in the terminal as:
+```
+Error: Machine must be online for remote shell
+```
+
+8. Bring Linux-C back online:
+```bash
+ztna up
+```
+9. Click "Reconnect". Confirm a new session is created and the terminal reconnects.
+
+**Pass:** Loss of tailnet connectivity causes WebSocket close code 1011. The "Reconnect" flow correctly calls `create_session` again (not reusing the old token).
+
+**Fail / Common issues:**
+- Close code is 1006 (abnormal) instead of 1011 -- this happens when the TCP connection is dropped without a clean close frame. The behavior is acceptable; the displayed message may differ but the disconnect is still detected.
+- Reconnect succeeds even while the machine is offline -- the heartbeat timeout window (90 seconds) may not have elapsed, so the machine status is still `online` in the DB. Wait for the heartbeat to expire or force-set status via machine-admin.
+
+---
+
+## ST4 -- Terminate Session from the Backend (Recording Cleanup)
+
+**What it verifies:** After a session terminates, a pending `active` session recording (if one was started) can be completed or deleted via the `session-recording` API, and the audit trail reflects the full session lifecycle.
+
+**Steps:**
+1. Start a session recording before opening the shell:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "start",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID",
+    "session_type": "ssh"
+  }'
+```
+Note the `session_id` from the response.
+
+2. Open and use the terminal session (run a few commands).
+3. Close the terminal (click X or type `exit`).
+4. Complete the recording:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "complete",
+    "org_id": "YOUR_ORG_ID",
+    "session_id": "SESSION_UUID",
+    "duration_seconds": 45
+  }'
+```
+**Expected:** HTTP 200, `data.completed` equals the session UUID.
+
+5. Verify the Audit Log shows both events in order:
+   - `remote.shell_connected` (when the WebSocket opened)
+   - `remote.shell_disconnected` (when the WebSocket closed)
+
+6. Delete the test recording:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/session-recording" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "delete",
+    "org_id": "YOUR_ORG_ID",
+    "session_id": "SESSION_UUID"
+  }'
+```
+**Expected:** HTTP 200, `data.deleted` equals the session UUID. The R2 key is also deleted from the bucket (best-effort).
+
+7. Verify the recording no longer appears in the `list` action.
+
+**Pass:** Recording lifecycle completes cleanly: `active` → `completed` → `deleted`. R2 summary file is removed. Audit log contains both connect and disconnect events.
+
+**Fail / Common issues:**
+- `complete` returns 404 -- the `session_id` does not match any recording for the `org_id`. Verify the correct UUID.
+- Recording still appears in `list` after delete -- the `delete` action removes from the DB. If the `list` result is cached by the frontend, force-refresh.
+
+---
+
+## ST5 -- Reconnect Flow After Disconnection
+
+**What it verifies:** The "Reconnect" button in `RemoteTerminal` correctly calls `create_session` to obtain a new token and opens a new WebSocket, rather than reusing the expired `shell_token`.
+
+**Steps:**
+1. Open a terminal session to <MachineRef name="Linux-C" />. Note the first WebSocket URL's `shell_token` parameter from browser DevTools.
+2. In the terminal, type `exit` to terminate the session (close code 1000).
+3. Observe the "Reconnect" button in the terminal header.
+4. In browser DevTools, clear the Network log.
+5. Click "Reconnect".
+6. Observe in the Network tab:
+   - A new `POST /api/remote-shell` request with `action: "create_session"` (generates a new token)
+   - A new WebSocket connection to `/api/remote-shell/ws` with a different `shell_token`
+7. Confirm the new `shell_token` in the WebSocket URL is different from the first session's token.
+8. Confirm the terminal connects successfully and `echo "reconnected"` produces output.
+
+**Pass:** Each reconnect generates a fresh `create_session` call and a new `shell_token`. The old token is not reused. Session connects successfully.
+
+**Fail / Common issues:**
+- Reconnect uses the same `shell_token` -- this would indicate `shellTokenRef.current` is being reused without clearing. Check `createSessionAndConnect` in `RemoteTerminal.tsx`: it always calls `api.functions.invoke("remote-shell", { action: "create_session" })` and sets `shellTokenRef.current = data.token` with the new token.
+- Reconnect fails immediately with "Error: Machine must be online" -- the machine went offline during the session. Bring it back online with `ztna up` before clicking Reconnect.
+- Double WebSocket connections visible in DevTools -- the component may have mounted twice due to React StrictMode double-invocation in development. This does not occur in production builds.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | User clicking X sends WS close code 1000; `onClose` fires, agent HTTP request is ended, `remote.shell_disconnected` audit entry written to Loki |
+| ST2 | Typing `exit` causes agent to end the stdout stream; backend propagates this as WS close 1000 with reason `"Shell session ended"` |
+| ST3 | Unreachable agent causes WS close code 1011 or timeout; Reconnect flow correctly calls `create_session` for a fresh token |
+| ST4 | Session recording started before a shell session can be completed and deleted after termination; audit log shows both `shell_connected` and `shell_disconnected` entries in order |
+| ST5 | Reconnect button triggers a new `create_session` call; new `shell_token` is different from the previous session's token |

@@ -1,0 +1,268 @@
+---
+title: "DERP Relay Node Visible in Graph"
+topic: "Topology Visualization"
+order: 88
+machines: ["Win-A"]
+summary: "Verify that DERP relay regions are discoverable via the DERP map endpoint, visible in the admin settings UI, and that the CLI correctly identifies and uses the nearest relay node."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+DERP (Designated Encrypted Relay for Packets) relay nodes are an essential part of the network topology. When two machines cannot establish a direct WireGuard P2P connection (due to symmetric NAT, firewall rules, or other traversal failures), all traffic is relayed through the nearest DERP server. The relay node is therefore a logical hub in the topology for any pair of machines that cannot communicate directly.
+
+QuickZTNA operates four globally distributed DERP relay servers, defined statically in `backend/src/handlers/derp-map.ts`:
+
+| Region Code | Name | IPv4 | Priority |
+|-------------|------|------|----------|
+| `blr1` | Bangalore | 139.59.26.108 | 10 |
+| `nyc1` | New York | 142.93.7.116 | 20 |
+| `lon1` | London | 142.93.39.6 | 30 |
+| `sfo3` | San Francisco | 137.184.190.98 | 40 |
+
+The DERP map is served by `GET /api/derp-map` (no authentication required). This endpoint returns all four regions. Each Go client fetches the DERP map on startup and probes latency to each region, connecting to the lowest-latency one.
+
+Administrators can also add custom DERP regions per-org via the **DERPRegionsCard** component (`src/components/settings/DERPRegionsCard.tsx`) on the Settings page (`/settings`). Custom regions are stored in the `derp_regions` table and returned by the same CRUD API.
+
+The DERP relay connection state is visible via `ztna status` on the client: the output includes a `relay` field showing the region code of the active relay, or indicates `direct` if a P2P connection is established.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser, API testing, CLI testing |
+
+---
+
+## ST1 -- DERP Map Endpoint Returns All Four Relay Regions
+
+**What it verifies:** The public `GET /api/derp-map` endpoint returns the complete list of relay regions with correct hostnames, IPs, and port numbers.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, call the DERP map endpoint (no auth token required):
+```bash
+curl -s "https://login.quickztna.com/api/derp-map" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "regions": [
+      {
+        "id": 1,
+        "region_code": "blr1",
+        "region_name": "Bangalore",
+        "hostname": "derp-blr1.quickztna.com",
+        "ipv4": "139.59.26.108",
+        "stun_port": 3478,
+        "derp_port": 443,
+        "priority": 10
+      },
+      {
+        "id": 2,
+        "region_code": "nyc1",
+        "region_name": "New York",
+        "hostname": "derp-nyc1.quickztna.com",
+        "ipv4": "142.93.7.116",
+        "stun_port": 3478,
+        "derp_port": 443,
+        "priority": 20
+      },
+      {
+        "id": 3,
+        "region_code": "lon1",
+        "region_name": "London",
+        "hostname": "derp-lon1.quickztna.com",
+        "ipv4": "142.93.39.6",
+        "stun_port": 3478,
+        "derp_port": 443,
+        "priority": 30
+      },
+      {
+        "id": 4,
+        "region_code": "sfo3",
+        "region_name": "San Francisco",
+        "hostname": "derp-sfo3.quickztna.com",
+        "ipv4": "137.184.190.98",
+        "stun_port": 3478,
+        "derp_port": 443,
+        "priority": 40
+      }
+    ]
+  }
+}
+```
+
+2. Confirm all four regions are present. Confirm `stun_port` is 3478 and `derp_port` is 443 for all regions.
+
+**Pass:** Four regions returned. All hostnames follow the pattern `derp-REGIONCODE.quickztna.com`. Ports match expected values.
+
+---
+
+## ST2 -- DERP Regions Visible in Admin Settings UI
+
+**What it verifies:** The DERPRegionsCard component on the Settings page fetches org-level custom DERP regions from the `derp_regions` table and renders them. Built-in regions are not stored in the database and are not shown here; this card is for custom overrides.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/settings`.
+2. Scroll to the "DERP Relay Regions" card.
+
+**Expected:** The card header shows "DERP Relay Regions" with subtitle "Relay servers for NAT traversal between machines". An "Add Region" button is present.
+
+3. If no custom regions have been configured, the card body shows: "No relay regions configured yet".
+
+4. Add a custom test region to verify the form works:
+   - Click "Add Region"
+   - Fill in: Region Name "Test-BLR", Region Code "test-blr", Hostname "derp-test.example.com"
+   - Set STUN Port to 3478, DERP Port to 443, Priority to 99
+   - Click "Add Region"
+
+**Expected:** A toast notification: "Region added — Test-BLR relay region created."
+
+5. Verify the new entry appears in the card with the region name, badge showing the region code, and the hostname:port.
+
+6. Verify via API:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/derp_regions?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** The response includes the newly created region row.
+
+7. Cleanup -- delete the test region by clicking the trash icon on the region entry.
+
+**Pass:** Custom region can be added and deleted via the UI. The DERP map card correctly persists custom regions to the database. Cleanup succeeds.
+
+---
+
+## ST3 -- CLI Reports Active Relay Node in Status Output
+
+**What it verifies:** When a machine is connected, `ztna status` reports the relay node being used (or indicates a direct connection). This confirms the client has selected a DERP region from the map.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ensure the VPN is running:
+```bash
+ztna status
+```
+
+**Expected output includes:**
+```
+Status: Connected
+Tailnet IP: 100.64.x.x
+```
+
+The output may also include relay information. If the machine is using DERP relay, the output will reference the relay region (e.g., `blr1` for India-based machines since blr1 has priority 10).
+
+2. Run a network check to see DERP latency probing:
+```bash
+ztna netcheck
+```
+
+**Expected:** The netcheck output shows latency measurements to each DERP region. The lowest-latency region will be used for relay.
+
+3. On <MachineRef name="Win-A" /> (located in India), the Bangalore region (`blr1`, priority 10) should show the lowest latency.
+
+4. Confirm the relay regions are reachable on port 443:
+```bash
+# Test DERP connectivity to each region
+curl -sk "https://derp-blr1.quickztna.com/derp/probe" -o /dev/null -w "%{http_code}\n"
+curl -sk "https://derp-nyc1.quickztna.com/derp/probe" -o /dev/null -w "%{http_code}\n"
+curl -sk "https://derp-lon1.quickztna.com/derp/probe" -o /dev/null -w "%{http_code}\n"
+curl -sk "https://derp-sfo3.quickztna.com/derp/probe" -o /dev/null -w "%{http_code}\n"
+```
+
+**Expected:** Each probe returns HTTP 200 (DERP health check endpoint).
+
+**Pass:** `ztna status` reports a connected state. `ztna netcheck` shows latency to all four DERP regions. DERP probe endpoints respond with 200.
+
+---
+
+## ST4 -- DERP Relay Used as Fallback When Direct P2P Fails
+
+**What it verifies:** When direct P2P connectivity is unavailable between two machines, traffic automatically falls back to the DERP relay. The relay node becomes an active topology hub.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, check the current connection path to Win-B:
+```bash
+ztna ping WIN_B_TAILNET_IP
+```
+
+2. Note whether the output indicates `direct` or `relay` for the path.
+
+3. On <MachineRef name="Win-B" /> (if accessible), simulate a NAT scenario by blocking direct UDP traffic on port 41641 (the WireGuard listen port):
+
+   **Windows (PowerShell, run as Administrator):**
+   ```powershell
+   New-NetFirewallRule -DisplayName "Block-WG-Test" -Direction Inbound -Protocol UDP -LocalPort 41641 -Action Block
+   ```
+
+4. Wait 30-60 seconds for the state machine to detect the lost direct path and fall back to relay.
+
+5. On <MachineRef name="Win-A" />, ping Win-B again:
+```bash
+ztna ping WIN_B_TAILNET_IP
+```
+
+**Expected:** Ping still succeeds, but latency is higher (relay adds round-trip overhead). The output may indicate the relay region being used.
+
+6. Cleanup -- remove the test firewall rule on Win-B:
+```powershell
+Remove-NetFirewallRule -DisplayName "Block-WG-Test"
+```
+
+7. Wait for the state machine to re-establish the direct path (the `RETRY_DIRECT` state runs periodically).
+
+**Pass:** Connectivity is maintained through DERP relay even when direct P2P is blocked. Latency increases when relaying. Direct path is re-established after the firewall rule is removed.
+
+**Fail / Common issues:**
+- Ping fails entirely even with relay -- check that the DERP relay servers are reachable from the test environment (some corporate firewalls block outbound WebSocket connections on port 443).
+- Latency does not increase -- the direct path may not have been blocked successfully. Verify the firewall rule is active on Win-B.
+
+---
+
+## ST5 -- DERP Region Toggle via Settings UI
+
+**What it verifies:** Custom DERP regions can be enabled and disabled via the toggle switch in the DERPRegionsCard. A disabled region will not be used by clients.
+
+**Steps:**
+1. Add a custom region via the Settings page if none exists (follow ST2 steps 4-5 to add a test region).
+
+2. In the DERPRegionsCard, locate the toggle switch next to the custom region entry.
+
+3. Toggle the region OFF (switch from enabled to disabled).
+
+**Expected:** An API call is made to `PATCH /api/db/derp_regions` updating `enabled = false`. No toast notification is shown (the `toggleRegion` function in `DERPRegionsCard.tsx` does not call toast on toggle). The badge or label "Disabled" appears next to the region code badge.
+
+4. Verify via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/derp_regions?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** The custom region row has `"enabled": false`.
+
+5. Toggle the region back ON.
+
+**Expected:** `"enabled": true` confirmed via API. "Disabled" badge disappears from the UI.
+
+6. Cleanup -- delete the custom region.
+
+**Pass:** Toggle correctly updates the `enabled` field in the database. Disabled badge appears/disappears correctly. Custom region can be deleted.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | DERP map endpoint returns all 4 relay regions | All 4 regions returned with correct hostnames, IPs, and ports |
+| ST2 | Custom DERP regions visible in Settings UI | DERPRegionsCard adds and deletes custom regions; persisted in database |
+| ST3 | CLI reports active relay node | `ztna status` shows connected; `ztna netcheck` probes all 4 regions |
+| ST4 | DERP fallback when direct P2P blocked | Connectivity maintained via relay; latency increases; path restored after unblock |
+| ST5 | DERP region enable/disable toggle | Toggle updates `enabled` field in database; UI badge reflects state |

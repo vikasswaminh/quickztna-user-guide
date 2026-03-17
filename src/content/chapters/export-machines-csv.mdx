@@ -1,0 +1,364 @@
+---
+title: "Export Machines CSV"
+topic: "Export & Data Management"
+order: 102
+machines: ["Win-A"]
+summary: "Verify that POST /api/export with action 'machines' and format 'csv' returns a well-formed CSV string with the correct header row, one row per machine, CSV-injection-safe values, and the count field matching the row count."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The `handleExportData` handler in `backend/src/handlers/export-data.ts` supports CSV output for the `machines` action. When the request body includes `"format": "csv"`, the response contains a `csv` string instead of a `machines` array.
+
+**CSV column order (exact):**
+
+```
+id,name,tailnet_ip,os,status,last_seen,has_key,tags
+```
+
+Note that `has_key` is a derived field: the handler outputs `"yes"` if `public_key` is non-null/non-empty, and `"no"` otherwise. The raw `public_key` value is never included in the CSV output.
+
+**CSV injection protection:** The handler runs every cell value through two functions:
+- `csvSafe` — prepends a single quote `'` if the value starts with `=`, `+`, `-`, `@`, tab, or carriage return.
+- `csvEscapeField` — wraps in double quotes and escapes internal double quotes if the value contains a comma, double quote, or newline.
+
+The `tags` column contains the raw JSON string from the database (e.g. `[]` or `["tag:servers"]`).
+
+**Route:**
+
+```
+POST /api/export
+```
+
+**Request body:**
+
+```json
+{ "action": "machines", "org_id": "YOUR_ORG_ID", "format": "csv" }
+```
+
+**Response envelope:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "csv": "id,name,...\nrow1\nrow2",
+    "count": 3
+  }
+}
+```
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — all API calls issued from here |
+
+```bash
+TOKEN="eyJhbGciOiJFUzI1NiIsInR..."
+ORG_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+---
+
+## ST1 — Retrieve CSV String and Verify Header Row
+
+**What it verifies:** The response contains a `csv` key (not a `machines` array), and the first line of the CSV matches the exact column specification.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\",\"format\":\"csv\"}" \
+  | python3 -m json.tool
+```
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "csv": "id,name,tailnet_ip,os,status,last_seen,has_key,tags\n...",
+    "count": 3
+  }
+}
+```
+
+Extract and inspect just the CSV header:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\",\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+csv = d['data']['csv']
+lines = csv.split('\n')
+print('Header:', lines[0])
+print('Row count (data):', len(lines) - 1)
+print('count field:', d['data']['count'])
+"
+```
+
+**Expected output:**
+
+```
+Header: id,name,tailnet_ip,os,status,last_seen,has_key,tags
+Row count (data): 3
+count field: 3
+```
+
+**Pass:** Header is exactly `id,name,tailnet_ip,os,status,last_seen,has_key,tags` (8 columns, no extra whitespace). The number of data lines equals `data.count`.
+
+**Fail / Common issues:**
+- Response contains `machines` array instead of `csv` string — the `format` field was not sent or was misspelled. Ensure the body is `"format": "csv"` (lowercase).
+- Header has 10 columns — you are using the JSON endpoint. Confirm `format` is in the request body.
+- `count: 0` — no machines are registered to this org. Register at least one machine first.
+
+---
+
+## ST2 — Verify Data Rows and Field Values
+
+**What it verifies:** Each data row contains the correct values for all 8 columns, including the derived `has_key` field.
+
+**Steps:**
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\",\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+csv_text = d['data']['csv']
+lines = csv_text.split('\n')
+header = lines[0].split(',')
+print('Columns:', header)
+print()
+for i, line in enumerate(lines[1:], 1):
+    print(f'Row {i}: {line}')
+"
+```
+
+**Expected output (example with one machine):**
+
+```
+Columns: ['id', 'name', 'tailnet_ip', 'os', 'status', 'last_seen', 'has_key', 'tags']
+
+Row 1: abc123,Win-A,100.64.0.1,windows,online,2026-03-17T10:00:00.000Z,yes,[]
+```
+
+Cross-check the values against the dashboard:
+
+1. Open `https://login.quickztna.com/machines` on <MachineRef name="Win-A" />.
+2. Confirm each machine's name, tailnet IP, OS, and status match the CSV row.
+3. For a machine with a registered WireGuard key, `has_key` must be `yes`.
+4. For a machine that was registered but has no key exchange yet, `has_key` must be `no`.
+
+**Pass:** Every data row has exactly 8 comma-separated fields. `has_key` is either `yes` or `no`. `tags` is a valid JSON array string (at minimum `[]`).
+
+**Fail / Common issues:**
+- Row has fewer than 8 fields — a field value contains an unescaped comma. The `csvEscapeField` function should have quoted it. If this occurs, check whether the machine name contains a comma.
+- `has_key` shows something other than `yes` or `no` — unexpected value in the `public_key` column. Report as a bug.
+
+---
+
+## ST3 — Save CSV to File and Open in Spreadsheet
+
+**What it verifies:** The CSV output is valid enough to save to disk and parse as a standard CSV file.
+
+**Steps:**
+
+1. Save the CSV to a file on <MachineRef name="Win-A" />:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\",\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+with open('machines_export.csv', 'w', newline='') as f:
+    f.write(d['data']['csv'])
+print('Saved', d['data']['count'], 'machines to machines_export.csv')
+"
+```
+
+**Expected output:**
+
+```
+Saved 3 machines to machines_export.csv
+```
+
+2. Verify the file contents:
+
+```bash
+cat machines_export.csv
+```
+
+**Expected:**
+
+```
+id,name,tailnet_ip,os,status,last_seen,has_key,tags
+abc123,Win-A,100.64.0.1,windows,online,2026-03-17T10:00:00.000Z,yes,[]
+def456,Linux-C,100.64.0.2,linux,online,2026-03-17T09:55:00.000Z,yes,[]
+```
+
+3. Parse with Python's `csv` module to confirm validity:
+
+```bash
+python3 -c "
+import csv
+with open('machines_export.csv') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        print(dict(row))
+"
+```
+
+**Expected:** Each row prints as a Python dict with all 8 keys populated. No `csv.Error` exceptions.
+
+**Pass:** File saves without error, Python's `csv.DictReader` parses every row cleanly, all 8 keys present.
+
+**Fail / Common issues:**
+- `csv.Error: line contains NUL` — unexpected binary data. Should not occur; report as a bug.
+- Fewer rows than `count` — line endings may be inconsistent. Try `split('\r\n')` instead of `split('\n')`.
+
+---
+
+## ST4 — CSV Injection Safety Check
+
+**What it verifies:** Machine names or tag values that start with `=`, `+`, `-`, or `@` are prefixed with a single quote in the CSV output to prevent formula injection in spreadsheet applications.
+
+**Steps:**
+
+1. Create a machine with a name that starts with `=` to test injection protection. Use the machine-admin API to rename an existing test machine on <MachineRef name="Win-A" />:
+
+```bash
+# First, get a machine ID
+MACHINE_ID=$(curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&select=id,name" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; rows=json.load(sys.stdin)['data']; print(rows[0]['id'])")
+
+# Rename to a formula-injection-style name
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"rename\",\"machine_id\":\"$MACHINE_ID\",\"name\":\"=SUM(A1:A10)\"}" \
+  | python3 -m json.tool
+```
+
+2. Export machines as CSV:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\",\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for line in d['data']['csv'].split('\n'):
+    if 'SUM' in line:
+        print('Found injection-test row:', line)
+"
+```
+
+**Expected output:**
+
+```
+Found injection-test row: abc123,'=SUM(A1:A10),100.64.0.1,windows,online,...,yes,[]
+```
+
+The name column value is `'=SUM(A1:A10)` — the leading single quote neutralises the formula in Excel, LibreOffice, and Google Sheets.
+
+3. Rename the machine back to its original name after testing:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"rename\",\"machine_id\":\"$MACHINE_ID\",\"name\":\"Win-A\"}" \
+  | python3 -m json.tool
+```
+
+**Pass:** The name starting with `=` is exported with a `'` prefix. The raw `=` is never the first character of that CSV field.
+
+**Fail / Common issues:**
+- The `'` prefix is missing — the `csvSafe` function was not called for that column. Report as a bug.
+- Rename returns `404` — the machine ID is wrong. Re-query the machine list.
+
+---
+
+## ST5 — Count Field Consistency Check
+
+**What it verifies:** The `count` field in the response always equals the number of newline-separated data rows in the `csv` string (excluding the header).
+
+**Steps:**
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\",\"format\":\"csv\"}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+csv_text = d['data']['csv']
+reported_count = d['data']['count']
+# Lines minus the header row
+actual_rows = len([l for l in csv_text.split('\n') if l.strip()]) - 1
+print('Reported count :', reported_count)
+print('Actual data rows:', actual_rows)
+print('Match:', reported_count == actual_rows)
+"
+```
+
+**Expected output:**
+
+```
+Reported count : 3
+Actual data rows: 3
+Match: True
+```
+
+Also verify against the CRUD endpoint:
+
+```bash
+CRUD_COUNT=$(curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&select=id" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; print(len(json.load(sys.stdin)['data']))")
+
+echo "CRUD machine count: $CRUD_COUNT"
+```
+
+Both counts must agree.
+
+**Pass:** `count` equals the number of non-empty data rows in the `csv` string. Both counts match the CRUD endpoint count.
+
+**Fail / Common issues:**
+- `Match: False` — a machine name or tag field contains a newline character, splitting one logical row into two physical lines. This would be a data integrity issue.
+- Export count differs from CRUD count — the export SELECT and the CRUD SELECT target different tables or apply different filters. Report as a bug.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Header row format | Exactly `id,name,tailnet_ip,os,status,last_seen,has_key,tags` |
+| ST2 | Data row field values | 8 fields per row, `has_key` is `yes`/`no`, tags is JSON array string |
+| ST3 | File save and parse | `csv.DictReader` parses all rows without error |
+| ST4 | CSV injection protection | Names starting with `=` are prefixed with `'` |
+| ST5 | Count field consistency | `count` equals number of data rows; matches CRUD endpoint |

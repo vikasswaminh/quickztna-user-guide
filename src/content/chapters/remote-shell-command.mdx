@@ -1,0 +1,291 @@
+---
+title: "Command Execution via Remote Shell"
+topic: "Remote Shell"
+order: 112
+machines: ["Win-A", "Linux-C"]
+summary: "Test interactive command execution through the WebSocket PTY proxy and script execution via the remote-shell handler, including execution lifecycle and output capture."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Command execution over remote shell uses two distinct paths:
+
+**Path 1 -- Interactive PTY (WebSocket)**
+
+The WebSocket handler `createRemoteShellWsHandler` in `backend/src/handlers/remote-shell-ws.ts` proxies browser keystrokes to the Go agent's HTTP PTY endpoint. The flow is:
+
+```
+Browser (xterm.js) <--WebSocket-- Backend (/api/remote-shell/ws) <--HTTP streaming-- Agent (tailnet_ip:2222/shell)
+```
+
+The backend opens a long-lived HTTP GET to `http://TAILNET_IP:2222/shell?token=SHELL_TOKEN`. The request body is kept open as a writable stream (agent stdin). The response body is a chunked stream (agent stdout/stderr). The session maximum is 4 hours (`timeout: 4 * 60 * 60 * 1000` ms in `remote-shell-ws.ts`).
+
+**Path 2 -- Scripted Execution (REST)**
+
+The `execute_script` action in `handleRemoteShell` (`remote-shell.ts`) records a `script_executions` row with `status = 'pending'`, returns a one-time token and connection details, then the Go agent picks up the script via the same agent endpoint. The execution status transitions are: `pending` → `running` → `completed` / `failed` / `timeout`. Output is capped at 100 KB by `update_execution`.
+
+Both paths require `remote_management` feature gate, org admin role, and the machine to be `online`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard browser, API caller |
+| <MachineRef name="Linux-C" /> | Target machine running the Go agent with PTY endpoint on port 2222 |
+
+Prerequisites:
+- <MachineRef name="Linux-C" /> is online with the QuickZTNA agent running (`ztna up`).
+- Org is on Workforce plan with `remote_management` enabled.
+- Caller is an org admin with a valid JWT.
+- A valid `shell_token` has been obtained via `create_session` (see chapter 111).
+
+---
+
+## ST1 -- Interactive PTY: Connect and Run a Command
+
+**What it verifies:** The WebSocket bridge successfully relays keystrokes to the agent PTY and streams output back to the browser terminal.
+
+**Steps:**
+1. In the dashboard on <MachineRef name="Win-A" />, navigate to Remote Management (`/remote-management`).
+2. Select <MachineRef name="Linux-C" /> from the machine dropdown.
+3. Click "Connect". The `RemoteTerminal` component calls `create_session` and then opens a WebSocket to `/api/remote-shell/ws`.
+4. Observe the terminal header: the status indicator should turn green and show "Connected".
+5. The terminal writes:
+```
+QuickZTNA Remote Shell
+Connecting to Linux-C...
+
+Session created (expires in 300s)
+
+Connected to Linux-C
+```
+6. Type a simple command:
+```
+uname -a
+```
+7. Press Enter. Observe output within 1-2 seconds, e.g.:
+```
+Linux linux-c 6.8.0-51-generic #52-Ubuntu SMP PREEMPT_DYNAMIC ...
+```
+8. Run a multi-line command:
+```
+for i in 1 2 3; do echo "line $i"; sleep 0.2; done
+```
+9. Confirm each line appears incrementally (streaming, not batched).
+
+**Pass:** Keystrokes are echoed back by the PTY. Command output appears within 2 seconds. Multi-line output arrives in order.
+
+**Fail / Common issues:**
+- Terminal header stays yellow ("Connecting...") -- the agent is not reachable at `tailnet_ip:2222`. Ensure the Go agent is running on Linux-C and the tailnet is up.
+- WebSocket closes immediately with code 4003 -- the feature gate or admin check failed. Confirm plan and role.
+- Output is garbled -- this is a terminal encoding issue; the PTY uses UTF-8 by default, which xterm.js handles correctly. If garbled, check that the agent's PTY is not outputting raw binary sequences.
+
+---
+
+## ST2 -- Interactive PTY: Special Keys and Control Sequences
+
+**What it verifies:** Control characters (Ctrl+C, Ctrl+L, arrow keys, Tab completion) are relayed correctly as binary frames through the WebSocket.
+
+**Steps:**
+1. With an active session on <MachineRef name="Linux-C" />, run a long-running command:
+```bash
+sleep 60
+```
+2. Press Ctrl+C. The `RemoteTerminal` component sends the byte `0x03` via `ws.send`. Verify the sleep process is killed and the prompt returns.
+3. Type `ls /et` and press Tab. Verify Tab completion expands to `ls /etc/`.
+4. Press the Up arrow key. Verify the previous command `sleep 60` appears (shell history recall).
+5. Press Ctrl+L. Verify the terminal clears the screen (sends `0x0c`).
+6. Start the `top` command:
+```bash
+top
+```
+7. Press `q` to quit. Verify top exits cleanly and the shell prompt returns.
+
+**Pass:** Ctrl+C terminates the foreground process. Tab completion and arrow keys work. Ctrl+L clears the screen. Interactive programs (top) render and respond to keypresses.
+
+**Fail / Common issues:**
+- Ctrl+C does not kill the process -- the `onData` handler sends the raw string `"\x03"`, but if the WebSocket message is not received by the agent as binary, the PTY may not interpret it as SIGINT. Verify the agent is running the latest binary (v3.2.8+).
+- Tab completion not working -- the shell on Linux-C may not have completion enabled. Run `bash --login` first.
+
+---
+
+## ST3 -- Script Execution via REST API
+
+**What it verifies:** The `execute_script` action creates a `script_executions` record, returns a token, and the execution history reflects the correct status lifecycle.
+
+**Steps:**
+1. First, add a test script. On <MachineRef name="Win-A" />:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "add_script",
+    "org_id": "YOUR_ORG_ID",
+    "name": "Disk Check",
+    "description": "Check disk usage",
+    "script_body": "df -h",
+    "os_target": "linux"
+  }'
+```
+**Expected:** HTTP 200, `data.id` contains the new script UUID.
+
+2. Execute the script against Linux-C:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "execute_script",
+    "org_id": "YOUR_ORG_ID",
+    "script_id": "SCRIPT_UUID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "execution_id": "UUID",
+    "script_name": "Disk Check",
+    "machine_name": "Linux-C",
+    "tailnet_ip": "100.64.x.x",
+    "port": 2222,
+    "token": "UUID-UUID"
+  },
+  "error": null
+}
+```
+
+3. Immediately query execution history to see the `pending` status:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "execution_history",
+    "org_id": "YOUR_ORG_ID",
+    "limit": 5
+  }'
+```
+**Expected:** The newest entry shows `status: "pending"` for the Disk Check script on Linux-C.
+
+4. Wait for the agent to execute the script (the frontend polls every 3 seconds). After the agent calls `update_execution` with `status: "completed"`, re-query history.
+**Expected:** `status: "completed"`, `exit_code: 0`, `output` contains `df -h` output.
+
+**Pass:** Execution record transitions `pending` → `running` → `completed`. Exit code is 0. Output contains filesystem data.
+
+**Fail / Common issues:**
+- Status stays `pending` indefinitely -- the Go agent is not polling for new scripts. Verify the agent version and that it has `remote_management` integration enabled.
+- `OS_MISMATCH` error -- the script `os_target` is `linux` but the machine's `os` field in the `machines` table shows `windows`. Run the script against the correct machine.
+
+---
+
+## ST4 -- Script Execution OS Mismatch Rejection
+
+**What it verifies:** The `execute_script` action rejects execution when the script's `os_target` does not match the machine's OS (and is not `all`).
+
+**Steps:**
+1. Create a Windows-only script:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "add_script",
+    "org_id": "YOUR_ORG_ID",
+    "name": "Windows Only",
+    "script_body": "Get-Process",
+    "os_target": "windows"
+  }'
+```
+
+2. Attempt to run it against <MachineRef name="Linux-C" /> (which has `os: "linux"`):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "execute_script",
+    "org_id": "YOUR_ORG_ID",
+    "script_id": "WINDOWS_SCRIPT_UUID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "OS_MISMATCH",
+    "message": "Script targets windows but machine runs linux"
+  }
+}
+```
+
+3. Verify that a script with `os_target: "all"` executes on Linux-C without an OS mismatch error.
+
+**Pass:** HTTP 400 with `OS_MISMATCH`. Scripts with `os_target: "all"` bypass the OS check and execute on any machine.
+
+**Fail / Common issues:**
+- No `OS_MISMATCH` error even with mismatched OS -- the `machines.os` field may be null or unset. The handler only performs the check when `machine.os` is present: `if (script.os_target !== 'all' && machine.os && machine.os !== script.os_target)`. A null `machine.os` skips the check by design.
+
+---
+
+## ST5 -- Script Body Size Limit Enforcement
+
+**What it verifies:** The `add_script` action rejects scripts exceeding 50 KB.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, generate a script body larger than 50,000 characters (50 KB):
+```powershell
+$bigBody = "echo hello`n" * 5001  # ~60,000 chars
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d (ConvertTo-Json @{
+    action = "add_script"
+    org_id = "YOUR_ORG_ID"
+    name = "Too Big"
+    script_body = $bigBody
+    os_target = "all"
+  })
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "Script body too large (max 50KB)"
+  }
+}
+```
+
+2. Confirm the limit is checked at `script_body.length > 50000` (character count, not byte count).
+3. Submit a script body of exactly 50,000 characters. This should succeed.
+
+**Pass:** Scripts over 50,000 characters return HTTP 400 with `INVALID_INPUT`. Scripts at or under the limit are accepted.
+
+**Fail / Common issues:**
+- Request times out before reaching the size check -- the backend applies a 1 MB body size limit by default. A 50 KB payload will not hit that limit. If requests fail with a 413, the Caddy body size limit or the server body limit is too restrictive.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | WebSocket PTY relays keystrokes and streams output; `create_session` token is used as `shell_token` |
+| ST2 | Control sequences (Ctrl+C, Tab, arrows) are forwarded as binary frames and processed correctly by the PTY |
+| ST3 | `execute_script` creates a `pending` execution record; agent transitions it to `completed` with output |
+| ST4 | OS mismatch between script `os_target` and machine `os` returns `OS_MISMATCH`; `os_target: "all"` bypasses the check |
+| ST5 | Scripts over 50,000 characters are rejected with `INVALID_INPUT`; the limit is enforced in `add_script` before any DB write |

@@ -1,0 +1,345 @@
+---
+title: "Export Org Data (JSON)"
+topic: "Export & Data Management"
+order: 101
+machines: ["Win-A"]
+summary: "Verify that the handleExportData handler at POST /api/export correctly exports machines and audit logs in JSON format, enforces admin-only access, requires valid org_id, and returns the correct response envelope."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+All export operations are handled by `handleExportData` in `backend/src/handlers/export-data.ts`, registered at:
+
+```
+POST /api/export
+```
+
+The handler accepts a JSON body with three required fields: `action`, `org_id`, and an optional `format`. When `format` is omitted (or anything other than `"csv"`), the response is JSON. Three actions exist:
+
+| Action | Requires admin | Returns |
+|--------|---------------|---------|
+| `machines` | Yes | `{ machines: [...], count: N }` |
+| `audit_logs` | Yes | `{ logs: [...], count: N }` |
+| `compliance_report` | Yes | Full compliance report object |
+
+The handler enforces two access checks in sequence: first `isOrgMember`, then `isOrgAdmin`. A plain org member (non-admin) receives `403 FORBIDDEN` even if they are authenticated.
+
+Audit logs are read from Loki via `queryAuditLogs` (not from PostgreSQL). The `days` parameter controls the lookback window; it defaults to 30 if omitted or non-numeric.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — all API calls issued from here |
+
+You will need:
+- A valid JWT token for an org **admin** account. Obtain it via `POST /api/auth/login`.
+- Your org ID (UUID). Find it in the dashboard URL or from `GET /api/user-orgs`.
+
+Store these in your shell session before running any sub-test:
+
+```bash
+TOKEN="eyJhbGciOiJFUzI1NiIsInR..."   # your JWT
+ORG_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+---
+
+## ST1 — Export Machines as JSON (Happy Path)
+
+**What it verifies:** The `machines` action returns all org machines with the correct fields in a JSON envelope when `format` is not `"csv"`.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -m json.tool
+```
+
+**Expected response structure:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "machines": [
+      {
+        "id": "...",
+        "name": "Win-A",
+        "tailnet_ip": "100.x.x.x",
+        "os": "windows",
+        "status": "online",
+        "last_seen": "2026-03-17T10:00:00.000Z",
+        "public_key": "...",
+        "tags": "[]",
+        "advertised_routes": null,
+        "created_at": "2026-03-10T09:00:00.000Z"
+      }
+    ],
+    "count": 3
+  }
+}
+```
+
+The handler selects exactly these columns from the `machines` table:
+`id, name, tailnet_ip, os, status, last_seen, public_key, tags, advertised_routes, created_at`
+
+Results are ordered by `name ASC`.
+
+**Pass:** `success: true`, `data.machines` is an array, `data.count` matches the array length. Each machine object contains all ten fields listed above.
+
+**Fail / Common issues:**
+- `401 UNAUTHORIZED` — token is missing, expired, or malformed.
+- `400 MISSING_FIELDS` — `action` or `org_id` is absent from the body.
+- `403 FORBIDDEN` with message "Not a member" — the user account does not belong to this org.
+- `403 FORBIDDEN` with message "Admin required" — user is an org member but not an admin.
+
+---
+
+## ST2 — Export Audit Logs as JSON (Happy Path)
+
+**What it verifies:** The `audit_logs` action queries Loki and returns log entries in JSON format with the correct envelope.
+
+**Steps:**
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"audit_logs\",\"org_id\":\"$ORG_ID\",\"days\":7}" \
+  | python3 -m json.tool
+```
+
+**Expected response structure:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "logs": [
+      {
+        "id": "...",
+        "action": "machine.registered",
+        "resource_type": "machine",
+        "resource_id": "...",
+        "user_id": "...",
+        "created_at": "2026-03-16T14:22:01.000Z",
+        "details": "{...}"
+      }
+    ],
+    "count": 42
+  }
+}
+```
+
+The `days` field is parsed with `parseInt`; if omitted or non-numeric it defaults to 30. The Loki query uses `date_from` set to `now - days * 86400000ms` and a hard limit of 10,000 entries.
+
+**Pass:** `success: true`, `data.logs` is an array, `data.count` reflects the number of entries. Each log entry contains `id`, `action`, `resource_type`, `resource_id`, `user_id`, `created_at`, and `details`.
+
+**Fail / Common issues:**
+- Empty `logs` array with `count: 0` — no audit events in the past 7 days for this org. Try `"days": 90` to widen the window.
+- Loki connectivity error surfaces as a 500 — check that the Loki service is reachable from the API container.
+
+---
+
+## ST3 — Export Compliance Report (JSON)
+
+**What it verifies:** The `compliance_report` action aggregates data from eight database tables plus Loki and returns a structured report.
+
+**Steps:**
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"compliance_report\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -m json.tool
+```
+
+**Expected top-level response keys:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "generated_at": "2026-03-17T10:00:00.000Z",
+    "org_id": "...",
+    "report_type": "compliance",
+    "summary": {
+      "machines": { "total": 3, "online": 2, "quarantined": 0 },
+      "posture": { "total": 2, "compliant": 2, "compliance_rate": 100 },
+      "acl_rules": 5,
+      "abac_policies": 1,
+      "certificates": { "total": 4, "active": 3 },
+      "threats": { "total": 10, "blocked": 2 },
+      "ip_allowlist_entries": 3,
+      "quarantine_events_30d": 0
+    },
+    "posture_policy": { ... },
+    "non_compliant_machines": [],
+    "recent_quarantine_events": []
+  }
+}
+```
+
+The `compliance_rate` is computed as `Math.round((compliant / total) * 100)`. If no posture reports exist, it returns `100`. The `posture_policy` key is `null` if no enabled posture policy exists.
+
+**Pass:** `success: true`, all seven `summary` keys are present, `report_type` is `"compliance"`, `generated_at` is an ISO 8601 timestamp.
+
+**Fail / Common issues:**
+- Any summary field showing `0` when you expect a non-zero value — verify there is actual data in the corresponding table for this org.
+- `posture_policy: null` — no posture policy has been created or enabled yet for this org.
+
+---
+
+## ST4 — Reject Non-Admin Access
+
+**What it verifies:** A non-admin org member cannot access any export action — the handler returns `403 FORBIDDEN` with `"Admin required"`.
+
+**Steps:**
+
+1. Log in as a non-admin member of the org:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"member@example.com","password":"MemberPass123"}' \
+  | python3 -m json.tool
+```
+
+Save the returned token:
+
+```bash
+MEMBER_TOKEN="eyJ..."
+```
+
+2. Attempt to export machines:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"machines\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -m json.tool
+```
+
+**Expected response:**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin required"
+  }
+}
+```
+
+HTTP status will be `403`.
+
+3. Repeat for `audit_logs` and `compliance_report` actions — both must return the same `403 FORBIDDEN`.
+
+**Pass:** All three export actions return `403` with `code: "FORBIDDEN"` and `message: "Admin required"` when called with a non-admin token.
+
+**Fail / Common issues:**
+- The member token returns `403` with "Not a member" instead — the account used is not a member of this org at all. Use an account that is a member but not an admin.
+- The export succeeds (200) — the account was promoted to admin. Verify the user's role in `org_members`.
+
+---
+
+## ST5 — Reject Missing Fields and Invalid JSON
+
+**What it verifies:** The handler validates the request body and returns appropriate 400 errors for malformed or incomplete requests.
+
+**Steps:**
+
+1. Send a request with no body (invalid JSON):
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "not-json" \
+  | python3 -m json.tool
+```
+
+**Expected:**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_JSON",
+    "message": "Request body must be valid JSON"
+  }
+}
+```
+
+2. Send valid JSON but omit `action`:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\"}" \
+  | python3 -m json.tool
+```
+
+**Expected:**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "MISSING_FIELDS",
+    "message": "action and org_id required"
+  }
+}
+```
+
+3. Send a valid body with an unknown `action`:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"nonexistent\",\"org_id\":\"$ORG_ID\"}" \
+  | python3 -m json.tool
+```
+
+**Expected:**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNKNOWN_ACTION",
+    "message": "Unknown action: nonexistent"
+  }
+}
+```
+
+**Pass:** All three malformed requests are rejected with the correct error code and HTTP 400. No 500 errors.
+
+**Fail / Common issues:**
+- 500 returned instead of 400 — the body parser or JSON.parse threw an unhandled exception. Check API container logs.
+- `MISSING_FIELDS` fires even when fields are present — ensure `Content-Type: application/json` is set; without it the body may not parse correctly.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Machines JSON export | `success: true`, array with 10 fields per machine, ordered by name |
+| ST2 | Audit log JSON export | `success: true`, Loki logs returned, `days` param respected |
+| ST3 | Compliance report | All seven summary keys present, `report_type: "compliance"` |
+| ST4 | Non-admin blocked | `403 FORBIDDEN "Admin required"` for all three actions |
+| ST5 | Input validation | `INVALID_JSON`, `MISSING_FIELDS`, and `UNKNOWN_ACTION` each return 400 |

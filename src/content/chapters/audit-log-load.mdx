@@ -1,0 +1,271 @@
+---
+title: "Audit Log Load & Basic Filtering"
+topic: "Audit Log"
+order: 71
+machines: ["Win-A"]
+summary: "Load the Audit Log page, confirm Loki-backed entries appear, verify the table columns, and exercise the search bar."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA stores every control-plane action in Grafana Loki — not PostgreSQL. There is no `audit_logs` table in the database. All writes go through `services/loki.ts → logAudit()`, which pushes a JSON line to the Loki push endpoint (`/loki/api/v1/push`) with stream labels `job="audit"`, `org_id`, `action_prefix`, and `resource_type`.
+
+The Audit Log page (`/audit-log`, `AuditLogPage.tsx`) reads data by calling `POST /api/governance` with `action: "search_audit_logs"`. The `handleGovernance` handler (in `handlers/governance.ts`) maps that to `queryAuditLogs()` in `services/loki.ts`, which issues a LogQL `query_range` request against Loki with the `direction=backward` parameter so results arrive newest-first.
+
+The full query/response path is:
+
+```
+AuditLogPage → POST /api/governance { action: "search_audit_logs", org_id, page, page_size: 50 }
+  → handlers/governance.ts (case 'search_audit_logs')
+    → services/loki.ts queryAuditLogs()
+      → GET /loki/api/v1/query_range?query={job="audit",org_id="..."}&direction=backward
+```
+
+The response envelope carries:
+
+```json
+{
+  "success": true,
+  "data": {
+    "logs": [ ... ],
+    "total": 42,
+    "page": 0,
+    "page_size": 50,
+    "total_pages": 1,
+    "filters": {
+      "resource_types": ["machine", "user", "auth_key"],
+      "action_categories": ["auth", "machine", "acl_rules"]
+    }
+  }
+}
+```
+
+Each log entry has the fields: `id` (Loki nanosecond timestamp used as a pseudo-ID), `action`, `resource_type`, `resource_id`, `details`, `user_id`, and `created_at`.
+
+The page auto-refreshes every 30 seconds because Loki does not support realtime subscriptions.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser (dashboard) + PowerShell API calls |
+
+**Prerequisites:**
+- Authenticated to the dashboard as an org member
+- At least a few audit events exist (any prior login, machine registration, or ACL change generates one)
+
+---
+
+## ST1 -- Page Loads Without Error
+
+**What it verifies:** The Audit Log page renders, the `search_audit_logs` API call succeeds, and at least one row appears in the table.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open a browser and navigate to `https://login.quickztna.com/audit-log`.
+
+2. Wait up to five seconds for the loading spinner to clear.
+
+3. Confirm the page heading reads "Audit Log" and the sub-heading includes a parenthesised event count, for example "(14 events)".
+
+4. Confirm the table has four columns: Action, Resource, Details, Time.
+
+5. Confirm at least one row is visible with a coloured badge in the Action column.
+
+**Expected output:**
+
+The table shows rows. The Action column contains monospace badge text such as `auth.login`, `machine.self_service_setup`, or `acl_rules.created`. The Time column shows a localised date/time string. The Details column shows either a JSON snippet or a dash.
+
+**Pass:** Page renders without a blank screen or error toast, at least one log row is present.
+
+**Fail / Common issues:**
+- Blank table with "No audit events recorded yet" -- no events have been generated yet. Log out and log back in, then reload the page. The `auth.login` event will be the first entry.
+- "Audit log service temporarily unavailable" -- Loki is not reachable from the API container. This is a server-side issue; check Loki health at `http://188.166.155.128:3000` (Grafana).
+
+---
+
+## ST2 -- Verify the API Response Shape
+
+**What it verifies:** The `POST /api/governance` endpoint with `action: "search_audit_logs"` returns the correct envelope with `logs`, `total`, `page_size`, and `filters`.
+
+**Steps:**
+
+1. From <MachineRef name="Win-A" />, open PowerShell. Set your JWT and org ID:
+
+```powershell
+$TOKEN  = "eyJ..."    # paste your JWT from browser DevTools → Application → Local Storage
+$ORG_ID = "..."       # paste your org UUID
+```
+
+2. Call the governance endpoint:
+
+```powershell
+$body = @{
+    action    = "search_audit_logs"
+    org_id    = $ORG_ID
+    page      = 0
+    page_size = 10
+} | ConvertTo-Json
+
+$resp = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/governance" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$resp | ConvertTo-Json -Depth 5
+```
+
+**Expected response (truncated):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "logs": [
+      {
+        "id": "1742000000000000000",
+        "action": "auth.login",
+        "resource_type": "user",
+        "resource_id": "abc123",
+        "details": { "email": "you@example.com", "mfa": false },
+        "user_id": "abc123",
+        "created_at": "2026-03-17T09:00:00.000Z"
+      }
+    ],
+    "total": 14,
+    "page": 0,
+    "page_size": 10,
+    "total_pages": 2,
+    "filters": {
+      "resource_types": ["user", "machine"],
+      "action_categories": ["auth", "machine"]
+    }
+  },
+  "error": null
+}
+```
+
+3. Confirm `$resp.success` is `$true`.
+4. Confirm `$resp.data.logs` is an array.
+5. Confirm `$resp.data.filters.resource_types` is a non-empty array.
+
+**Pass:** `success: true`, `logs` is a non-empty array, `filters.resource_types` is populated.
+
+**Fail / Common issues:**
+- `401 UNAUTHORIZED` -- the JWT is expired or pasted incorrectly.
+- `403 FORBIDDEN` -- the `org_id` does not match the user's membership.
+- `logs: []` with `total: 0` -- no events exist yet for this org. Generate one by visiting any page that triggers an action (e.g., rename a machine).
+
+---
+
+## ST3 -- Search Bar Filters Results
+
+**What it verifies:** Typing a search term and pressing Enter (or clicking Search) sends the `search` field in the request body, which `buildLogQL()` translates into a Loki `|= "term"` pipeline filter.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, return to the `/audit-log` page.
+
+2. In the search box (placeholder: "Search actions, resources, details..."), type `auth.login`.
+
+3. Press Enter or click the Search button.
+
+4. Observe the table updates. All visible rows should have `auth.login` (or a substring match) in the Action badge or Details column.
+
+5. Clear the search by clicking the X button inside the search field. The table should reload all events.
+
+**Expected output:**
+
+After searching for `auth.login`: the table shows only rows where the action is `auth.login`. The event count in the page heading decreases (or reads "No events match your filters" if no login events exist yet).
+
+After clearing: all events return.
+
+**Pass:** Rows narrow to those containing the search term; clearing restores all rows.
+
+**Fail / Common issues:**
+- Table does not change after pressing Enter -- make sure to press Enter or click the Search button, not just type. The component only triggers `fetchLogs` when `handleSearch()` is called.
+- "No events match your filters" for a term that should exist -- Loki full-text search (`|= "term"`) is case-sensitive. Try `auth` instead of `Auth`.
+
+---
+
+## ST4 -- Pagination Works Correctly
+
+**What it verifies:** When total events exceed 50 (one page), the Previous/Next buttons advance through pages and the "Showing X-Y of Z events" counter updates correctly.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, generate more than 50 audit events if needed. The easiest method is to call the write endpoint in a loop:
+
+```powershell
+1..55 | ForEach-Object {
+    $b = @{ org_id = $ORG_ID; action = "test.ping"; resource_type = "test" } | ConvertTo-Json
+    Invoke-RestMethod -Uri "https://login.quickztna.com/api/audit" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+        -Body $b | Out-Null
+}
+```
+
+2. Reload `/audit-log`. Confirm the heading shows more than 50 events.
+
+3. Scroll to the bottom and click Next. Confirm the counter changes from "Showing 1-50 of N events" to "Showing 51-100 of N events" (or fewer if N is between 51 and 100).
+
+4. Click Previous. Confirm the counter returns to "Showing 1-50 of N events".
+
+5. While on page 2, confirm the Previous button is enabled and the page number increments as expected.
+
+**Pass:** Next/Previous navigate correctly; the counter reflects the current page window.
+
+**Fail / Common issues:**
+- Next button disabled despite total > 50 -- `total_pages` returned from the API may equal 1 if Loki's offset pagination collapsed entries. Check `$resp.data.total_pages` in ST2.
+- Counter shows "Page 1" instead of "Showing 1-50 of N events" -- this happens when `total` is 0. The API returned an empty result despite events existing. Check Loki connectivity.
+
+---
+
+## ST5 -- 30-Second Auto-Refresh
+
+**What it verifies:** The page automatically calls `fetchLogs` every 30 seconds (via `setInterval`) so new events appear without a manual reload.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open the `/audit-log` page and note the current event count in the heading.
+
+2. Open a second PowerShell window. Write a new audit event:
+
+```powershell
+$b = @{
+    org_id        = $ORG_ID
+    action        = "test.auto_refresh_check"
+    resource_type = "test"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/audit" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $b
+```
+
+3. Do NOT manually reload the browser. Wait up to 35 seconds.
+
+4. Observe the event count in the page heading. It should increment by at least 1, and the new `test.auto_refresh_check` row should appear at the top of the table.
+
+**Pass:** The new event appears within 35 seconds without a manual reload.
+
+**Fail / Common issues:**
+- Event does not appear within 35 seconds -- check whether the browser tab is in the background (some browsers throttle timers for inactive tabs). Bring the tab to the foreground and wait another 35 seconds.
+- Count increments but the new row is not visible -- the auto-refresh fetches page 0 (newest first), so if you had navigated to page 2 the new event would appear on page 0. Navigate back to page 0.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | Page loads and Loki data renders | Table shows rows; heading includes event count |
+| ST2 | API response shape is correct | `success: true`, `logs` array, `filters` populated |
+| ST3 | Search bar sends Loki pipeline filter | Rows narrow to matching entries; clearing restores all |
+| ST4 | Pagination navigates pages correctly | Counter updates; Previous/Next work |
+| ST5 | Auto-refresh fires every 30 seconds | New event appears without a manual reload |

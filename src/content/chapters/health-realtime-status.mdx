@@ -1,0 +1,267 @@
+---
+title: "Real-time Status Updates (WebSocket)"
+topic: "Health & Monitoring"
+order: 83
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that the Health page updates machine status in real-time via WebSocket — channel subscription, UPDATE/DELETE event delivery, fallback polling, and heartbeat timeout eviction."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Health page subscribes to real-time machine updates using the `api.channel()` API from `src/lib/api/client.ts`. The subscription is set up in `HealthPage.tsx`:
+
+```js
+const channel = api
+  .channel("health-machines-rt")
+  .on("postgres_changes", { event: "*", schema: "public", table: "machines",
+      filter: `org_id=eq.${currentOrg.id}` }, () => fetch())
+  .subscribe();
+```
+
+When a WebSocket event arrives on the `machines` channel, the callback re-runs the full machine list fetch from `GET /api/db/machines`. The page does not attempt to apply incremental patches — it always re-fetches everything.
+
+The WebSocket connection is established by `RealtimeChannel.subscribe()` in the client:
+
+1. Opens `wss://login.quickztna.com/api/realtime?org_id=<org_id>&token=<jwt>`
+2. Sends `{ "type": "subscribe", "channels": ["machines"] }` on open
+3. Server (`ws-manager.ts`) sends `{ "type": "subscribed", "channels": ["machines"] }` in response
+4. Events arrive as `{ "type": "event", "channel": "machines", "event": "UPDATE"|"DELETE", "payload": {...} }`
+
+On the server side, events are published to the WebSocket channel by two handlers:
+
+- `machine-heartbeat.ts` calls `broadcastEvent(env, org_id, "machines", "UPDATE", {id, status, last_seen})` — but **only when `status` changes**, not on every heartbeat
+- `cleanup-machines.ts` calls `broadcastEvent(env, org_id, "machines", "UPDATE", {id, status: "offline"})` for each machine it marks offline, and `broadcastEvent(env, org_id, "machines", "DELETE", {id})` for deleted ephemeral machines
+
+The Valkey pub/sub layer (`ws:org:<org_id>` channel) ensures cross-server delivery between the production and standby nodes.
+
+**WebSocket fallback:** If the WebSocket connection fails (network error or `onerror` event), the client falls back to 30-second interval polling, calling all registered callbacks on each tick.
+
+**Heartbeat timeout:** The server-side `ws-manager.ts` evicts clients that have not sent a `ping` message within 90 seconds (`HEARTBEAT_TIMEOUT = 90_000`). The server checks every 30 seconds (`HEARTBEAT_INTERVAL = 30_000`). Clients that are evicted receive close code 4000.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — Health page open, observing real-time updates |
+| <MachineRef name="Linux-C" /> | VPN source — start/stop to trigger status events |
+
+---
+
+## ST1 — WebSocket Connects and Subscribes to Machines Channel
+
+**What it verifies:** Opening the Health page establishes a WebSocket connection and successfully subscribes to the `machines` channel.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open browser DevTools (F12) and go to the **Network** tab. Filter by `WS` (WebSocket).
+
+2. Navigate to `/health` (or reload if already there).
+
+3. In DevTools, find the WebSocket connection to `wss://login.quickztna.com/api/realtime`.
+
+4. Click the connection entry and go to the **Messages** tab.
+
+5. You should see the outgoing subscribe message sent immediately after the connection opens:
+```json
+{"type":"subscribe","channels":["machines"]}
+```
+
+6. You should receive the server's confirmation:
+```json
+{"type":"subscribed","channels":["machines"]}
+```
+
+7. You should also have received a `connected` welcome message shortly before the subscribe:
+```json
+{
+  "type": "connected",
+  "clientId": "uuid",
+  "availableChannels": ["machines","members","audit","keys","general","posture","threats","certificates","dns","acl","billing","remote_desktop"]
+}
+```
+
+**Pass:** WebSocket connects, subscribe message is sent, `subscribed` confirmation is received.
+
+**Fail / Common issues:**
+- No WebSocket connection visible — the channel name `health-machines-rt` is used as an internal key only; the actual WS URL is constructed from `currentOrg.id`. If `currentOrg` is not set, the channel falls back to 30-second polling (no WS connection is made). Verify org context is active.
+- `401` response on upgrade — the JWT token may be expired. Log out and back in to refresh the session.
+- Connection immediately closes — check that the `org_id` belongs to an org the user is a member of. The server's `isOrgMember()` check will close the connection if not.
+
+---
+
+## ST2 — Machine Goes Online: UPDATE Event Triggers Re-fetch
+
+**What it verifies:** When a machine starts up and sends its first heartbeat (causing a status change from `offline` to `online`), the server broadcasts an `UPDATE` event and the Health page re-fetches and updates.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open the Health page. Keep DevTools open on the WebSocket Messages tab.
+
+2. Ensure <MachineRef name="Linux-C" /> is currently offline:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. On <MachineRef name="Linux-C" />, start the VPN:
+```bash
+ztna up
+```
+
+4. Within 5-10 seconds, watch the Health page on <MachineRef name="Win-A" />. The Linux-C row should update from grey (offline) to green (online) **without a manual page refresh**.
+
+5. In DevTools WebSocket Messages, confirm you received an event similar to:
+```json
+{
+  "type": "event",
+  "channel": "machines",
+  "event": "UPDATE",
+  "payload": {
+    "id": "machine-uuid",
+    "status": "online",
+    "last_seen": "2026-03-17T10:30:45.123Z"
+  },
+  "timestamp": "2026-03-17T10:30:45.200Z"
+}
+```
+
+**Note:** This event is only broadcast when `status` changes. Routine heartbeats from an already-online machine do not produce a WebSocket event.
+
+**Pass:** Status change from `offline` to `online` triggers a WebSocket `UPDATE` event. Health page updates within seconds without a manual refresh.
+
+**Fail / Common issues:**
+- Page does not update automatically — WebSocket may have disconnected. Check DevTools for the WS connection state. If disconnected, the page falls back to 30-second polling; the update will appear after the next poll cycle.
+- Event is received but page still shows old data — the re-fetch callback may have hit a transient network error. Check the Network tab for a failed `/api/db/machines` request after the WS event.
+
+---
+
+## ST3 — Machine Goes Offline: UPDATE Event from Cleanup Job
+
+**What it verifies:** When the cleanup cron job marks a machine offline (after 3 minutes of missed heartbeats), it broadcasts an `UPDATE` event that triggers a Health page re-fetch.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, Health page open, DevTools WebSocket Messages visible.
+
+2. On <MachineRef name="Linux-C" />, kill the VPN process without graceful shutdown:
+```bash
+sudo pkill -9 ztna
+```
+
+3. Wait up to 3 minutes. The cleanup job (`cleanup-machines.ts`) runs periodically and executes:
+```sql
+UPDATE machines SET status = 'offline'
+WHERE status = 'online' AND last_seen < NOW() - INTERVAL '3 minutes'
+```
+
+After the job runs, it calls `broadcastEvent(env, org_id, "machines", "UPDATE", {id, status: "offline"})` for each machine it marks offline.
+
+4. Watch the Health page on <MachineRef name="Win-A" />. The Linux-C row should transition to grey/offline automatically.
+
+5. In DevTools, confirm the `UPDATE` event:
+```json
+{
+  "type": "event",
+  "channel": "machines",
+  "event": "UPDATE",
+  "payload": {
+    "id": "machine-uuid",
+    "status": "offline"
+  }
+}
+```
+
+**Pass:** After ~3 minutes of missed heartbeats, cleanup job broadcasts `UPDATE` event, Health page shows offline status automatically.
+
+**Fail / Common issues:**
+- Page takes longer than 3 minutes to update — the cleanup cron job's run frequency determines the lag. The job is scheduled in `backend/src/cron.ts`; check its interval if updates are delayed.
+- The graceful `ztna down` command sends an offline heartbeat synchronously, so status changes immediately (via `broadcastEvent` in `machine-heartbeat.ts`). The 3-minute delay only applies to hard kills.
+
+---
+
+## ST4 — WebSocket Fallback to 30-Second Polling
+
+**What it verifies:** If the WebSocket connection is unavailable, the client falls back to periodic polling and the Health page still reflects machine changes (with up to 30-second delay).
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open DevTools. Go to the **Network** tab, select **Throttling**, and choose **Offline** to simulate a network interruption — or use the Application tab to block the WebSocket URL.
+
+   Alternatively, use browser DevTools to simulate a WebSocket failure:
+   - Open the Console tab
+   - The `RealtimeChannel` class handles `onerror` and `onclose` by starting a 30-second polling interval
+
+2. Wait for the WebSocket close event. After that the client starts polling every 30 seconds (the `_startPolling()` method fires all callbacks on each tick).
+
+3. Restore normal network. On <MachineRef name="Linux-C" />, toggle the VPN:
+```bash
+ztna down
+sleep 5
+ztna up
+```
+
+4. On <MachineRef name="Win-A" />, observe the Health page. Without WebSocket, the status change will appear within 30 seconds (next poll cycle), not immediately.
+
+5. After the network is restored, the client will attempt WebSocket reconnection after 5 seconds (`_reconnectTimer = setTimeout(..., 5000)`).
+
+**Expected:** Status changes are reflected within 30 seconds when operating in polling fallback mode.
+
+**Pass:** Page updates machine status during polling fallback mode, within one 30-second poll interval.
+
+**Fail / Common issues:**
+- Page never updates without WebSocket — verify the polling timer is active. If the channel was disposed (`removeChannel` called) before the WebSocket error, polling will not start.
+- Reconnection does not occur — the 5-second reconnect timer requires the browser to remain on the `/health` page. Navigation away disposes the channel.
+
+---
+
+## ST5 — Server-Side WebSocket Heartbeat and Eviction
+
+**What it verifies:** The server evicts WebSocket clients that have not sent a `ping` within 90 seconds, closing the connection with code 4000.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open the Health page with DevTools WebSocket Messages visible.
+
+2. The browser client in `RealtimeChannel` does not automatically send `ping` frames — it only sends `subscribe`/`unsubscribe`/`broadcast` messages. The server's 90-second timeout (`HEARTBEAT_TIMEOUT = 90_000`) measures the time since `lastPing` was set, which initialises to `Date.now()` at connection open.
+
+   This means if the client never sends a `ping`, it will be evicted after 90 seconds.
+
+3. To manually test the ping/pong exchange, use the browser console to send a ping to the active WebSocket:
+```js
+// Find the active WebSocket — this is internal to the client module
+// but you can observe it via DevTools
+// In DevTools Network → WS → Messages, manually type a message
+// (some browsers support this in the "Send" box)
+{"type":"ping"}
+```
+
+4. The server should respond with:
+```json
+{"type":"pong","timestamp":"2026-03-17T10:31:00.000Z"}
+```
+
+5. To observe the eviction: open the Health page, wait 91 seconds without any user interaction, and watch DevTools for a WebSocket close event with code 4000 and reason `Heartbeat timeout`.
+
+6. After eviction, the client's `onclose` handler fires and schedules a reconnection after 5 seconds.
+
+**Expected:** Server sends `pong` in response to `ping`. Clients that go silent for 90 seconds receive close code 4000. The client reconnects automatically within 5 seconds.
+
+**Pass:** `ping` receives `pong`. After 90 seconds of silence, connection closes with code 4000. Reconnection happens within 5 seconds.
+
+**Fail / Common issues:**
+- No eviction observed after 90 seconds — the server heartbeat check runs every 30 seconds (`HEARTBEAT_INTERVAL = 30_000`), so eviction can take up to 30 seconds beyond the 90-second timeout threshold (i.e., up to 120 seconds total).
+- Close code is not 4000 — normal TCP-level disconnections use code 1001 or 1006. Code 4000 specifically means the server's heartbeat check evicted the client.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | WebSocket connects and subscribes | `connected` welcome + `subscribed` confirmation received in DevTools |
+| ST2 | Online transition triggers UPDATE event | `ztna up` → WebSocket UPDATE event → page updates without refresh |
+| ST3 | Offline detection via cleanup job | Hard kill → 3-min cleanup job → UPDATE event → page shows offline |
+| ST4 | Polling fallback | WebSocket failure → 30-sec poll interval → updates within 30 sec |
+| ST5 | Server-side heartbeat eviction | Idle client evicted after 90 sec with close code 4000; reconnects in 5 sec |

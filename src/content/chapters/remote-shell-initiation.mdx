@@ -1,0 +1,276 @@
+---
+title: "Remote Shell Session Initiation"
+topic: "Remote Shell"
+order: 111
+machines: ["Win-A", "Linux-C"]
+summary: "Test that the remote shell session creation API correctly issues a one-time token, validates machine status, and enforces the remote_management feature gate."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Remote shell session initiation is handled by `handleRemoteShell` in `backend/src/handlers/remote-shell.ts`, specifically the `create_session` action. The endpoint is:
+
+```
+POST https://login.quickztna.com/api/remote-shell
+```
+
+When `action` is `create_session`, the handler:
+1. Verifies the caller's JWT via `getAuthedUser`
+2. Checks the `remote_management` feature gate via `requireFeature` (Workforce plan or higher required)
+3. Confirms the caller is an org admin via `isOrgAdmin`
+4. Looks up the target machine in the `machines` table, asserting `org_id` matches and `status = 'online'`
+5. Generates a one-time session token (two UUIDs joined by a hyphen)
+6. Writes an audit log entry `remote.session_created` to Loki
+7. Returns the token along with `tailnet_ip`, `port: 2222`, `machine_name`, and `expires_in: 300`
+
+The returned token is then passed as `shell_token` when opening the WebSocket at `GET /api/remote-shell/ws`. Without a successful `create_session` call there is no valid `shell_token` and the WebSocket handshake is rejected.
+
+The frontend flow lives in `RemoteTerminal.tsx` (`src/components/remote/RemoteTerminal.tsx`): it calls `create_session` via `api.functions.invoke("remote-shell", ...)`, stores the token, then calls `buildWsUrl` which constructs:
+
+```
+wss://login.quickztna.com/api/remote-shell/ws?token=JWT&org_id=ORG&machine_id=MACHINE&shell_token=TOKEN
+```
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | API caller (browser dashboard or curl) |
+| <MachineRef name="Linux-C" /> | Target machine for the shell session |
+
+Prerequisites:
+- The org must be on the Workforce plan (feature `remote_management` must be enabled).
+- <MachineRef name="Linux-C" /> must be online (`status = 'online'` in the `machines` table). Confirm with `ztna status` on that machine.
+- The caller must be an org admin (owner or admin role).
+- You need a valid JWT access token. Extract it from browser DevTools: Application tab, Local Storage, key `quickztna_session`, field `access_token`.
+
+---
+
+## ST1 -- Successful Session Token Creation
+
+**What it verifies:** `create_session` returns a well-formed token and connection details when the machine is online and the caller is an admin on a Workforce plan.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_session",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "token": "UUID-UUID",
+    "tailnet_ip": "100.64.x.x",
+    "port": 2222,
+    "machine_name": "Linux-C",
+    "expires_in": 300
+  },
+  "error": null
+}
+```
+
+2. Verify the token format: it must be two UUIDs joined by a hyphen, e.g. `550e8400-e29b-41d4-a716-446655440000-f47ac10b-58cc-4372-a567-0e02b2c3d479`.
+3. Confirm `port` is exactly `2222` and `expires_in` is `300`.
+
+**Pass:** HTTP 200, `success: true`, token present and double-UUID formatted, `tailnet_ip` matches the IP shown on the Machines page for Linux-C.
+
+**Fail / Common issues:**
+- HTTP 403 with code `FEATURE_NOT_AVAILABLE` -- the org is not on the Workforce plan. Upgrade via the Billing page.
+- HTTP 403 with code `FORBIDDEN` -- the caller is not an org admin. Check role on the Users page.
+- HTTP 404 with code `NOT_FOUND` -- wrong `machine_id`. Fetch the correct UUID via `GET /api/db/machines?org_id=YOUR_ORG_ID`.
+
+---
+
+## ST2 -- Rejection When Machine Is Offline
+
+**What it verifies:** `create_session` returns `MACHINE_OFFLINE` when the target machine's status is not `online`.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, stop the VPN client:
+```bash
+ztna down
+```
+2. Wait 90 seconds for the heartbeat timeout to mark the machine offline (or set it to offline directly via `machine-admin` if you need immediate results).
+3. On <MachineRef name="Win-A" />, attempt session creation again:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_session",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "MACHINE_OFFLINE",
+    "message": "Machine must be online for remote shell"
+  }
+}
+```
+
+4. Bring Linux-C back online:
+```bash
+ztna up
+```
+
+**Pass:** HTTP 400, `success: false`, error code `MACHINE_OFFLINE`. After `ztna up` the same request succeeds.
+
+**Fail / Common issues:**
+- Still getting a token while machine is offline -- the heartbeat window may not have elapsed. Wait the full 90 seconds or force-set `status = 'offline'` via machine-admin for an immediate test.
+
+---
+
+## ST3 -- Rejection Without Authentication
+
+**What it verifies:** Requests without a valid JWT are rejected before any feature gate or machine check.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, send the request with no Authorization header:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_session",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "..."
+  }
+}
+```
+
+2. Send with an expired or malformed token:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer invalid.token.here" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_session",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected:** Same 401 response.
+
+**Pass:** Both cases return HTTP 401 with `UNAUTHORIZED`. No token is issued.
+
+**Fail / Common issues:**
+- Getting 400 instead of 401 -- the request body may be missing `action`. The handler validates auth before the action switch, so auth failures always return 401 first.
+
+---
+
+## ST4 -- Missing Required Fields Validation
+
+**What it verifies:** The handler rejects requests missing `action`, `org_id`, or `machine_id` with clear error codes.
+
+**Steps:**
+1. Missing `action`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"org_id": "YOUR_ORG_ID", "machine_id": "LINUX_C_MACHINE_ID"}'
+```
+**Expected:** HTTP 400, code `MISSING_FIELDS`, message `"action required"`.
+
+2. Missing `org_id`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "create_session", "machine_id": "LINUX_C_MACHINE_ID"}'
+```
+**Expected:** HTTP 400, code `MISSING_FIELDS`, message `"org_id required"`.
+
+3. Missing `machine_id`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "create_session", "org_id": "YOUR_ORG_ID"}'
+```
+**Expected:** HTTP 400, code `MISSING_FIELDS`, message `"machine_id required"`.
+
+4. Invalid JSON:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d 'not-json'
+```
+**Expected:** HTTP 400, code `INVALID_JSON`.
+
+**Pass:** Each missing field produces a 400 with the correct error code and a message that identifies the missing field.
+
+**Fail / Common issues:**
+- Getting 401 even with a valid token -- the token may have expired (24-hour lifetime). Refresh via the login page or browser auto-refresh.
+
+---
+
+## ST5 -- Audit Log Entry Written on Session Creation
+
+**What it verifies:** A successful `create_session` call writes a `remote.session_created` audit event to Loki including the machine name and tailnet IP.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, perform a successful `create_session` call (as in ST1). Note the current timestamp.
+2. Navigate to the dashboard: Audit Log page (`/audit-log`).
+3. Filter by action type or search for `remote.session_created`.
+4. Confirm an entry exists with:
+   - `action: "remote.session_created"`
+   - `resource_type: "machine"`
+   - `resource_id` matching the Linux-C machine UUID
+   - `actor_id` matching your user UUID
+   - `metadata.machine_name: "Linux-C"`
+   - `metadata.tailnet_ip` matching the tailnet IP shown in the API response
+
+5. Alternatively, query Loki directly from the monitoring VM:
+```bash
+ssh root@188.166.155.128
+logcli query '{job="quickztna"} |= "remote.session_created"' --limit=5
+```
+
+**Pass:** The audit entry is present within a few seconds of the API call, with correct `resource_id`, `actor_id`, and metadata fields.
+
+**Fail / Common issues:**
+- Entry missing -- Loki ingestion is async. Wait 10-15 seconds and refresh. If still absent, check Loki health at `http://188.166.155.128:3000`.
+- `metadata.tailnet_ip` is null -- the machine was registered without a tailnet IP. This should have been caught by the `NO_TAILNET_IP` guard, so a missing tailnet IP in the audit entry means the guard was bypassed. Check the `machines` table for the `tailnet_ip` column value.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Successful `create_session` returns a double-UUID token, tailnet IP, port 2222, and expires_in 300 |
+| ST2 | Offline machines are rejected with `MACHINE_OFFLINE` before any token is issued |
+| ST3 | Missing or invalid JWT returns 401 `UNAUTHORIZED` before reaching any business logic |
+| ST4 | Missing `action`, `org_id`, or `machine_id` returns 400 `MISSING_FIELDS` with an accurate message |
+| ST5 | Successful session creation writes a `remote.session_created` entry to Loki with correct metadata |

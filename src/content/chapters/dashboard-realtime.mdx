@@ -1,0 +1,248 @@
+---
+title: "Real-time Dashboard Update (WebSocket)"
+topic: "Dashboard & Analytics"
+order: 80
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that the dashboard updates automatically without page refresh when machines come online or go offline — via the postgres_changes subscription channel, React Query cache invalidation, and the 500ms debounce guard."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+`DashboardPage.tsx` subscribes to realtime events for the `machines` table using the API client's channel API:
+
+```typescript
+api.channel("dashboard-machines-realtime")
+  .on("postgres_changes", {
+    event: "*",
+    schema: "public",
+    table: "machines",
+    filter: `org_id=eq.${currentOrg.id}`
+  }, () => {
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      queryClient.invalidateQueries({ queryKey: ["dashboard", currentOrg.id] });
+    }, 500);
+  })
+  .subscribe();
+```
+
+This connects to the WebSocket endpoint at `wss://login.quickztna.com/api/realtime?org_id=ORG_ID&token=JWT`. The backend `handleRealtimeUpgrade` in `realtime.ts` validates the JWT and org membership before allowing the upgrade.
+
+When a machine event fires (INSERT, UPDATE, or DELETE), the callback debounces the React Query cache invalidation by 500ms. After invalidation, `useDashboardData` automatically re-fetches `POST /api/db/_rpc` with `get_dashboard_stats`, and the UI re-renders with the new counts.
+
+The channel is cleaned up on component unmount (`api.removeChannel(channel)` in the `useEffect` cleanup).
+
+**Key facts to test:**
+- The debounce is 500ms — rapid consecutive events (e.g., 3 machines coming online at once) result in only one re-fetch, fired 500ms after the last event.
+- The channel filter is `org_id=eq.ORGID` — only machines belonging to the current org trigger re-fetches.
+- Channel name is fixed as `"dashboard-machines-realtime"` — if two tabs are open on the same dashboard, each creates its own subscription with the same channel name.
+- The realtime subscription is established only when `currentOrg` is truthy — it is skipped until the org context is loaded.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — admin account watching the dashboard |
+| <MachineRef name="Linux-C" /> | The machine that will come online and go offline to trigger events |
+
+---
+
+## ST1 — Dashboard Updates When a Machine Comes Online
+
+**What it verifies:** When <MachineRef name="Linux-C" /> transitions from `offline` to `online` (by running `ztna up`), the dashboard's Network Status card updates automatically within about 1-2 seconds — no page refresh needed.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open the dashboard in a browser:
+   `https://login.quickztna.com/dashboard`
+
+2. Note the current "N/M Online" count in the Network Status card. Ensure <MachineRef name="Linux-C" /> is currently offline:
+```bash
+TOKEN="YOUR_ADMIN_JWT_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.Linux-C&select=name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. On <MachineRef name="Linux-C" />, start the VPN:
+```bash
+ztna up
+```
+
+4. Watch the dashboard on <MachineRef name="Win-A" /> without refreshing.
+
+**Expected:** Within 1-3 seconds of `ztna up` on Linux-C (accounting for heartbeat propagation and the 500ms debounce), the Network Status card's online count increments by 1. Linux-C appears in the Active Machines list.
+
+**Pass:** The count updates without a page refresh. The transition time is under 5 seconds from `ztna up` to count change on the dashboard.
+
+**Fail / Common issues:**
+- Count does not update — the WebSocket connection may not be established. Open DevTools Network tab, filter by "WS", and verify there is an active `wss://login.quickztna.com/api/realtime` connection. If absent, the subscription silently failed.
+- Update takes more than 10 seconds — the heartbeat may be arriving slowly (30s interval on the first startup). Wait up to 60 seconds for the first heartbeat to register the machine.
+
+---
+
+## ST2 — Dashboard Updates When a Machine Goes Offline
+
+**What it verifies:** When <MachineRef name="Linux-C" /> stops the VPN (`ztna down`), the dashboard online count decrements automatically.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, confirm Linux-C is online and note the current count on the dashboard (e.g., "2/3 Online").
+
+2. On <MachineRef name="Linux-C" />, stop the VPN:
+```bash
+ztna down
+```
+
+This sends a final heartbeat with `status: "offline"` before stopping.
+
+3. Watch the dashboard on <MachineRef name="Win-A" /> without refreshing.
+
+**Expected:** Within 1-3 seconds of `ztna down`, the online count decrements by 1. Linux-C disappears from the Active Machines list (since the list only shows `status = 'online'` machines).
+
+4. Verify the final state via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.Linux-C&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "Linux-C",
+      "status": "offline",
+      "last_seen": "2026-03-17T10:35:12.456Z"
+    }
+  ]
+}
+```
+
+**Pass:** Online count decrements. Linux-C is absent from Active Machines list. `status` field reads `offline` in the API response.
+
+**Fail / Common issues:**
+- Count stays at the previous value even after `ztna down` — the offline heartbeat may have failed. In this case, the machine's `status` will remain `online` in the DB until the server-side cleanup job runs. Check with `ztna status` on Linux-C to confirm it stopped.
+- Linux-C still shows in Active Machines — the React Query cache was not invalidated. Check the WebSocket connection in DevTools.
+
+---
+
+## ST3 — Debounce Prevents Redundant Re-fetches
+
+**What it verifies:** The 500ms debounce (`debounceRef`) prevents multiple consecutive machine events from triggering multiple RPC re-fetches.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open DevTools Network tab. Filter by "XHR" or "Fetch". Keep it visible.
+
+2. Perform an action that generates multiple machine events in rapid succession. The most practical approach is to use the API to update a machine's status twice quickly:
+```bash
+# Update machine status to offline, then online, within 200ms
+MACHINE_ID="YOUR_MACHINE_ID"
+
+curl -s -X PATCH "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"offline"}' &
+
+sleep 0.1
+
+curl -s -X PATCH "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"online"}'
+```
+
+3. In the DevTools Network tab, watch for requests to `/api/db/_rpc` with body containing `get_dashboard_stats`.
+
+**Expected:** Despite two machine events firing within 100ms, only one `get_dashboard_stats` RPC request fires in the network tab. It fires approximately 500ms after the second event.
+
+**Pass:** A single RPC request fires after the burst of events. The count in the dashboard updates to reflect the final state.
+
+**Fail / Common issues:**
+- Two `_rpc` requests fire — the debounce was not effective. This could happen if the two events arrived more than 500ms apart. Tighten the sleep interval or run both `curl` commands in closer succession.
+- No `_rpc` request fires — the realtime events may not have been delivered to the browser. Check the WS connection in DevTools.
+
+---
+
+## ST4 — WebSocket Connection Lifecycle
+
+**What it verifies:** The WebSocket connection to `wss://login.quickztna.com/api/realtime` is established on dashboard load, authenticated with the JWT, and closed when navigating away.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open DevTools Network tab and switch to the "WS" filter (WebSockets).
+
+2. Navigate to `https://login.quickztna.com/dashboard`.
+
+3. Observe the WebSocket connection appear in the list. Click on it and view the request URL — it should contain `org_id=` and `token=` query params.
+
+4. Verify the connection status shows as "101 Switching Protocols" in the Headers tab.
+
+5. Click the "Messages" tab in the WebSocket inspector. You should see periodic messages (keepalive frames or channel subscription confirmations) once the connection is active.
+
+6. Navigate away from the dashboard (e.g., click "Machines" in the sidebar).
+
+7. Verify the WebSocket connection closes (the `useEffect` cleanup calls `api.removeChannel(channel)`).
+
+8. Navigate back to the dashboard. A new WebSocket connection should be established.
+
+**Expected WebSocket URL format:**
+```
+wss://login.quickztna.com/api/realtime?org_id=YOUR_ORG_ID&token=YOUR_JWT_TOKEN
+```
+
+**Pass:** WebSocket connection opens on dashboard load with a valid JWT and org_id. Connection closes when navigating away. A new connection opens on return.
+
+**Fail / Common issues:**
+- WebSocket connection fails with 401 — the JWT token in the query param may be expired. The API client automatically passes the current token. If you see 401, force-refresh the page to get a new token.
+- No WebSocket connection in DevTools — some browsers hide WebSocket connections unless the Network tab was open before navigation. Open DevTools before navigating to the dashboard.
+
+---
+
+## ST5 — Realtime Does Not Fire for Other Orgs
+
+**What it verifies:** The `org_id=eq.ORG_ID` filter on the channel subscription means machine events from other organizations do NOT trigger dashboard re-fetches.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, if you have access to a second organization, note its org ID (e.g., `ORG_ID_2`). If not, this test can be verified by inspecting the channel filter.
+
+2. Open the dashboard while logged into `ORG_ID`. In DevTools Network tab, monitor for `_rpc` requests.
+
+3. Trigger a machine event on `ORG_ID_2` (e.g., update a machine's `last_seen` via a separate API call):
+```bash
+ORG_ID_2="SECOND_ORG_ID"
+MACHINE_ID_2="MACHINE_IN_ORG_2"
+
+curl -s -X PATCH "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID_2" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"last_seen\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}"
+```
+
+4. Watch the DevTools Network tab. No `_rpc` request should fire for the first org's dashboard.
+
+5. To verify the filter is applied, you can inspect the channel subscription by viewing the WebSocket messages. The subscription frame should contain `filter: "org_id=eq.ORG_ID"`.
+
+**Pass:** Machine updates in a different org do not trigger React Query invalidation on the current org's dashboard. The Network tab shows no spurious `_rpc` requests.
+
+**Fail / Common issues:**
+- Dashboard re-fetches on other-org events — this would indicate the `filter` parameter is not being applied. This would be a regression in the WebSocket subscription setup.
+- Cannot test (only one org) — inspect the channel subscription frame in the WebSocket messages panel. Confirm `filter` contains the current org ID.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Online transition | Dashboard count increments within ~2s of `ztna up` on Linux-C, no page refresh |
+| ST2 | Offline transition | Dashboard count decrements and Linux-C leaves Active Machines list after `ztna down` |
+| ST3 | Debounce | Rapid machine events produce only one `_rpc` re-fetch, fired 500ms after last event |
+| ST4 | WebSocket lifecycle | Connection opens on dashboard load with JWT+org_id; closes on navigation away |
+| ST5 | Org isolation | Machine events from other orgs do not trigger re-fetches on the current org dashboard |

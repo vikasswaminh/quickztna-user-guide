@@ -1,0 +1,524 @@
+---
+title: "Remote Desktop Access Control"
+topic: "Remote Desktop"
+order: 120
+machines: ["Win-A", "Win-B"]
+summary: "Verify plan feature gating, admin-vs-peer session type authorization, ACL enforcement for peer sessions, consent workflow, admin terminate, and non-admin disconnect restrictions."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+`handleRemoteDesktop` in `backend/src/handlers/remote-desktop.ts` enforces multiple layers of access control before allowing a session to proceed. This chapter tests each gate in isolation to verify that unauthorised access is correctly rejected.
+
+**Layer 1 — Feature gate:** `requireFeature(db, org_id, 'remote_desktop', request)` is called for all user-authenticated actions. The `plan_features` table (seeded in `028_remote_desktop.sql`) sets `remote_desktop = false` for `free` and `starter` plans, and `true` for `business` and `enterprise`. An HTTP 403 with code `FEATURE_NOT_ENABLED` is returned for gated orgs.
+
+**Layer 2 — Session type authorization:**
+- `session_type: "admin"` requires `isOrgAdmin(db, user_id, org_id)` → returns HTTP 403 `FORBIDDEN` if the user is not an admin
+- `session_type: "peer"` requires `isOrgMember(db, user_id, org_id)` → any org member can initiate; additionally, if `viewer_machine_id` is provided, ACL rules are evaluated inline
+
+**Layer 3 — ACL check for peer sessions:** When `session_type: "peer"` and `viewer_machine_id` is supplied, the handler queries all `acl_rules` for the org ordered by `priority ASC`. It evaluates each rule's `source` (matched against viewer machine name or tailnet IP) and `destination` (matched against target machine name or tailnet IP) with wildcard `"*"` support. If the first matching rule has `action: "deny"`, an HTTP 403 `ACL_DENIED` is returned. If no rules match, the default is `allow`.
+
+**Layer 4 — Consent workflow:** When `consent_required: true`, submitting an `action: "offer"` while `consent_granted` is null or false returns HTTP 403 `CONSENT_PENDING`. The `action: "approve_consent"` handler requires the caller to be the machine owner (`machines.owner_id`) or an org admin. `action: "reject_consent"` terminates the session with `status: "rejected"`.
+
+**Layer 5 — Disconnect authorization:** `action: "disconnect"` allows the session viewer (`viewer_user_id`) or any org admin to disconnect. Non-admin non-viewers receive HTTP 403 `FORBIDDEN`. `action: "terminate"` is admin-only (forcefully closes any non-terminal sessions for a machine or specific session).
+
+**Layer 6 — Agent authentication:** `action: "answer"` and `action: "agent_ice_candidate"` are authenticated by `node_key` (not JWT). The handler SHA256-hashes the key, looks up the machine, and verifies `callerMachine.id === session.machine_id`. A mismatched node key returns HTTP 403 `FORBIDDEN`.
+
+**Audit logging:** Every significant event writes to Loki via `logAudit()`:
+- `remote.desktop_initiated` on initiate
+- `remote.desktop_connected` on connected
+- `remote.desktop_disconnected` on disconnect
+- `remote.desktop_terminated` on admin terminate
+- `remote.desktop_consent_approved` / `remote.desktop_consent_rejected` on consent decisions
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Initiating viewer — tests all access control paths |
+| <MachineRef name="Win-B" /> | Target machine — subject of all session attempts |
+
+**Prerequisites:**
+- Admin JWT token: `$TOKEN` (org admin user)
+- Non-admin JWT token: `$MEMBER_TOKEN` (org member, not admin)
+- Org ID: `$ORG_ID` (Business or Enterprise plan for positive tests)
+- Win-B machine ID: `$MACHINE_ID`
+- Win-B must be `online` for all positive tests
+
+---
+
+## ST1 -- Feature Gate Blocks Free Plan Orgs
+
+**What it verifies:** `action: "initiate"` on a Free plan org returns HTTP 403 with `FEATURE_NOT_ENABLED`, not a session.
+
+**Steps:**
+
+1. Obtain the ID of a Free plan org (or temporarily change an org's plan to free in the DB for testing):
+```powershell
+$FREE_ORG_ID = "<free-plan-org-id>"
+```
+
+2. Attempt to initiate a remote desktop session on the free org:
+```powershell
+$body = @{
+    action       = "initiate"
+    org_id       = $FREE_ORG_ID
+    machine_id   = "$MACHINE_ID"
+    session_type = "admin"
+} | ConvertTo-Json
+
+try {
+    $result = Invoke-RestMethod `
+        -Uri "https://login.quickztna.com/api/remote-desktop" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+        -Body $body
+    Write-Host "Unexpected success: $($result | ConvertTo-Json)"
+} catch {
+    $response = $_.ErrorDetails.Message | ConvertFrom-Json
+    Write-Host "Error code: $($response.error.code)"
+    Write-Host "HTTP status: $($_.Exception.Response.StatusCode.value__)"
+}
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "error": { "code": "FEATURE_NOT_ENABLED", "message": "..." }
+}
+```
+HTTP status: 403
+
+3. Confirm no `remote_desktop_sessions` row was created:
+```powershell
+$rows = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/db/remote_desktop_sessions?org_id=eq.$FREE_ORG_ID" `
+    -Headers @{ Authorization = "Bearer $TOKEN" }
+
+$rows.data.Count  # Should be 0
+```
+
+**Pass:** HTTP 403, `error.code: "FEATURE_NOT_ENABLED"`, no session row created.
+
+**Fail / Common issues:**
+- HTTP 200 returned -- the org is not on a free plan, or the `plan_features` table has `remote_desktop = true` for this plan. Check the plan assignment.
+- `UNAUTHORIZED` instead of `FEATURE_NOT_ENABLED` -- the JWT is invalid or expired. Refresh `$TOKEN`.
+
+---
+
+## ST2 -- Non-Admin Cannot Initiate Admin Session Type
+
+**What it verifies:** `session_type: "admin"` requires org admin role. A non-admin member receives HTTP 403 `FORBIDDEN`.
+
+**Steps:**
+
+1. Using the non-admin member token `$MEMBER_TOKEN`, attempt an admin session:
+```powershell
+$body = @{
+    action       = "initiate"
+    org_id       = $ORG_ID
+    machine_id   = $MACHINE_ID
+    session_type = "admin"
+} | ConvertTo-Json
+
+try {
+    $result = Invoke-RestMethod `
+        -Uri "https://login.quickztna.com/api/remote-desktop" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+        -Body $body
+    Write-Host "Unexpected success"
+} catch {
+    $response = $_.ErrorDetails.Message | ConvertFrom-Json
+    Write-Host "Error code: $($response.error.code)"
+}
+```
+
+**Expected:** `error.code: "FORBIDDEN"`, message: "Admin access required for admin sessions"
+
+2. Verify the same non-admin token CAN initiate a peer session (if org membership is sufficient):
+```powershell
+$peerBody = @{
+    action       = "initiate"
+    org_id       = $ORG_ID
+    machine_id   = $MACHINE_ID
+    session_type = "peer"
+} | ConvertTo-Json
+
+$peerResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+    -Body $peerBody
+
+$peerResult.success
+$peerResult.data.session_id
+```
+
+**Expected:** `success: true`, `session_id` returned, `consent_required: true` (peer sessions default to consent required).
+
+3. Clean up the peer session:
+```powershell
+Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "terminate"; org_id = $ORG_ID; machine_id = $MACHINE_ID } | ConvertTo-Json)
+```
+
+**Pass:** Non-admin admin-session attempt returns HTTP 403 `FORBIDDEN`; non-admin peer-session initiate returns HTTP 200 with `consent_required: true`.
+
+**Fail / Common issues:**
+- Non-admin successfully creates admin session -- the user has been promoted to admin. Verify their role in `org_members`.
+- Peer initiate also returns `FORBIDDEN` -- verify the user is in `org_members` for this org. `isOrgMember` checks the `org_members` table.
+
+---
+
+## ST3 -- ACL Deny Blocks Peer Session Between Specific Machines
+
+**What it verifies:** When `session_type: "peer"` and `viewer_machine_id` is provided, a deny ACL rule between the viewer and target machine prevents session initiation.
+
+**Steps:**
+
+1. First, get the viewer's machine ID (Win-A's machine ID):
+```powershell
+$VIEWER_MACHINE_ID = "<Win-A-machine-id>"
+```
+
+2. Create a deny ACL rule from Win-A to Win-B:
+```powershell
+$aclBody = @{
+    org_id      = $ORG_ID
+    action      = "deny"
+    source      = "Win-A"   # Win-A machine name
+    destination = "Win-B"   # Win-B machine name
+    protocol    = "*"
+    priority    = 1         # High priority — evaluated first
+    description = "ACL test — deny Win-A to Win-B"
+} | ConvertTo-Json
+
+$aclResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/db/acl_rules" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $aclBody
+
+$ACL_RULE_ID = $aclResult.data.id
+Write-Host "Created ACL rule: $ACL_RULE_ID"
+```
+
+3. Attempt a peer session from Win-A to Win-B using the member token:
+```powershell
+$peerBody = @{
+    action            = "initiate"
+    org_id            = $ORG_ID
+    machine_id        = $MACHINE_ID        # Win-B (target)
+    viewer_machine_id = $VIEWER_MACHINE_ID # Win-A (viewer)
+    session_type      = "peer"
+} | ConvertTo-Json
+
+try {
+    $result = Invoke-RestMethod `
+        -Uri "https://login.quickztna.com/api/remote-desktop" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+        -Body $peerBody
+    Write-Host "Unexpected success: $($result.data.session_id)"
+} catch {
+    $response = $_.ErrorDetails.Message | ConvertFrom-Json
+    Write-Host "Error code: $($response.error.code)"
+    Write-Host "Message: $($response.error.message)"
+}
+```
+
+**Expected:** `error.code: "ACL_DENIED"`, message: "ACL rules deny access between these machines"
+
+4. Verify that an admin session (session_type: "admin") bypasses the ACL check entirely:
+```powershell
+# Admin session does not consult ACL rules
+$adminBody = @{
+    action       = "initiate"
+    org_id       = $ORG_ID
+    machine_id   = $MACHINE_ID
+    session_type = "admin"
+} | ConvertTo-Json
+
+$adminResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $adminBody
+
+$adminResult.success  # Should be true — admin sessions skip ACL
+```
+
+5. Clean up the test ACL rule and any test sessions:
+```powershell
+Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/db/acl_rules" `
+    -Method DELETE `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ id = $ACL_RULE_ID } | ConvertTo-Json)
+
+Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "terminate"; org_id = $ORG_ID; machine_id = $MACHINE_ID } | ConvertTo-Json)
+```
+
+**Pass:** Peer session with `viewer_machine_id` returns `ACL_DENIED`; admin session bypasses ACL and succeeds; ACL rule deletion succeeds.
+
+**Fail / Common issues:**
+- Peer session succeeds despite deny rule -- verify the ACL rule has `priority: 1` (lowest number = highest priority). The handler iterates rules in `priority ASC` order and uses the first matching rule. If a lower-priority allow rule exists and is listed first, it would match before the deny rule.
+- `ACL_DENIED` even without `viewer_machine_id` -- when `viewer_machine_id` is not provided, the ACL check is skipped entirely. Verify `viewer_machine_id` is being passed in the request body.
+- Admin session returns `ACL_DENIED` -- the admin session code path does not call the ACL check. If this occurs, check if the handler code was modified.
+
+---
+
+## ST4 -- Consent Workflow: Approve and Reject
+
+**What it verifies:** Peer sessions with `consent_required: true` block the offer until consent is granted. `approve_consent` unblocks it; `reject_consent` terminates the session.
+
+**Steps:**
+
+1. Initiate a peer session (consent is required by default for peer sessions):
+```powershell
+$peerBody = @{
+    action       = "initiate"
+    org_id       = $ORG_ID
+    machine_id   = $MACHINE_ID
+    session_type = "peer"
+} | ConvertTo-Json
+
+$peerInit = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+    -Body $peerBody
+
+$CONSENT_SESSION_ID = $peerInit.data.session_id
+Write-Host "Session: $CONSENT_SESSION_ID  consent_required: $($peerInit.data.consent_required)"
+```
+
+2. Attempt to submit an offer before consent is granted:
+```powershell
+$offerBody = @{
+    action     = "offer"
+    org_id     = $ORG_ID
+    session_id = $CONSENT_SESSION_ID
+    sdp_offer  = "v=0`r`no=- 0 0 IN IP4 127.0.0.1`r`ns=-`r`nt=0 0`r`n"
+} | ConvertTo-Json
+
+try {
+    $offerResult = Invoke-RestMethod `
+        -Uri "https://login.quickztna.com/api/remote-desktop" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+        -Body $offerBody
+    Write-Host "Unexpected success"
+} catch {
+    $err = $_.ErrorDetails.Message | ConvertFrom-Json
+    Write-Host "Error: $($err.error.code)"  # Expected: CONSENT_PENDING
+}
+```
+
+3. Now approve consent using the admin token (simulating the machine owner or admin approving):
+```powershell
+$consentBody = @{
+    action     = "approve_consent"
+    org_id     = $ORG_ID
+    session_id = $CONSENT_SESSION_ID
+} | ConvertTo-Json
+
+$consentResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $consentBody
+
+$consentResult.data  # { session_id, consent_granted: true }
+```
+
+4. Verify the session status now has `consent_granted: true`:
+```powershell
+$statusResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $CONSENT_SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$statusResult.data.session | Select-Object status, consent_required, consent_granted
+```
+
+5. Now test reject_consent. Initiate a fresh peer session:
+```powershell
+# Terminate the approved session first
+Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "terminate"; org_id = $ORG_ID; session_id = $CONSENT_SESSION_ID } | ConvertTo-Json)
+
+# New peer session
+$peer2 = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "initiate"; org_id = $ORG_ID; machine_id = $MACHINE_ID; session_type = "peer" } | ConvertTo-Json)
+
+$REJECT_SESSION_ID = $peer2.data.session_id
+
+$rejectBody = @{
+    action     = "reject_consent"
+    org_id     = $ORG_ID
+    session_id = $REJECT_SESSION_ID
+} | ConvertTo-Json
+
+$rejectResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $rejectBody
+
+$rejectResult.data  # { session_id, status: "rejected" }
+```
+
+6. Verify the rejected session has `status: "rejected"`:
+```powershell
+$rejStatus = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $REJECT_SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$rejStatus.data.session.status  # Should be "rejected"
+$rejStatus.data.session.ended_at  # Should be non-null
+```
+
+**Pass:** Offer before consent returns `CONSENT_PENDING`; `approve_consent` sets `consent_granted: true`; `reject_consent` sets `status: "rejected"` with `ended_at`.
+
+**Fail / Common issues:**
+- `approve_consent` returns `FORBIDDEN` -- only the machine owner (`machines.owner_id`) or an org admin can approve. Verify `$TOKEN` belongs to an admin or the owner of Win-B.
+- `NO_CONSENT_NEEDED` on approve -- the session was initiated with `consent_required: false` (which only happens if `consent_required: false` was explicitly passed to the initiate, or `session_type: "admin"` was used). Peer sessions default to `consent_required: true`.
+- Status remains `"pending"` after reject -- the reject updated `status = 'rejected'` via a direct DB query. If the status poll still shows `pending`, the session may have been a different ID.
+
+---
+
+## ST5 -- Admin Terminate and Non-Admin Disconnect Restriction
+
+**What it verifies:** `action: "terminate"` is admin-only. `action: "disconnect"` allows the viewer or admin but not a third non-admin user.
+
+**Steps:**
+
+1. Establish an active session using the admin token:
+```powershell
+$adminInit = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "initiate"; org_id = $ORG_ID; machine_id = $MACHINE_ID; session_type = "admin" } | ConvertTo-Json)
+
+$TERM_SESSION_ID = $adminInit.data.session_id
+```
+
+2. Attempt `action: "terminate"` using the non-admin member token:
+```powershell
+try {
+    Invoke-RestMethod `
+        -Uri "https://login.quickztna.com/api/remote-desktop" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+        -Body (@{ action = "terminate"; org_id = $ORG_ID; session_id = $TERM_SESSION_ID } | ConvertTo-Json)
+    Write-Host "Unexpected success"
+} catch {
+    $err = $_.ErrorDetails.Message | ConvertFrom-Json
+    Write-Host "Error: $($err.error.code)"  # Expected: FORBIDDEN
+}
+```
+
+3. Verify the session is still active (not terminated):
+```powershell
+$check = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $TERM_SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$check.data.session.status  # Should still be "pending" or whatever state before terminate attempt
+```
+
+4. Attempt `action: "disconnect"` using a third party non-admin who is not the session viewer:
+```powershell
+# The session was initiated with $TOKEN (admin user).
+# $MEMBER_TOKEN is a different user (not the viewer_user_id of this session).
+try {
+    Invoke-RestMethod `
+        -Uri "https://login.quickztna.com/api/remote-desktop" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $MEMBER_TOKEN"; "Content-Type" = "application/json" } `
+        -Body (@{ action = "disconnect"; org_id = $ORG_ID; session_id = $TERM_SESSION_ID } | ConvertTo-Json)
+    Write-Host "Unexpected success"
+} catch {
+    $err = $_.ErrorDetails.Message | ConvertFrom-Json
+    Write-Host "Error: $($err.error.code)"  # Expected: FORBIDDEN
+}
+```
+
+5. Now use the admin token to terminate the session (should succeed):
+```powershell
+$termResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "terminate"; org_id = $ORG_ID; session_id = $TERM_SESSION_ID } | ConvertTo-Json)
+
+$termResult.data.terminated_count  # Should be 1
+```
+
+6. Verify the terminate action was audited in Loki:
+```
+Grafana → Explore → Loki
+Query: {job="audit"} | json | action="remote.desktop_terminated" | resource_id="<session_id>"
+```
+
+7. Test that the viewer can disconnect their own session. Initiate a new session as the viewer (admin user), then disconnect it using the same token:
+```powershell
+$selfInit = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "initiate"; org_id = $ORG_ID; machine_id = $MACHINE_ID; session_type = "admin" } | ConvertTo-Json)
+
+$SELF_SESSION_ID = $selfInit.data.session_id
+
+$disconnectResult = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "disconnect"; org_id = $ORG_ID; session_id = $SELF_SESSION_ID } | ConvertTo-Json)
+
+$disconnectResult.data  # { session_id, status: "disconnected", duration_seconds: ... }
+```
+
+**Pass:** Non-admin terminate returns `FORBIDDEN`; third-party disconnect returns `FORBIDDEN`; admin terminate returns `terminated_count: 1`; viewer self-disconnect returns `status: "disconnected"`; audit log shows `remote.desktop_terminated`.
+
+**Fail / Common issues:**
+- Non-admin terminate succeeds -- the `isOrgAdmin` check for terminate is missing or bypassed. This is a security regression.
+- Self-disconnect fails with `FORBIDDEN` -- the `disconnect` handler checks `session.viewer_user_id !== user.user_id`. If the tokens are for different users than expected, this can occur. Verify `$TOKEN` is the same user who initiated the session.
+- `duration_seconds` is null on disconnect -- `started_at` was never set because `action: "connected"` was never called (the session never actually connected). For pending sessions, `duration_seconds` is null by design.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | Feature gate enforced | Free plan returns `FEATURE_NOT_ENABLED` (HTTP 403); no session row created |
+| ST2 | Admin session type check | Non-admin member gets `FORBIDDEN` for admin session; peer session allowed |
+| ST3 | ACL deny for peer sessions | Deny rule between viewer and target returns `ACL_DENIED`; admin session bypasses ACL |
+| ST4 | Consent workflow | Offer blocked with `CONSENT_PENDING`; approve unblocks; reject sets `status: "rejected"` |
+| ST5 | Terminate and disconnect authz | Non-admin terminate returns `FORBIDDEN`; admin terminate succeeds; viewer self-disconnect succeeds |

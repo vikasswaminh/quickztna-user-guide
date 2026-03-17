@@ -1,0 +1,238 @@
+---
+title: "Onboarding Wizard"
+topic: "Dashboard & Analytics"
+order: 79
+machines: ["Win-A"]
+summary: "Verify the OnboardingWizard component — auto-show logic when onlineCount is 0, the 4-step flow (Organization, Install CLI, Connect, Verify), machine approval in-wizard, and the dismiss/skip persistence in localStorage."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+`DashboardPage.tsx` renders `<OnboardingWizard>` when two conditions are both true:
+1. `onlineCount === 0` — no machines are online
+2. `localStorage.getItem("onboarding-dismissed-${currentOrg.id}")` is `null` — the wizard has not been dismissed for this org
+
+The wizard (`src/components/OnboardingWizard.tsx`) has 4 steps:
+- **Step 0 — Organization:** Shows the current org name and slug. Auto-advances to step 1 if already set.
+- **Step 1 — Install CLI:** Shows the one-line install command, platform-detected (Windows/macOS/Linux). Install commands: Windows: `irm https://login.quickztna.com/install.ps1 | iex`, Linux/macOS: `curl -fsSL https://login.quickztna.com/install.sh | bash`
+- **Step 2 — Connect:** Shows 3 commands in order: `ztna login`, `ztna connect --org SLUG`, `ztna up`. Note: the slug is `currentOrg.slug`, not `currentOrg.id`.
+- **Step 3 — Verify:** Shows pending machines awaiting approval, or a success state if machines are registered, or a "waiting" state if no machines have appeared yet.
+
+The wizard auto-advances on mount via a `useEffect` that queries `GET /api/db/machines?select=id,name,status,tailnet_ip&org_id=eq.ORG_ID`:
+- If any machine with `status = 'online'` exists → goes to step 3
+- Else if any machine exists (any status) → goes to step 3
+- Else if `currentOrg` exists → goes to step 1
+
+When dismissed (via "Skip" button or "Go to Dashboard" button in step 3), it sets `localStorage.setItem("onboarding-dismissed-${currentOrg.id}", "true")` and calls `onComplete()`.
+
+Pending machine approval (Step 3) calls `PATCH /api/db/machines` (via `api.from("machines").update({...}).eq("id", machineId)`) setting `status: "online"`, `approved_by`, and `approved_at`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — admin account, used to view and interact with the wizard |
+
+---
+
+## ST1 — Wizard Auto-Shows When No Machines Are Online
+
+**What it verifies:** The `OnboardingWizard` component appears on the dashboard when `onlineCount === 0` and the wizard has not been dismissed for the current org.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, in the browser developer console, clear the onboarding dismissed flag for your org:
+```javascript
+// Replace ORG_ID with your actual org ID
+localStorage.removeItem("onboarding-dismissed-YOUR_ORG_ID");
+```
+
+2. Ensure no machines are online for the org (all should be offline or the org is freshly created with no machines).
+
+3. Navigate to `https://login.quickztna.com/dashboard`. The wizard should appear at the top of the page.
+
+4. Verify the wizard header shows "Getting Started" and "Set up your Zero Trust network in 4 steps".
+
+**Expected:** The wizard card appears above the metric cards. Step indicators show 4 steps (1 through 4 labeled: Organization, Install CLI, Connect, Verify). The active step has a highlighted indicator.
+
+**Pass:** The wizard is visible when `onlineCount === 0` and the localStorage flag is absent. The wizard does not appear after dismissal (the localStorage key is set) even if no machines are online.
+
+**Fail / Common issues:**
+- Wizard does not appear despite no machines online — the localStorage key may already be set from a previous session. Clear it in the browser console using the command above.
+- Wizard appears even when machines are online — check `onlineCount` from the dashboard data. The wizard condition checks `onlineCount === 0` at the time of data load.
+
+---
+
+## ST2 — Step 1: Install CLI Command and Copy Button
+
+**What it verifies:** Step 1 shows the correct platform-detected install command with a working copy button.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" /> (Windows), navigate to the dashboard with the wizard visible (see ST1). Click through to Step 1 ("Install CLI") if not already there.
+
+2. The wizard detects the platform from `navigator.userAgent`. On Windows, the displayed command should be:
+```
+irm https://login.quickztna.com/install.ps1 | iex
+```
+
+3. Verify the "Quick Install (Windows detected)" label appears above the command.
+
+4. Click the copy button (clipboard icon) next to the command. A toast notification should appear: "Copied to clipboard".
+
+5. Paste into Notepad to verify the clipboard contains the exact command.
+
+6. Click "Next: Connect Your Device" to advance to Step 2.
+
+**Expected install commands by platform:**
+- Windows: `irm https://login.quickztna.com/install.ps1 | iex`
+- Linux: `curl -fsSL https://login.quickztna.com/install.sh | bash`
+- macOS: `curl -fsSL https://login.quickztna.com/install.sh | bash`
+
+**Pass:** Correct command displayed for the detected OS. Copy button works. "Or download manually from the Downloads page" link navigates to `/download`.
+
+**Fail / Common issues:**
+- Shows Linux command on Windows — `navigator.userAgent` does not contain `"win"`. This can happen in some browser configurations. Check `navigator.userAgent.toLowerCase()` in the console.
+- Copy button shows a checkmark but clipboard is empty — `copyToClipboard` uses the Clipboard API which requires HTTPS and user interaction. Verify the page is on HTTPS.
+
+---
+
+## ST3 — Step 2: Connect Commands with Org Slug
+
+**What it verifies:** Step 2 displays the three connection commands with the correct org slug substituted into `ztna connect --org SLUG`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, navigate the wizard to Step 2 ("Connect").
+
+2. Get your org slug from the API to compare:
+```bash
+TOKEN="YOUR_ADMIN_JWT_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/organizations?id=eq.$ORG_ID&select=slug" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Note the slug value (e.g., `myorg`).
+
+3. On the wizard Step 2, verify the three commands shown are exactly:
+   - `ztna login` — "Opens your browser to sign in"
+   - `ztna connect --org myorg` — "Register this device to your network" (where `myorg` is your actual org slug)
+   - `ztna up` — "Start heartbeat and join the mesh"
+
+4. Hover over each command row to reveal the copy button. Click the copy button on `ztna login`. Verify the clipboard contains `ztna login` (not the full URL).
+
+5. Read the tip box below: it should mention `ztna login --password` for headless servers.
+
+**Pass:** The `ztna connect --org` command contains the actual org slug, not a placeholder. All 3 commands are copyable individually. The headless tip text is present.
+
+**Fail / Common issues:**
+- Slug shows `your-org` — `currentOrg` was null when the wizard rendered. This can happen if the org context hasn't loaded yet. Refresh the page.
+- Command shows `ztna connect --org undefined` — the `currentOrg.slug` property was undefined. Check the org object in the React DevTools OrgContext.
+
+---
+
+## ST4 — Step 3: Pending Machine Approval
+
+**What it verifies:** When a machine with `status = 'pending'` exists, Step 3 shows it with an "Approve" button. Clicking Approve calls the machines PATCH endpoint and removes the machine from the pending list.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, verify there is a pending machine:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.pending&select=id,name,status,tailnet_ip" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Note the machine `id` and `name`.
+
+2. Navigate the wizard to Step 3 (or wait for it to auto-advance). If pending machines exist, Step 3 shows:
+```
+1 device waiting for approval:
+[monitor icon] MachineName   [tailnet_ip or "assigning..."]   [Approve]
+```
+
+3. Click "Approve" on the pending machine.
+
+4. Verify the machine disappears from the list.
+
+5. After approval, check the machine's updated status:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.MachineName&select=id,name,status,approved_by,approved_at" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response after approval:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "uuid",
+      "name": "MachineName",
+      "status": "online",
+      "approved_by": "USER_UUID",
+      "approved_at": "2026-03-17T10:30:00.000Z"
+    }
+  ]
+}
+```
+
+6. Verify the audit log entry by checking Loki or the audit log page — the action should be `machine.approved`.
+
+**Pass:** After clicking Approve, `status` changes to `online`, `approved_by` is set to the current user's ID, and `approved_at` is set to the current timestamp. The machine disappears from the wizard's pending list.
+
+**Fail / Common issues:**
+- `FORBIDDEN` on approve — the wizard calls `api.from("machines").update(...)`. This goes through the CRUD API which checks org membership. Member-role users can approve (the wizard does not check role). If you get 403, the user may not be an org member.
+- Machine re-appears after approval — the `setPendingMachines(prev => prev.filter(m => m.id !== machineId))` call filters it out client-side immediately. If it re-appears, the component may have re-mounted and re-fetched from the API.
+
+---
+
+## ST5 — Wizard Dismiss and localStorage Persistence
+
+**What it verifies:** Clicking "Skip" dismisses the wizard, sets the localStorage flag, and prevents the wizard from re-appearing on subsequent page loads.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, verify the localStorage flag is absent:
+```javascript
+// In browser console
+console.log(localStorage.getItem("onboarding-dismissed-YOUR_ORG_ID")); // should be null
+```
+
+2. With the wizard visible, click the "Skip" button in the top-right of the wizard card.
+
+3. Verify the wizard disappears immediately from the page.
+
+4. Check the localStorage flag was set:
+```javascript
+console.log(localStorage.getItem("onboarding-dismissed-YOUR_ORG_ID")); // should be "true"
+```
+
+5. Refresh the page (F5). Verify the wizard does NOT reappear, even though `onlineCount` is still 0.
+
+6. Clear the flag and repeat the test using the "Go to Dashboard" button (shown in Step 3 when machines are connected) to verify that path also sets the flag:
+```javascript
+localStorage.removeItem("onboarding-dismissed-YOUR_ORG_ID");
+```
+
+**Pass:** After clicking Skip (or "Go to Dashboard"), the localStorage key `onboarding-dismissed-ORG_ID` is set to `"true"`. On the next page load, the wizard check (`localStorage.getItem`) finds the flag and the wizard is not shown.
+
+**Fail / Common issues:**
+- Wizard reappears after skip — the `currentOrg.id` used in the localStorage key may be different from the key you cleared. Check `currentOrg.id` in the React DevTools to get the exact key.
+- Flag not set in localStorage — if the browser has cookies/storage disabled or is in strict privacy mode, `localStorage.setItem` may throw silently. The wizard code wraps this in a `try/catch`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Auto-show logic | Wizard appears when `onlineCount === 0` and localStorage dismiss flag is absent |
+| ST2 | Install CLI step | Correct platform-detected install command; copy button works |
+| ST3 | Connect step | `ztna connect --org SLUG` contains real org slug; all 3 commands individually copyable |
+| ST4 | Pending approval | Approve button sets `status = 'online'`, `approved_by`, `approved_at`; machine removed from list |
+| ST5 | Dismiss persistence | "Skip" sets localStorage flag; wizard does not re-appear on subsequent page loads |

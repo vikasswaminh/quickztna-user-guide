@@ -1,0 +1,184 @@
+---
+title: "Key Expiry Policy"
+topic: "Organization Settings & Network Config"
+order: 124
+machines: ["Win-A", "Linux-C"]
+summary: "Set the org-level key expiry policy via the Settings UI and API, verify the value stored in org_settings.key_expiry_days, and confirm the enforce-key-expiry cron respects the setting."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Key expiry controls how long a machine's node key (WireGuard session) remains valid before the machine must re-authenticate. The `org_settings.key_expiry_days` column stores the policy as an integer number of days.
+
+**Backend — `handlers/org-management.ts`, action `update_org_settings`:**
+- **Endpoint**: `POST /api/org-management` with `action: "update_org_settings"`, `org_id`, `key_expiry_days`
+- **Authorization**: `isOrgAdmin` required
+- **DB column**: `org_settings.key_expiry_days` (integer, default `180`)
+- **Write path**: UPDATE existing row or INSERT new row with `key_expiry_days` set
+- **Response**: `{ "updated": true }`
+
+**Backend — `handlers/enforce-key-expiry.ts`:**
+- Endpoint: `POST /api/enforce-key-expiry` (internal cron call)
+- Reads `key_expiry_days` from `org_settings` per org
+- Marks machine node keys as expired when `last_seen` or `key_created_at` exceeds the threshold
+- Expired machines must run `ztna up` again to re-register
+
+**Frontend — `SettingsPage.tsx`:**
+- The **Key Expiry** card shows a `Select` dropdown with four options: 30 days, 90 days, 180 days, 1 year.
+- Reads `settings?.key_expiry_days || 180` from the `org_settings` CRUD fetch.
+- On change, calls `updateSettings({ key_expiry_days: parseInt(v) })` — same `PATCH /api/db/org_settings` path.
+- Help text: "Machines must re-authenticate after this period"
+
+**Auth key expiry (separate):** The auth key expiry configured when generating a key (in the Auth Keys card on the same page) is distinct from `key_expiry_days`. Auth key expiry is stored in `auth_keys.expires_at` and controls when the key can no longer be used to register new machines. `key_expiry_days` governs how long an already-registered machine's session key stays valid.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser session — changes the key expiry setting |
+| <MachineRef name="Linux-C" /> | Registered machine — would be affected by expiry enforcement |
+
+Prerequisites: An admin JWT token is available. The `org_settings` row exists (either created by a previous toggle or by the INSERT path in the handler).
+
+---
+
+## ST1 — Observe Default Key Expiry in the Dashboard
+
+**What it verifies:** The Key Expiry dropdown renders the current DB value and defaults to 180 days for a new org.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as an admin on <MachineRef name="Win-A" />.
+2. Navigate to **Settings** > **General** tab.
+3. Scroll to the **Key Expiry** card.
+4. Observe the current selection in the dropdown.
+
+**Expected behavior:**
+- The dropdown shows "180 days" (the INSERT default in `org-management.ts`).
+- The help text reads: "Machines must re-authenticate after this period"
+
+**Pass:** Dropdown shows 180 days (or whatever was previously set).
+
+**Fail / Common issues:**
+- Dropdown shows a blank value — the `org_settings` row does not exist yet, and the fallback `|| 180` in the frontend should still render "180 days". If it's blank, the `Select` `value` prop received `undefined` instead of `"180"`. This is a frontend rendering edge case, not a backend issue.
+
+---
+
+## ST2 — Change Key Expiry to 30 Days via Dashboard
+
+**What it verifies:** Selecting a different expiry value in the dropdown fires the PATCH request and updates `key_expiry_days` in the DB.
+
+**Steps:**
+1. On the **Key Expiry** card, open the dropdown.
+2. Select **30 days**.
+3. Observe the network activity in browser DevTools > Network.
+
+**Expected behavior:**
+- The dropdown immediately shows "30 days" (optimistic update in React state).
+- DevTools shows a PATCH to `/api/db/org_settings` with body containing `key_expiry_days: 30`, returning HTTP 200.
+- Reload the page: the dropdown still shows "30 days" (confirming DB write was successful).
+
+**Pass:** Dropdown retains "30 days" after full page reload.
+
+**Fail / Common issues:**
+- After reload, the dropdown reverts to the old value — the PATCH failed silently. Check DevTools for a non-200 response on the PATCH call.
+- Toast "Failed to update settings" — check the PATCH response body for the error code.
+
+---
+
+## ST3 — Change Key Expiry via API
+
+**What it verifies:** The `update_org_settings` action correctly sets `key_expiry_days` to any integer value via direct API call, confirming the backend is not restricted to the four UI-exposed values.
+
+**Steps:**
+1. Set key expiry to 90 days via API:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org_settings","org_id":"<org_id>","key_expiry_days":90}'
+```
+
+2. Reload the Settings page and check the Key Expiry dropdown.
+
+**Expected behavior:**
+- HTTP 200
+- Response body:
+```json
+{
+  "success": true,
+  "data": {
+    "updated": true
+  }
+}
+```
+- Dashboard dropdown shows "90 days"
+
+**Pass:** API update works and UI reflects the change.
+
+**Fail / Common issues:**
+- HTTP 403 `FORBIDDEN` — token belongs to a non-admin user.
+- Dashboard shows a different value after reload — another call may have overwritten it, or there is a caching issue. Confirm by reading directly: `GET /api/db/org_settings?org_id=<org_id>`.
+
+---
+
+## ST4 — Read Back Key Expiry via CRUD API
+
+**What it verifies:** The value stored in `org_settings.key_expiry_days` matches what was written — confirms the DB round-trip.
+
+**Steps:**
+1. Read the `org_settings` row via the CRUD API:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/org_settings?org_id=<org_id>" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+**Expected behavior:**
+- HTTP 200
+- Response `data` array contains one object with:
+  - `org_id`: matching your org ID
+  - `key_expiry_days`: `90` (or whatever was last set)
+  - `allow_exit_nodes`: current value
+  - `allow_subnet_routing`: current value
+
+**Pass:** `key_expiry_days` in the response matches the value set in ST3.
+
+**Fail / Common issues:**
+- Empty `data` array — the `org_settings` row was never created. This can happen if the Settings page was never loaded (no CRUD fetch triggered) and no `update_org_settings` call was ever made. Use the API call from ST3 with `key_expiry_days: 180` to create the row.
+
+---
+
+## ST5 — Set Key Expiry to 1 Year and Confirm All Options Work
+
+**What it verifies:** All four UI-exposed values (30, 90, 180, 365) are accepted by the backend without error, and the maximum option (365 days / 1 year) is stored correctly.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open the Key Expiry dropdown on the Settings page.
+2. Cycle through each option in order: **30 days** → **90 days** → **180 days** → **1 year**.
+3. After selecting **1 year**, reload the page.
+
+**Expected behavior:**
+- Each selection triggers a PATCH to `/api/db/org_settings` — all four return HTTP 200.
+- After reload, the dropdown shows "1 year".
+- Via API read (same as ST4), `key_expiry_days` is `365`.
+
+**Pass:** All four values accepted, 365 persists correctly.
+
+**Fail / Common issues:**
+- One option causes an error — ensure the `parseInt(v)` call in the frontend's `onValueChange` handler is receiving a string numeral. If `v` is somehow `NaN`, the DB column will be set to `null` rather than the integer.
+- "1 year" dropdown option does not appear — verify the `SelectItem` with `value="365"` exists in `SettingsPage.tsx`.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Dashboard default display | Dropdown shows 180 days (INSERT default) |
+| ST2 | Dashboard change to 30 days | PATCH succeeds, persists after reload |
+| ST3 | API `update_org_settings` with `key_expiry_days: 90` | 200 `updated: true`, dropdown reflects change |
+| ST4 | CRUD read-back | `key_expiry_days` in `org_settings` matches written value |
+| ST5 | All four options accepted | 30/90/180/365 all write successfully; 365 persists |

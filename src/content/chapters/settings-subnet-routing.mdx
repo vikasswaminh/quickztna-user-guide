@@ -1,0 +1,194 @@
+---
+title: "Allow Subnet Routing Toggle & Verification"
+topic: "Organization Settings & Network Config"
+order: 123
+machines: ["Win-A", "Linux-C"]
+summary: "Toggle allow_subnet_routing for the org, advertise a subnet from Linux-C, and verify the control plane accepts or rejects the advertisement based on the setting."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Subnet routing allows a tailnet machine to act as a gateway for a local network, advertising a CIDR block so other peers can reach it. The org-level `allow_subnet_routing` boolean in `org_settings` gates this capability.
+
+**Backend — `handlers/org-management.ts`, action `update_org_settings`:**
+- **Endpoint**: `POST /api/org-management` with `action: "update_org_settings"`, `org_id`, `allow_subnet_routing`
+- **Authorization**: `isOrgAdmin` required
+- **DB column**: `org_settings.allow_subnet_routing` (boolean, default `true` per the INSERT default in the handler)
+- **Write path**: UPDATE if `org_settings` row exists, INSERT otherwise
+- **Response**: `{ "updated": true }`
+
+**Frontend — `SettingsPage.tsx`:**
+- The **Network Features** card has a **Subnet Routing** toggle.
+- Reads `settings?.allow_subnet_routing ?? true` (defaults to `true` when the row doesn't exist yet).
+- On toggle, calls `updateSettings({ allow_subnet_routing: v })` which issues `PATCH /api/db/org_settings`.
+
+**CLI — subnet advertisement:**
+- `ztna set --advertise-routes <cidr>` announces a subnet from the client.
+- The `machines.advertised_routes` column stores the advertised CIDR.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser session — toggles the setting |
+| <MachineRef name="Linux-C" /> | Connected to tailnet — advertises test subnet |
+
+Prerequisites: Both machines are online. <MachineRef name="Linux-C" /> has `ztna` connected (`ztna up`). You have an admin JWT token available.
+
+---
+
+## ST1 — Verify Subnet Routing Default State
+
+**What it verifies:** The `allow_subnet_routing` field defaults to `true`, so the toggle should already be ON for a newly created org.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as an admin on <MachineRef name="Win-A" />.
+2. Navigate to **Settings** > **General** tab.
+3. Scroll to the **Network Features** card.
+4. Observe the **Subnet Routing** toggle state.
+
+**Expected behavior:**
+- Toggle is in the ON (active) state.
+- Help text reads: "Allow machines to advertise subnet routes"
+
+**Pass:** Toggle is ON by default.
+
+**Fail / Common issues:**
+- Toggle shows OFF — the `org_settings` row was explicitly inserted with `allow_subnet_routing = false`, or a previous test set it to false. Re-enable it for subsequent sub-tests.
+
+---
+
+## ST2 — Advertise a Subnet Route from Linux-C When Enabled
+
+**What it verifies:** With `allow_subnet_routing = true`, a machine can advertise a CIDR block and it is stored in `machines.advertised_routes`.
+
+**Steps:**
+1. Confirm `allow_subnet_routing` is `true` on the Settings page.
+2. On <MachineRef name="Linux-C" />, advertise a test subnet (use a non-conflicting private range):
+
+```bash
+sudo ztna set --advertise-routes 192.168.100.0/24
+```
+
+3. Check status:
+
+```bash
+ztna status
+```
+
+4. In the dashboard on <MachineRef name="Win-A" />, navigate to **Machines** and click on <MachineRef name="Linux-C" />.
+
+**Expected behavior:**
+- `ztna set` returns without error.
+- `ztna status` shows `AdvertisedRoutes: 192.168.100.0/24`.
+- The machine detail page in the dashboard shows the advertised route.
+
+**Pass:** Route is advertised and visible in the dashboard.
+
+**Fail / Common issues:**
+- "subnet routing not allowed for this org" error — the `allow_subnet_routing` flag is `false`. Check the Settings page and toggle it ON.
+- Route not visible in dashboard — the heartbeat may not have fired yet. Wait 30 seconds or run `ztna down && ztna up` to re-register.
+
+---
+
+## ST3 — Toggle Subnet Routing OFF via Dashboard
+
+**What it verifies:** Disabling the toggle writes `allow_subnet_routing = false` to `org_settings`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, click the **Subnet Routing** toggle to turn it OFF.
+2. Observe the network request in browser DevTools > Network.
+
+**Expected behavior:**
+- Toggle moves to the OFF state.
+- No error toast.
+- DevTools shows a PATCH to `/api/db/org_settings` with `allow_subnet_routing: false`, returning HTTP 200.
+
+**Pass:** Toggle is OFF. PATCH request confirmed in DevTools.
+
+**Fail / Common issues:**
+- Toast "Failed to update settings" — check the PATCH response status. If 404, the `org_settings` row does not exist for this org; use the API path (ST4) instead to trigger an upsert.
+
+---
+
+## ST4 — API Disable and Verify Subnet Advertisement Blocked
+
+**What it verifies:** After setting `allow_subnet_routing = false` via the API, a new attempt to advertise routes is rejected.
+
+**Steps:**
+1. Disable subnet routing via API:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org_settings","org_id":"<org_id>","allow_subnet_routing":false}'
+```
+
+2. On <MachineRef name="Linux-C" />, run `ztna down` then `ztna up` to re-register.
+3. Attempt to advertise a route:
+
+```bash
+sudo ztna set --advertise-routes 10.10.10.0/24
+```
+
+**Expected behavior:**
+- API returns HTTP 200 `updated: true`.
+- The `ztna set --advertise-routes` command returns an error or the control plane strips the advertisement.
+- `ztna status` does not show `AdvertisedRoutes`.
+- Settings page toggle is OFF after reload.
+
+**Pass:** Advertisement is blocked when `allow_subnet_routing = false`.
+
+**Fail / Common issues:**
+- Route still advertised — the machine may be using a cached configuration. Run `ztna down && ztna up` to force a full re-registration with the updated org settings.
+
+---
+
+## ST5 — Re-enable and Confirm Round-Trip
+
+**What it verifies:** Subnet routing can be re-enabled and machines accept route advertisements again, proving the toggle is fully bidirectional.
+
+**Steps:**
+1. Re-enable via API:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org_settings","org_id":"<org_id>","allow_subnet_routing":true}'
+```
+
+2. On <MachineRef name="Linux-C" />, run `ztna down && ztna up`.
+3. Re-advertise the subnet:
+
+```bash
+sudo ztna set --advertise-routes 192.168.100.0/24
+```
+
+4. Verify with `ztna status`.
+
+**Expected behavior:**
+- API returns `updated: true`.
+- Route advertisement is accepted.
+- `ztna status` shows `AdvertisedRoutes: 192.168.100.0/24`.
+- Settings page toggle is back ON.
+
+**Pass:** Full round-trip confirmed — disable then re-enable works correctly.
+
+**Fail / Common issues:**
+- After re-enable, the toggle still appears OFF on the Settings page — do a hard refresh (Ctrl+Shift+R) to bypass the React state cache and force a fresh fetch from `/api/db/org_settings`.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Default state | Subnet Routing toggle is ON by default |
+| ST2 | Advertise route when enabled | `ztna set --advertise-routes` accepted, visible in dashboard |
+| ST3 | Dashboard toggle OFF | PATCH to `/api/db/org_settings` with `allow_subnet_routing: false` |
+| ST4 | API disable + verify blocked | Route advertisement rejected after `allow_subnet_routing = false` |
+| ST5 | Re-enable round-trip | Re-enable restores advertisement capability end-to-end |

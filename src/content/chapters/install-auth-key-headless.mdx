@@ -1,0 +1,256 @@
+---
+title: "Auth Key Headless Install"
+topic: "Client Install & Setup"
+order: 108
+machines: ["Linux-C"]
+summary: "Verify that passing ZTNA_AUTH_KEY to the install script — or using ztna login --auth-key — registers the machine with the control plane and auto-connects without any browser interaction."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA supports a Tailscale-style headless install: pass `ZTNA_AUTH_KEY` as an environment variable to the install script, and the machine registers itself and connects without any user interaction. This is the primary pattern for CI/CD pipelines, cloud-init scripts, and unattended server deployments.
+
+There are two surfaces to test:
+
+**Surface 1 — Install script one-liner with `ZTNA_AUTH_KEY`:**
+```bash
+curl -fsSL https://login.quickztna.com/install.sh | ZTNA_AUTH_KEY=tskey-auth-xxx sh
+```
+After the binary is installed and the service is set up, the script runs:
+```bash
+sudo ZTNA_AUTH_KEY="$ZTNA_AUTH_KEY" ztna up
+```
+This calls `ztna up`, which reads `ZTNA_AUTH_KEY` from the environment (the CLI also reads it, giving the env var priority over the `--auth-key` flag to avoid key exposure in `ps` output).
+
+**Surface 2 — `ztna login --auth-key`:**
+The `cmd_login.go` `loginWithAuthKey()` function calls `SetupWithOptions()` to register the machine, saves config + state + JWT tokens to disk, then calls `runAutoConnect()` which forks `ztna up --daemon` to the background.
+
+**Surface 3 — `ztna up --auth-key` (or `ZTNA_AUTH_KEY` env var with `ztna up`):**
+`cmd_up.go` reads `ZTNA_AUTH_KEY` from the environment first, then the `--auth-key` flag. When an auth key is present and the machine is not yet registered, it calls `SetupWithOptions()`, saves state, then forks the VPN daemon.
+
+Auth key format: `tskey-auth-` followed by a 32-hex-byte random string (e.g., `tskey-auth-a1b2c3d4e5f6a7b8`).
+Auth keys are stored in the `auth_keys` table, valid for 90 days, optionally reusable and optionally ephemeral (machine deleted on `ztna down`).
+
+**Key security note:** The CLI prints a warning when `--auth-key` is passed as a flag (exposes the key in `ps` output). The env var path (`ZTNA_AUTH_KEY`) is always preferred.
+
+Config directory: `~/.config/ztna/` (user state) or `/etc/quickztna/` (service config)
+State file: `~/.config/ztna/state.json`
+Tokens file: `~/.config/ztna/tokens.json`
+
+## Your Test Setup
+
+| Machine | Role | Notes |
+|---------|------|-------|
+| <MachineRef name="Linux-C" /> | Headless target machine | SSH in; no browser available |
+
+You will also need access to the QuickZTNA dashboard (admin role) to generate auth keys before running these tests. Navigate to Settings → Auth Keys → Generate, or use the Client Setup page at `https://login.quickztna.com/setup`.
+
+---
+
+## ST1 — One-Liner with ZTNA_AUTH_KEY
+
+**Objective:** Confirm the install script registers the machine automatically when `ZTNA_AUTH_KEY` is set.
+
+**Pre-condition:** Generate a reusable auth key from the dashboard. Copy the full `tskey-auth-...` value.
+
+**Steps:**
+
+1. SSH into <MachineRef name="Linux-C" />.
+2. Run the one-liner with the auth key:
+   ```bash
+   curl -fsSL https://login.quickztna.com/install.sh | ZTNA_AUTH_KEY=tskey-auth-YOUR_KEY_HERE sh
+   ```
+3. Observe the final output line.
+4. Check machine status:
+   ```bash
+   ztna status
+   ```
+
+**Expected final output line (from install script):**
+```
+Connected to ZTNA Network. Please ask admin to approve your machine for further VPN access.
+```
+
+**Expected `ztna status` output (if admin has pre-approved or machine is auto-approved):**
+```
+Connected as Linux-C (<tailnet-ip>) [TUN]
+```
+
+Or, if the machine requires admin approval:
+```
+Machine registered but requires admin approval.
+```
+
+**Pass criteria:**
+- Install script exits 0.
+- Final output is the "Connected to ZTNA Network..." line (not the "Run 'ztna login' to authenticate." line).
+- Machine appears in the dashboard under Machines (as `online` or `pending`).
+
+**Fail criteria:**
+- Final line reads "ZTNA installed. Run 'ztna login' to authenticate." — means `ZTNA_AUTH_KEY` was not picked up.
+- `ztna up` exited with error during the auth-key registration step.
+
+---
+
+## ST2 — ztna login --auth-key (Standalone Command)
+
+**Objective:** Confirm `ztna login --auth-key` registers the machine and forks the VPN daemon.
+
+**Pre-condition:** `ztna` is already installed. Auth key is available.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, run:
+   ```bash
+   ztna login --auth-key tskey-auth-YOUR_KEY_HERE
+   ```
+2. Check the output:
+   ```bash
+   ztna status
+   ```
+3. Confirm the daemon is running:
+   ```bash
+   pgrep -a ztna
+   ```
+
+**Expected output of `ztna login --auth-key`:**
+```
+Logged in. Machine: Linux-C (<tailnet-ip>)
+VPN starting in background (PID <n>)
+Logs: /root/.config/ztna/ztna.log
+Run 'ztna log' to view logs, 'ztna status' to check, 'ztna down' to disconnect.
+```
+
+**Pass criteria:**
+- Command exits 0 and returns the shell promptly.
+- The VPN daemon is forked as a background process (`ztna up --daemon`).
+- `ztna status` shows the machine as connected (or pending approval).
+- `~/.config/ztna/tokens.json` exists and is non-empty (tokens saved by `c.SaveTokens()`).
+
+**Fail criteria:**
+- Command blocks indefinitely (daemon was not forked).
+- `tokens.json` is absent — authenticated commands like `ztna peers` will fail.
+- Error: "auth key registration failed".
+
+---
+
+## ST3 — ZTNA_AUTH_KEY Env Var Takes Priority Over --auth-key Flag
+
+**Objective:** Confirm the CLI reads `ZTNA_AUTH_KEY` from the environment and warns when the flag form is used.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />:
+   ```bash
+   ztna up --auth-key tskey-auth-SOME_KEY 2>&1 | head -5
+   ```
+2. Also test the env var path:
+   ```bash
+   ZTNA_AUTH_KEY=tskey-auth-SOME_KEY ztna up 2>&1 | head -5
+   ```
+3. Compare the output — the flag form should print a warning.
+
+**Expected warning when using `--auth-key` flag (from `cmd_up.go`):**
+```
+WARNING: passing auth-key via CLI flag exposes it in process listing and shell history. Use ZTNA_AUTH_KEY env var instead.
+```
+
+**Expected behaviour when using `ZTNA_AUTH_KEY` env var:**
+- No warning line.
+- Registration proceeds normally.
+
+**Pass criteria:**
+- Warning is printed only when `--auth-key` flag is explicitly set on the command line.
+- `ZTNA_AUTH_KEY` env var is picked up silently (no warning).
+- Both methods result in successful machine registration.
+
+**Fail criteria:**
+- Warning is printed when using env var path (false positive).
+- Env var is ignored; only flag form works.
+
+---
+
+## ST4 — Pending Approval Flow
+
+**Objective:** Confirm correct behaviour when the auth key requires admin approval (non-auto-approved org).
+
+**Pre-condition:** Use an org where machines require manual approval (not automatic). Generate a reusable auth key for that org.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />:
+   ```bash
+   ZTNA_AUTH_KEY=tskey-auth-YOUR_KEY_HERE ztna up
+   ```
+2. Observe the output.
+3. Check `ztna status`.
+
+**Expected output (from `cmd_up.go`):**
+```
+Registered: Linux-C (<tailnet-ip>)
+
+Machine registered but requires admin approval.
+Ask your org admin to approve this machine in the dashboard:
+  Machines page -> Pending Approval tab -> Approve
+
+Run 'ztna up' again after approval.
+```
+
+**Pass criteria:**
+- Command exits 0 after printing the approval message.
+- Machine appears in the dashboard under Machines → Pending Approval tab.
+- The VPN daemon is NOT forked (process returns to shell; no background `ztna` process running).
+- Running `ztna up` again after admin approval connects successfully.
+
+**Fail criteria:**
+- Command hangs waiting for approval.
+- Machine does not appear in dashboard.
+- Daemon is forked even though the machine is in `pending` state (would fail to connect).
+
+---
+
+## ST5 — Ephemeral Auth Key Machine Cleanup
+
+**Objective:** Confirm that a machine registered with an ephemeral auth key is removed from the org when the tunnel goes down.
+
+**Pre-condition:** Generate an ephemeral reusable auth key from the dashboard (ephemeral toggle enabled). Auth keys with `ephemeral = true` cause the machine record to be deleted when the client disconnects.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />:
+   ```bash
+   ZTNA_AUTH_KEY=tskey-auth-YOUR_EPHEMERAL_KEY ztna up
+   ```
+2. Note the machine name and tailnet IP from the output.
+3. Bring the tunnel down:
+   ```bash
+   ztna down
+   ```
+4. In the dashboard, navigate to Machines and confirm the machine record is gone.
+
+**Expected behaviour:**
+- Machine appears in Machines list while connected.
+- After `ztna down`, the machine record is deleted automatically by the control plane (not manually by the client).
+
+**Pass criteria:**
+- Machine is visible in the dashboard while tunnel is up.
+- After `ztna down`, machine no longer appears in the Machines list (deleted by control plane on heartbeat timeout or explicit deregister).
+- A non-ephemeral machine registered in the same session remains visible.
+
+**Fail criteria:**
+- Ephemeral machine persists in dashboard after disconnect.
+- Non-ephemeral machine is accidentally deleted.
+
+---
+
+## Summary
+
+| Sub-test | What is verified | Pass signal |
+|----------|-----------------|-------------|
+| ST1 | One-liner + `ZTNA_AUTH_KEY` registers machine | "Connected to ZTNA Network..." final line |
+| ST2 | `ztna login --auth-key` forks daemon, saves tokens | `tokens.json` written; daemon in background |
+| ST3 | Env var vs flag warning | Warning on `--auth-key` flag, silent on env var |
+| ST4 | Pending approval flow | Correct message; daemon not forked; machine in pending tab |
+| ST5 | Ephemeral key — machine cleanup on disconnect | Machine deleted from dashboard after `ztna down` |

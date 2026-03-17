@@ -1,0 +1,308 @@
+---
+title: "Security Event Summary"
+topic: "Dashboard & Analytics"
+order: 78
+machines: ["Win-A"]
+summary: "Verify the health warning cards, the Security Digest (24h) card, and the AI Event Summary card on the dashboard — including anomaly detection logic, plan gating, and the admin-insights daily_digest endpoint."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+`DashboardPage.tsx` renders three security-related UI sections that are tested in this chapter:
+
+**1. Health Warning Cards (admin/owner only, no plan gate):**
+Rendered when `isAdmin && (expiringKeys > 0 || pendingMachines > 0 || staleMachines > 0)`. These are fetched client-side via three separate CRUD API calls in a `useEffect`:
+- Expiring auth keys: `auth_keys` where `revoked = false` and `expires_at < now + 7 days` and `expires_at > now`
+- Pending machines: `machines` where `status = 'pending'`
+- Stale machines: `machines` where `status = 'online'` and `last_seen < now - 24h`
+
+**2. Security Digest card (plan-gated: `security_digest` feature):**
+Calls `api.functions.invoke('admin-insights', { body: { action: 'daily_digest', org_id } })` which maps to `POST /api/admin-insights` with body `{ "action": "daily_digest", "org_id": "..." }`. Handled by `handleAdminInsights` in `admin-insights.ts`.
+
+The `daily_digest` response contains:
+- `machines` — total, online, offline, quarantined, pending, new in 24h
+- `security` — `threats_blocked`, `posture_violations`, `expiring_keys`, `failed_auths`
+- `jit_access` — total, approved, denied, pending (last 24h)
+- `acl` — total_evaluations, denials (from Loki)
+- `compliance` — rate percentage
+- `certificates` — active, expiring_30d, expired
+- `anomalies` — array of rule-based detections (ACL denial spike, missed heartbeats, non-compliant online machines, expiring certs)
+
+**3. AI Event Summary card (plan-gated: `event_summarizer` feature):**
+Calls `api.functions.invoke('ai-assist', { body: { action: 'summarize_events', org_id } })` → `POST /api/ai-assist` with `{ "action": "summarize_events", "org_id": "..." }`. Requires the `event_summarizer` plan feature. Also requires Groq API key to be configured in `platform_settings`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + API caller — admin account required for all tests |
+
+---
+
+## ST1 — Health Warning Cards Appear for Stale Machines
+
+**What it verifies:** When a machine has `status = 'online'` but `last_seen` older than 24 hours, the dashboard shows a red "N machine(s) unresponsive" warning card.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, query for machines that are `online` with stale heartbeats:
+```bash
+TOKEN="YOUR_ADMIN_JWT_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+# Find machines online but last_seen > 24h ago
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.online&select=id,name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Identify any machine where `last_seen` is more than 24 hours old.
+
+3. Open the dashboard at `https://login.quickztna.com/dashboard` (logged in as admin/owner).
+
+4. If stale machines exist, a red warning card appears at the top of the page reading: `"N machine(s) unresponsive (>24h)"` with a link "Review Machines".
+
+**Expected (1 stale machine):**
+```
+[red card]  N machine(s) unresponsive (>24h)  Review Machines
+```
+
+5. Click "Review Machines" — it should navigate to `/machines`.
+
+**Pass:** The warning card appears when stale machines exist and is absent otherwise. The count matches the number of `online` machines with `last_seen` older than 24h.
+
+**Fail / Common issues:**
+- Warning does not appear for a member-role account — health warning cards only render for `orgRole === 'owner'` or `orgRole === 'admin'`. Log in as admin to verify.
+- Count is off by one — the stale detection threshold is exactly 24 hours (`now - 86400000 ms`). A machine with `last_seen` exactly at the threshold may flip between shown/not-shown on refresh.
+
+---
+
+## ST2 — Expiring Auth Key Warning
+
+**What it verifies:** When an auth key expires within 7 days, the amber "N auth key(s) expiring soon" warning card appears.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, list active auth keys with their expiry:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=eq.$ORG_ID&revoked=eq.false&select=id,name,expires_at,revoked" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Identify any key where `expires_at` is within the next 7 days and is not revoked.
+
+3. The dashboard health warning uses the client-side check:
+   - `!k.revoked` — key is not revoked
+   - `k.expires_at` — expiry date exists
+   - `new Date(k.expires_at) < sevenDays` — expires within 7 days
+   - `new Date(k.expires_at) > now` — has not yet expired
+
+4. On the dashboard, verify the amber warning card appears (or is absent if no keys expire within 7 days).
+
+**Expected (1 key expiring within 7 days):**
+```
+[amber card]  1 auth key expiring soon  View in Settings
+```
+
+5. Click "View in Settings" — it should navigate to `/settings`.
+
+**Pass:** The amber card appears if and only if at least one non-revoked key expires within the next 7 days. The link navigates to `/settings`.
+
+**Fail / Common issues:**
+- Warning shows for already-expired keys — the check includes `new Date(k.expires_at) > now`, so already-expired keys are excluded. Expired keys should NOT trigger this warning.
+- Warning count includes revoked keys — the check filters `!k.revoked`, so revoked keys are excluded.
+
+---
+
+## ST3 — Security Digest Card (plan-gated)
+
+**What it verifies:** The Security Digest card loads and displays machine stats, compliance rate, JIT request counts, and anomalies from `POST /api/admin-insights` with `action: 'daily_digest'`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, call the digest endpoint directly:
+```bash
+curl -s -X POST https://login.quickztna.com/api/admin-insights \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"daily_digest\",\"org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+**Expected response structure:**
+```json
+{
+  "success": true,
+  "data": {
+    "period": "24h",
+    "generated_at": "2026-03-17T10:00:00.000Z",
+    "machines": {
+      "total": 3,
+      "online": 2,
+      "offline": 1,
+      "quarantined": 0,
+      "pending": 0,
+      "new_24h": 0
+    },
+    "security": {
+      "threats_blocked": 0,
+      "posture_violations": 0,
+      "expiring_keys": 0,
+      "failed_auths": 0
+    },
+    "jit_access": {
+      "total_requests": 0,
+      "approved": 0,
+      "denied": 0,
+      "pending": 0
+    },
+    "compliance": {
+      "rate": 67
+    },
+    "anomalies": []
+  }
+}
+```
+
+2. If the plan does not include `security_digest`, the endpoint returns:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FEATURE_NOT_AVAILABLE",
+    "message": "..."
+  }
+}
+```
+
+3. On the dashboard, the Security Digest card (when the feature is enabled) shows a 2x4 grid of counters: Machines, Threats Blocked, Compliance %, JIT Requests.
+
+**Pass:** The card renders with values matching the API response. The 4-cell grid shows `machines.total`, `security.threats_blocked`, `compliance.rate`, and `jit_access.total_requests`. When the feature is not available, the card is absent entirely.
+
+**Fail / Common issues:**
+- `FEATURE_NOT_AVAILABLE` — the org plan does not include `security_digest`. This is expected on Free plan.
+- `403 Forbidden` — only org admins/owners can call `admin-insights`. Member-role accounts are rejected.
+- Card shows skeleton indefinitely — the `daily_digest` call failed silently (the catch block is empty). Check the browser Network tab for the `/api/admin-insights` response.
+
+---
+
+## ST4 — Anomaly Detection in Security Digest
+
+**What it verifies:** The `daily_digest` endpoint performs rule-based anomaly detection. The anomalies array is populated when: ACL denial spikes occur, machines have stale heartbeats, online machines are non-compliant, or certificates are expiring within 30 days.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, call the digest and check the `anomalies` array:
+```bash
+curl -s -X POST https://login.quickztna.com/api/admin-insights \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"daily_digest\",\"org_id\":\"$ORG_ID\"}" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+anomalies = d.get('data', {}).get('anomalies', [])
+print(f'{len(anomalies)} anomaly/anomalies found:')
+for a in anomalies:
+    print(f'  [{a[\"severity\"]}] {a[\"type\"]}: {a[\"message\"]}')
+"
+```
+
+2. The four anomaly types and their trigger conditions are:
+   - `acl_denial_spike` (severity: medium) — triggered when any day in the past 7 days has denial count > 3x the weekly average AND denial count > 5
+   - `missed_heartbeats` (severity: low) — triggered when online machines have `last_seen < NOW() - 10 minutes`
+   - `non_compliant_online` (severity: high) — triggered when online machines have a non-compliant posture report
+   - `cert_expiry` (severity: medium) — triggered when any certificate expires within 30 days
+
+3. On the dashboard, when anomalies exist, they appear below the 4-cell grid in the Security Digest card as a list with severity badges (`high` = red, `medium` = default, `low` = secondary).
+
+4. When no anomalies exist, the card shows a green checkmark line: "No anomalies detected".
+
+**Expected (no anomalies):**
+```
+[green checkmark] No anomalies detected
+```
+
+**Expected (with anomaly):**
+```
+[high] non_compliant_online: 1 online machine(s) are non-compliant
+```
+
+**Pass:** Anomaly count in the API response matches what the dashboard card shows. Severity badges render in the correct color. "No anomalies detected" appears when the array is empty.
+
+**Fail / Common issues:**
+- `missed_heartbeats` anomaly appears unexpectedly — the threshold is 10 minutes, not 24 hours. A machine that stopped sending heartbeats only 11 minutes ago will appear here.
+- Anomaly count is 0 but you expect violations — verify the posture_reports, threat_checks, and acl audit log data for the org exist within the 24-hour window.
+
+---
+
+## ST5 — AI Event Summary Card (plan-gated)
+
+**What it verifies:** The AI Event Summary card, when the `event_summarizer` feature is enabled and Groq is configured, generates a natural-language summary of recent security events by calling `POST /api/ai-assist` with `action: 'summarize_events'`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, call the AI endpoint directly:
+```bash
+curl -s -X POST https://login.quickztna.com/api/ai-assist \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"summarize_events\",\"org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+**Expected (Groq configured, feature enabled):**
+```json
+{
+  "success": true,
+  "data": {
+    "summary": "In the past 24 hours, your network recorded 2 machines online..."
+  }
+}
+```
+
+**Expected (Groq not configured):**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "AI_NOT_CONFIGURED",
+    "message": "AI features are not available. The platform administrator must configure the Groq API key..."
+  }
+}
+```
+
+**Expected (feature not enabled for plan):**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FEATURE_NOT_AVAILABLE"
+  }
+}
+```
+
+2. On the dashboard, if the feature is enabled, the AI Event Summary card appears. It shows:
+   - A "Generate" button if no summary has been generated yet
+   - A loading spinner during generation
+   - The generated summary text in a `whitespace-pre-wrap` block after generation
+   - A "Refresh" button to regenerate
+
+3. Click "Generate" (admin/owner only). Wait up to 10 seconds for the Groq API response.
+
+**Pass:** A text summary appears after clicking "Generate". The summary mentions recent event types (audit entries, threat checks, posture reports, JIT grants from the last 24h). Clicking "Refresh" replaces the previous summary.
+
+**Fail / Common issues:**
+- `AI_NOT_CONFIGURED` — Groq API key not set in platform settings. An admin with superadmin access must configure it via the platform settings page.
+- Card is absent entirely — the org plan does not include `event_summarizer`. This is expected on Free and Business plans.
+- Summary loading spinner never resolves — Groq API timed out or returned an error. The catch block silently swallows the error; check the API server logs.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Stale machine warning | Red warning card appears for online machines with `last_seen` older than 24h |
+| ST2 | Expiring auth key warning | Amber warning card appears for non-revoked keys expiring within 7 days |
+| ST3 | Security Digest card | Card renders with machine, compliance, and JIT data from `daily_digest` |
+| ST4 | Anomaly detection | Anomalies array populated correctly; badge colors match severity; no-anomaly state shows checkmark |
+| ST5 | AI Event Summary | "Generate" produces a Groq-powered summary; feature gate and AI_NOT_CONFIGURED errors handled |

@@ -1,0 +1,239 @@
+---
+title: "Plan Feature Comparison"
+topic: "Billing & Plans"
+order: 95
+machines: ["Win-A"]
+summary: "Verify the feature comparison table on the Billing page — category collapsing, active plan highlighting, mismatch warnings between the static matrix and live DB features, and accuracy of per-category feature counts."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The bottom section of the Billing page renders a `FeatureComparison` component (`BillingPage.tsx`). It displays a static feature matrix (`FEATURE_MATRIX` constant) cross-referenced against the live features returned by `POST /api/feature-check`.
+
+Key behaviours to test:
+
+**Static matrix** — `FEATURE_MATRIX` in `BillingPage.tsx` defines 10 categories and ~70 feature rows. Each row has boolean or string values for `free`, `business`, and `workforce`. String values (e.g., `"Unlimited"`, `"Read-only"`, `"90 days"`) render as text; booleans render as a checkmark or a dash.
+
+**Active plan column** — The column for the org's current plan is highlighted with a `bg-primary/10` background and a "Your Plan" label beneath the price.
+
+**Mismatch detection** — The `hasMismatch` function compares the static matrix against `dbFeatures` (from `feature-check`). If the matrix says a feature is included on the active plan but `dbFeatures` does not list it, an amber `AlertTriangle` icon appears next to the feature name. This catches DB/code drift.
+
+**Category counts** — Each category header shows `N/M` where N is the number of features available in that plan and M is the total rows in the category.
+
+**Collapsible categories** — All 10 categories start expanded. Clicking a category header toggles it collapsed/expanded. The chevron icon rotates when collapsed.
+
+**Features exclusive to each plan** (from `FEATURE_MATRIX`):
+
+| Feature | Free | Business | Workforce |
+|---|---|---|---|
+| DNS filtering | no | yes | yes |
+| Session recording | no | yes | yes |
+| AI Chat assistant | "Read-only" | yes | yes |
+| Remote desktop (WebRTC) | no | no | yes |
+| Remote shell (SSH) | no | no | yes |
+| Workforce analytics | no | no | yes |
+| Dedicated support + SLA | no | no | yes |
+| Audit logging | "90 days" | "90 days" | "90 days" |
+| ACL rules | "Unlimited" | "Unlimited" | "Unlimited" |
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — inspect the feature comparison table |
+
+---
+
+## ST1 — Active Plan Column is Highlighted
+
+**What it verifies:** The column for the org's current plan has a distinct visual highlight ("Your Plan" label, `bg-primary/10` background, `ring-1 ring-primary/30` border).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, navigate to `/billing` as an admin of a **free-plan** org.
+2. Scroll to the **Feature Comparison** card at the bottom of the page.
+3. Inspect the column headers: **Free**, **Business**, **Workforce**.
+
+**Expected:**
+- The **Free** column header has a highlighted background, ring border, and a small "Your Plan" label beneath "$0".
+- The **Business** and **Workforce** columns are plain (no highlight, no "Your Plan").
+
+4. Now switch to a browser session for a **Business-plan** org (or simulate by sending a `subscription.activated` webhook for business as described in the Upgrade Flow chapter).
+5. Reload `/billing` and check the column headers again.
+
+**Expected:** The **Business** column is now highlighted with "Your Plan". Free and Workforce are plain.
+
+**Pass:** Exactly one column shows "Your Plan" at all times. The highlighted column matches the plan returned by `feature-check`.
+
+**Fail / Common issues:**
+- No column highlighted — `dbPlan` from `feature-check` may not match any of the three plan IDs. Verify `feature-check` returns `"free"`, `"business"`, or `"workforce"` (not an old plan name like `"personal"` or `"enterprise"`).
+- Two columns highlighted — should not be possible unless there is a render bug. Hard-refresh the page.
+
+---
+
+## ST2 — String Feature Values Render as Text
+
+**What it verifies:** Feature rows with string values (not booleans) render the string content rather than a check or dash icon.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, scroll to the **Compliance & Governance** category in the feature comparison table.
+2. Find the **Audit logging** row.
+
+**Expected:** All three plan columns for "Audit logging" show the text `90 days` (not a checkmark, not a dash).
+
+3. Scroll to the **Access Control** category and find the **ACL rules** row.
+
+**Expected:** All three plan columns show `Unlimited` as text.
+
+4. Scroll to the **AI-Powered Features** category and find the **AI Chat assistant** row.
+
+**Expected:**
+- Free column shows `Read-only` as text.
+- Business column shows a green checkmark.
+- Workforce column shows a green checkmark.
+
+**Pass:** String values render as `<span>` text. Boolean `true` renders as a check icon. Boolean `false` renders as a small dash.
+
+**Fail / Common issues:**
+- Text shows as `true` or `false` literally — a `FeatureCell` component render issue. This would indicate the `typeof value === "string"` branch is not being reached.
+
+---
+
+## ST3 — Category Count Badges are Accurate
+
+**What it verifies:** Each collapsible category header shows the correct `N/M` count per plan column (N = features available in that plan, M = total rows in category).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, scroll to the **Endpoint Management (Workforce)** category header.
+
+**Expected count badges (reading across the three plan columns):**
+- Free: `1/9` (only "DNS analytics" is available — but note it is listed as `false` for free, so the count is `0/9`)
+
+Let's verify precisely. The Endpoint Management rows from `FEATURE_MATRIX`:
+
+| Feature | Free | Business | Workforce |
+|---|---|---|---|
+| Remote desktop (WebRTC) | false | false | true |
+| Remote shell (SSH) | false | false | true |
+| Remote commands | false | false | true |
+| Software inventory | false | false | true |
+| Activity tracking | false | false | true |
+| Workforce analytics | false | false | true |
+| Window tracking | false | false | true |
+| DNS analytics | false | **true** | true |
+| Device policy (MDM) | false | false | true |
+
+Expected counts:
+- Free: `0/9`
+- Business: `1/9`
+- Workforce: `9/9`
+
+2. Read the count badges in the Endpoint Management category header.
+
+**Expected:** Free shows `0/9`, Business shows `1/9`, Workforce shows `9/9`.
+
+3. Check the **Networking** category header.
+
+All 8 Networking features are available on all plans, so:
+- Free: `8/8`
+- Business: `8/8`
+- Workforce: `8/8`
+
+**Pass:** Count badges match the hand-counted values above for both categories.
+
+**Fail / Common issues:**
+- Count off by 1 — the FEATURE_MATRIX in source code may have been updated since this guide was written. Re-count manually in `BillingPage.tsx` to verify.
+
+---
+
+## ST4 — Collapsible Category Toggle
+
+**What it verifies:** Clicking a category header collapses and expands the feature rows. All categories start expanded. The chevron icon rotates 90 degrees when collapsed.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, scroll to any category header (e.g., **Security & Threat Detection**).
+2. Observe that the feature rows beneath it are visible (expanded by default).
+3. Click the category header.
+
+**Expected:** The feature rows collapse (height animates to 0). The chevron icon rotates to point right (i.e., `-rotate-90` CSS class applied).
+
+4. Click the category header again.
+
+**Expected:** The feature rows expand back. The chevron points down again.
+
+5. Collapse three different categories and scroll away. Scroll back.
+
+**Expected:** The collapsed state is preserved — the three categories remain collapsed. State is stored in component-local `openCategories` state (not persisted to localStorage or URL).
+
+6. Navigate away from the page and return.
+
+**Expected:** All categories are expanded again (state resets on unmount).
+
+**Pass:** Toggle works correctly. Chevron animates. State is not persisted across page navigations.
+
+**Fail / Common issues:**
+- Categories do not collapse — CSS `CollapsibleContent` animation may be broken in the current browser. Test in Chrome and Firefox.
+- All categories collapse at once when one is clicked — the `toggle` function must use the category name as the key, not an index. Check the source if this occurs.
+
+---
+
+## ST5 — Mismatch Warning Icon for DB/Matrix Divergence
+
+**What it verifies:** When `feature-check` returns a feature list that contradicts the static matrix for the active plan, an amber `AlertTriangle` icon appears next to the affected feature name.
+
+For example, if the org is on the Business plan but `dns_filtering` is missing from `dbFeatures` (perhaps a seeding issue), the "DNS filtering (14 threat feeds)" row in the matrix (which shows `true` for Business) would display the warning icon.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open DevTools → Network. Filter for `feature-check`.
+2. Navigate to `/billing` and inspect the `feature-check` response.
+3. Note the `data.features` array.
+4. Scroll to the Feature Comparison table and look for any amber triangle icons next to feature names.
+
+**Expected (clean state):** No amber triangle icons visible anywhere in the table. All features in `data.features` match what the static matrix says should be enabled for the current plan.
+
+5. To deliberately trigger a mismatch (optional, advanced):
+   - On the production server, remove a Business feature from `plan_features`:
+```bash
+ssh root@172.99.189.211 \
+  "docker exec quickztna-api-1 psql \$DATABASE_URL -c \
+  \"UPDATE plan_features SET enabled = false WHERE plan = 'business' AND feature = 'session_recording';\""
+```
+   - Flush the feature cache: `docker exec quickztna-valkey-1 valkey-cli DEL features:YOUR_ORG_ID`
+   - Reload `/billing` on a Business-plan org.
+
+**Expected:** The "Session recording" row in the Compliance & Governance category shows an amber `AlertTriangle` icon. Hovering over it shows the tooltip: "Feature availability may differ from displayed matrix — check plan settings".
+
+6. Restore the correct state:
+```bash
+ssh root@172.99.189.211 \
+  "docker exec quickztna-api-1 psql \$DATABASE_URL -c \
+  \"UPDATE plan_features SET enabled = true WHERE plan = 'business' AND feature = 'session_recording';\""
+# Flush cache again
+ssh root@172.99.189.211 \
+  "docker exec quickztna-valkey-1 valkey-cli DEL features:YOUR_ORG_ID"
+```
+
+**Pass (clean state):** No mismatch icons in normal operation. If mismatch is deliberately induced, the icon appears on the correct row and disappears after the DB is corrected and cache is flushed.
+
+**Fail / Common issues:**
+- Mismatch icons visible in normal operation — `plan_features` seeding may be incomplete. Run migration `035_new_pricing_tiers.sql` again or verify with:
+```bash
+curl -s -X POST https://login.quickztna.com/api/feature-check \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"YOUR_ORG_ID"}' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['features'])"
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Active plan column highlighted | Exactly one "Your Plan" label, matches feature-check plan |
+| ST2 | String values render as text | "90 days", "Unlimited", "Read-only" appear as text, not icons |
+| ST3 | Category count badges accurate | Endpoint Mgmt: Free 0/9, Business 1/9, Workforce 9/9 |
+| ST4 | Category collapse/expand toggle | Chevron rotates, rows hide/show, state resets on navigation |
+| ST5 | Mismatch warning icon | AlertTriangle shown when DB features diverge from static matrix |

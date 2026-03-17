@@ -1,0 +1,313 @@
+---
+title: "ACL Paths Shown as Edges"
+topic: "Topology Visualization"
+order: 87
+machines: ["Win-A"]
+summary: "Verify that ACL rules represent the permitted and denied traffic paths between machines, and that the ACL evaluator correctly resolves which paths exist in the network topology."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+In QuickZTNA, ACL rules define the logical edges of the network topology — the permitted (and denied) traffic paths between machines. The **ACLs page** (`/acls`) renders these paths as a list of rule cards, each showing:
+- Source (`source` field) — a machine UUID, tailnet IP, tag selector, group selector, or wildcard
+- Destination (`destination` field) — same selector types
+- Protocol (`protocol` field) — `tcp`, `udp`, or `*`
+- Ports (`ports` field) — port numbers or `*`
+- Action (`action` field) — `allow` or `deny`
+- Priority (`priority` field) — rules are evaluated in ascending order; lower number = higher precedence
+
+The `RuleCard` component in `ACLsPage` (`src/pages/ACLsPage.tsx`) renders each rule's source and destination in a monospace font so the selectors are clearly legible.
+
+Traffic path evaluation is performed by `POST /api/acl-evaluate`. The evaluator (`acl-evaluate.ts`) walks rules in ascending priority order and calls `matchesTarget()` for both source and destination. The function supports these selector types (in evaluation order):
+
+1. `*` — wildcard, matches any machine
+2. Exact machine UUID
+3. Exact tailnet IP (e.g. `100.64.0.5`)
+4. `tag:` prefix — matches machines with that tag
+5. `user:` prefix — matches machines owned by that user
+6. `group:` prefix — matches machines that are members of that segmentation group
+7. CIDR notation — matches machines whose tailnet IP falls in the range
+
+The first rule (lowest priority number) that matches both source and destination determines the verdict. If no rule matches, the default action is `deny`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser + API testing |
+
+**Prerequisite:** Win-A, Win-B, and Linux-C are all registered and online. At least one ACL rule exists. All three machines have known tailnet IPs.
+
+---
+
+## ST1 -- ACLs Page Renders All Rules with Source/Destination Paths
+
+**What it verifies:** The ACLs page correctly fetches and renders all ACL rules. Each rule card displays the source, destination, protocol, and port fields that define the traffic path.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/acls`.
+2. Observe the rule cards in the "Rules" tab (default view).
+
+**Expected:** Each rule card shows:
+- Rule name in the header
+- An `allow` (default badge) or `deny` (destructive red badge) action badge
+- A priority number (top right of card header)
+- Source label with monospace value (e.g. `*`, `100.64.0.5`, `group:engineering`)
+- Destination label with monospace value
+- Protocol label (e.g. `tcp`)
+- Ports label (e.g. `443,8080` or `*`)
+
+3. Verify via API that the rule count matches what is displayed:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID&select=name,source,destination,action,priority,enabled" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** The `data` array length equals the number of rule cards shown on the page.
+
+**Pass:** All ACL rules are rendered as cards. Source and destination selectors are visible in each card. API count matches UI count.
+
+---
+
+## ST2 -- Wildcard Source to Specific Destination Path
+
+**What it verifies:** An ACL rule with a wildcard source (`*`) creates a universal inbound path to a specific destination machine, allowing any machine in the tailnet to reach it.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a rule allowing all machines to reach Linux-C on port 22:
+```bash
+LINUX_C_IP="100.64.x.z"  # Replace with Linux-C actual tailnet IP
+
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"allow-all-to-linux-c-ssh\",
+    \"source\": \"*\",
+    \"destination\": \"$LINUX_C_IP\",
+    \"ports\": \"22\",
+    \"protocol\": \"tcp\",
+    \"action\": \"allow\",
+    \"priority\": 10,
+    \"enabled\": true
+  }" | python3 -m json.tool
+```
+
+**Expected:** Rule created with `"success": true`. The `data.id` field contains the new rule UUID.
+
+2. Get Win-A and Win-B machine IDs:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=id,name" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. Evaluate the path from Win-A to Linux-C:
+```bash
+WIN_A_ID="WIN_A_MACHINE_ID"
+LINUX_C_ID="LINUX_C_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_A_ID\",
+    \"destination_machine_id\": \"$LINUX_C_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** Result is `allow`. The matched rule is `allow-all-to-linux-c-ssh`.
+
+4. Evaluate the path from Win-B to Linux-C -- also expect `allow`.
+
+**Pass:** Both Win-A and Win-B can reach Linux-C. The wildcard source correctly acts as a universal inbound edge to Linux-C.
+
+---
+
+## ST3 -- Specific Machine-to-Machine Path Evaluation
+
+**What it verifies:** An ACL rule that uses exact tailnet IPs as source and destination creates a point-to-point path between exactly those two machines.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, get the tailnet IPs of Win-A and Win-B:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,tailnet_ip,id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Create a point-to-point rule from Win-A to Win-B on HTTPS:
+```bash
+WIN_A_IP="100.64.x.x"  # Replace with Win-A actual tailnet IP
+WIN_B_IP="100.64.x.y"  # Replace with Win-B actual tailnet IP
+
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"win-a-to-win-b-https\",
+    \"source\": \"$WIN_A_IP\",
+    \"destination\": \"$WIN_B_IP\",
+    \"ports\": \"443\",
+    \"protocol\": \"tcp\",
+    \"action\": \"allow\",
+    \"priority\": 20,
+    \"enabled\": true
+  }" | python3 -m json.tool
+```
+
+3. Evaluate the forward path (Win-A to Win-B):
+```bash
+WIN_A_ID="WIN_A_MACHINE_ID"
+WIN_B_ID="WIN_B_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_A_ID\",
+    \"destination_machine_id\": \"$WIN_B_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** Result is `allow`. Matched rule is `win-a-to-win-b-https`.
+
+4. Evaluate the reverse path (Win-B to Win-A) -- no matching rule exists for this direction:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_B_ID\",
+    \"destination_machine_id\": \"$WIN_A_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** Result is `deny` (default when no rule matches).
+
+**Pass:** Forward path is `allow`; reverse path is `deny`. ACL rules are directional, not bidirectional.
+
+---
+
+## ST4 -- Deny Rule Blocks a Path at Higher Priority
+
+**What it verifies:** A deny rule with a lower priority number (higher precedence) overrides a lower-precedence allow rule. This tests the priority ordering of path evaluation.
+
+**Steps:**
+1. Create a deny rule at priority 5 that blocks Win-B from reaching Linux-C:
+```bash
+WIN_B_IP="100.64.x.y"
+LINUX_C_IP="100.64.x.z"
+
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"deny-win-b-to-linux-c\",
+    \"source\": \"$WIN_B_IP\",
+    \"destination\": \"$LINUX_C_IP\",
+    \"ports\": \"*\",
+    \"protocol\": \"*\",
+    \"action\": \"deny\",
+    \"priority\": 5,
+    \"enabled\": true
+  }" | python3 -m json.tool
+```
+
+Note: The existing `allow-all-to-linux-c-ssh` rule has priority 10. This new deny rule has priority 5 and will be evaluated first.
+
+2. Evaluate Win-B to Linux-C:
+```bash
+WIN_B_ID="WIN_B_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_B_ID\",
+    \"destination_machine_id\": \"$LINUX_C_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** Result is `deny`. The deny rule at priority 5 matches before the allow rule at priority 10 is reached.
+
+3. Evaluate Win-A to Linux-C -- the deny rule specifies `$WIN_B_IP` as source, so Win-A is unaffected:
+```bash
+WIN_A_ID="WIN_A_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_A_ID\",
+    \"destination_machine_id\": \"$LINUX_C_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** Result is `allow` (matched by the priority-10 wildcard allow rule).
+
+4. Cleanup -- delete the deny rule:
+```bash
+DENY_RULE_ID="THE_DENY_RULE_UUID"
+
+curl -s -X DELETE "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID&id=eq.$DENY_RULE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+**Pass:** Win-B is denied while Win-A is allowed. Priority ordering governs path blocking. Cleanup succeeds.
+
+---
+
+## ST5 -- ACL Policy JSON View Shows All Paths
+
+**What it verifies:** The JSON tab on the ACLs page renders the complete policy document, giving a machine-readable representation of all edges in the network topology.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/acls`.
+2. Click the "JSON" tab (the `Code` icon tab trigger in `ACLsPage`).
+
+**Expected:** A JSON block renders showing all ACL rules as a structured array. Each rule object contains `name`, `source`, `destination`, `protocol`, `ports`, `action`, `priority`, and `enabled` fields.
+
+3. Verify the JSON is syntactically valid by copying it and running:
+```bash
+echo 'PASTE_JSON_HERE' | python3 -m json.tool
+```
+
+4. Count the rules in the JSON and confirm they match the number of rule cards in the "Rules" tab.
+
+5. Verify the `policyJson` state reflects the rules fetched via the API by cross-checking the rule names against:
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID&select=name,source,destination,action,priority" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Pass:** JSON tab shows valid JSON. Rule count in JSON matches "Rules" tab. Names, sources, and destinations in the JSON match the API response.
+
+**Fail / Common issues:**
+- JSON tab shows an empty array or `{}` -- no ACL rules exist. Create at least one rule via the "+" button on the Rules tab first.
+- JSON appears to be cut off -- the JSON view in the page uses a textarea; scroll down to see the full content.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | ACL rule list renders all paths | All rule cards visible; source/destination selectors shown; API count matches UI |
+| ST2 | Wildcard source creates universal inbound edge | Both Win-A and Win-B can reach Linux-C via `*` source rule |
+| ST3 | Point-to-point path is directional | Forward path `allow`; reverse path `deny` (no matching rule) |
+| ST4 | Deny rule at higher priority blocks path | Win-B denied; Win-A unaffected; priority ordering confirmed |
+| ST5 | JSON policy view represents all topology edges | Valid JSON, rule count matches, names match API |

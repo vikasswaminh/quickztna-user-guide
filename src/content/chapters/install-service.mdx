@@ -1,0 +1,330 @@
+---
+title: "Service Install (systemd/Windows service)"
+topic: "Client Install & Setup"
+order: 110
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that ztna install registers the system service on Linux (systemd unit quickztna-svc.service) and Windows (service named QuickZTNA), that the service starts on boot, and that ztna uninstall cleanly removes all service artifacts."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+`ztna install` and `ztna uninstall` are defined in `cmd_install.go`. The command installs the `quickztna-svc` daemon binary as a system service so that the VPN starts automatically on boot without requiring a logged-in user.
+
+### Linux (systemd)
+
+`ztna install` on Linux:
+1. Looks for `quickztna-svc` in the same directory as the `ztna` binary, then falls back to `PATH`.
+2. Copies `quickztna-svc` to `/usr/local/bin/quickztna-svc` if it is not already there.
+3. Writes the systemd unit file to `/etc/systemd/system/quickztna-svc.service`.
+4. Runs `systemctl daemon-reload`, `systemctl enable quickztna-svc.service`, `systemctl start quickztna-svc.service`.
+5. Prints "QuickZTNA service installed and started." and "Run 'ztna login' to authenticate."
+
+Config directory written to the unit `Environment=`: `/etc/quickztna`
+Service type in unit: `Type=simple`
+Restart policy: `Restart=on-failure`, `RestartSec=5`
+`LimitNOFILE`: `65535`
+
+`ztna uninstall` on Linux:
+- Runs `systemctl stop`, `systemctl disable`, removes the unit file, reloads daemon, removes `/usr/local/bin/quickztna-svc`.
+
+Unit file path: `/etc/systemd/system/quickztna-svc.service`
+Service binary path: `/usr/local/bin/quickztna-svc`
+
+### Windows (SCM)
+
+`ztna install` on Windows:
+1. Looks for `quickztna-svc.exe` in the same directory as `ztna.exe`.
+2. Runs `quickztna-svc.exe install` (the service binary registers itself with the Windows Service Control Manager).
+3. Runs `sc start QuickZTNA`.
+4. Prints "QuickZTNA service installed and started." and "Run 'ztna login' to authenticate."
+
+Windows service name: `QuickZTNA`
+Config directory: `%ProgramData%\QuickZTNA\` (set by `configDirectory()`)
+
+`ztna uninstall` on Windows:
+- Runs `sc stop QuickZTNA` and `sc delete QuickZTNA`.
+
+### Force Flag
+
+`ztna install --force` overwrites an existing service installation without returning an error. Without `--force`, if the unit file or service is already present, the command returns:
+```
+service already installed at /etc/systemd/system/quickztna-svc.service (use --force to overwrite)
+```
+
+## Your Test Setup
+
+| Machine | Role | Notes |
+|---------|------|-------|
+| <MachineRef name="Win-A" /> | Windows service tests | Run as Administrator for service operations |
+| <MachineRef name="Linux-C" /> | Linux systemd tests | Run as root or with sudo |
+
+---
+
+## ST1 — Linux systemd Service Install
+
+**Objective:** Confirm `ztna install` writes the correct unit file and starts the service.
+
+**Pre-condition:** `quickztna-svc` binary is present at `/usr/local/bin/quickztna-svc` (installed by the install script or built manually).
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" /> (as root):
+   ```bash
+   ztna install
+   ```
+2. Verify the unit file:
+   ```bash
+   cat /etc/systemd/system/quickztna-svc.service
+   ```
+3. Check service status:
+   ```bash
+   systemctl status quickztna-svc.service
+   ```
+4. Confirm the service is enabled for boot:
+   ```bash
+   systemctl is-enabled quickztna-svc.service
+   ```
+
+**Expected output of `ztna install`:**
+```
+QuickZTNA service installed and started.
+Run 'ztna login' to authenticate.
+```
+
+**Expected unit file contents (key fields):**
+```ini
+[Unit]
+Description=QuickZTNA Mesh VPN Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/quickztna-svc
+Restart=on-failure
+RestartSec=5
+Environment=QUICKZTNA_CONFIG_DIR=/etc/quickztna
+Environment=QUICKZTNA_LOG_LEVEL=info
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Expected `systemctl is-enabled` output:**
+```
+enabled
+```
+
+**Pass criteria:**
+- `ztna install` exits 0.
+- Unit file exists at `/etc/systemd/system/quickztna-svc.service` with all required fields.
+- `systemctl status quickztna-svc.service` shows `Active: active (running)`.
+- `systemctl is-enabled quickztna-svc.service` returns `enabled`.
+
+**Fail criteria:**
+- `systemctl start quickztna-svc.service` fails (check `journalctl -u quickztna-svc.service`).
+- Unit file is missing `Restart=on-failure` (no auto-restart on crash).
+- `LimitNOFILE` missing (WireGuard needs high file descriptor limits).
+
+---
+
+## ST2 — Linux Service Already Installed Guard
+
+**Objective:** Confirm that re-running `ztna install` without `--force` returns a clear error.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" /> (service already installed from ST1):
+   ```bash
+   ztna install
+   echo "Exit code: $?"
+   ```
+2. Then with `--force`:
+   ```bash
+   ztna install --force
+   echo "Exit code: $?"
+   ```
+
+**Expected output without `--force`:**
+```
+service already installed at /etc/systemd/system/quickztna-svc.service (use --force to overwrite)
+Exit code: 1
+```
+
+**Expected output with `--force`:**
+```
+QuickZTNA service installed and started.
+Run 'ztna login' to authenticate.
+Exit code: 0
+```
+
+**Pass criteria:**
+- Without `--force`: non-zero exit code and descriptive error message.
+- With `--force`: exits 0, service is restarted cleanly.
+
+**Fail criteria:**
+- Without `--force`: command silently overwrites existing service (no error guard).
+- With `--force`: command fails instead of overwriting.
+
+---
+
+## ST3 — Linux Service Survives Reboot
+
+**Objective:** Confirm the service starts automatically on boot (the `enable` step in `ztna install`).
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, with service installed and running:
+   ```bash
+   systemctl is-enabled quickztna-svc.service
+   # Should return: enabled
+   ```
+2. Reboot the machine:
+   ```bash
+   sudo reboot
+   ```
+3. After reboot, SSH back in and check:
+   ```bash
+   systemctl status quickztna-svc.service
+   ```
+
+**Expected output after reboot:**
+```
+Active: active (running) since ...
+```
+
+**Pass criteria:**
+- Service is in `active (running)` state within 30 seconds of boot (after `network-online.target` is reached).
+- `After=network-online.target` ensures it does not start before the network is up.
+
+**Fail criteria:**
+- Service is `inactive (dead)` after reboot.
+- Service failed to start (check `journalctl -u quickztna-svc.service --boot`).
+- `quickztna-svc` binary was not preserved at `/usr/local/bin/quickztna-svc` after reboot.
+
+---
+
+## ST4 — Linux ztna uninstall Cleanup
+
+**Objective:** Confirm `ztna uninstall` stops the service, removes the unit file, and removes the service binary.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" /> (as root), with service running:
+   ```bash
+   ztna uninstall
+   ```
+2. Verify all artifacts are removed:
+   ```bash
+   systemctl status quickztna-svc.service
+   ls -la /etc/systemd/system/quickztna-svc.service 2>&1
+   ls -la /usr/local/bin/quickztna-svc 2>&1
+   systemctl is-enabled quickztna-svc.service 2>&1
+   ```
+
+**Expected output of `ztna uninstall`:**
+```
+QuickZTNA service removed.
+```
+
+**Expected output of verification commands:**
+```
+Unit quickztna-svc.service could not be found.
+ls: cannot access '/etc/systemd/system/quickztna-svc.service': No such file or directory
+ls: cannot access '/usr/local/bin/quickztna-svc': No such file or directory
+Failed to get unit file state for quickztna-svc.service: No such file or directory
+```
+
+**Pass criteria:**
+- `ztna uninstall` exits 0.
+- Unit file `/etc/systemd/system/quickztna-svc.service` is deleted.
+- Binary `/usr/local/bin/quickztna-svc` is deleted.
+- `systemctl daemon-reload` was called (unit no longer visible to systemd).
+- The `ztna` CLI binary at `/usr/local/bin/ztna` is NOT removed (only the service binary and unit are cleaned up).
+
+**Fail criteria:**
+- Unit file or service binary remains after uninstall.
+- `ztna` CLI binary is accidentally deleted.
+- `systemctl status quickztna-svc.service` still shows the unit as known.
+
+---
+
+## ST5 — Windows Service Install and Uninstall
+
+**Objective:** Confirm `ztna install` and `ztna uninstall` correctly register and remove the `QuickZTNA` Windows service.
+
+**Steps:**
+
+1. Open an elevated (Administrator) PowerShell on <MachineRef name="Win-A" />.
+2. Ensure `quickztna-svc.exe` is present alongside `ztna.exe`:
+   ```powershell
+   Get-Item "$env:LOCALAPPDATA\Programs\QuickZTNA\ztna-svc.exe"
+   ```
+3. Install the service:
+   ```powershell
+   ztna install
+   ```
+4. Verify the service:
+   ```powershell
+   Get-Service -Name QuickZTNA
+   sc.exe qc QuickZTNA
+   ```
+5. Uninstall the service:
+   ```powershell
+   ztna uninstall
+   ```
+6. Verify the service is gone:
+   ```powershell
+   Get-Service -Name QuickZTNA -ErrorAction SilentlyContinue
+   ```
+
+**Expected output of `ztna install`:**
+```
+QuickZTNA service installed and started.
+Run 'ztna login' to authenticate.
+```
+
+**Expected output of `sc.exe qc QuickZTNA` (key fields):**
+```
+[SC] QueryServiceConfig SUCCESS
+SERVICE_NAME: QuickZTNA
+        TYPE               : 10  WIN32_OWN_PROCESS
+        START_TYPE         : 2   AUTO_START
+        BINARY_PATH_NAME   : C:\Users\...\AppData\Local\Programs\QuickZTNA\ztna-svc.exe
+```
+
+**Expected output of `ztna uninstall`:**
+```
+QuickZTNA service removed.
+```
+
+**Expected output after uninstall (no service found):**
+```
+(empty — Get-Service returns nothing)
+```
+
+**Pass criteria:**
+- Service is registered with `AUTO_START` (starts on boot).
+- Service is in `Running` state immediately after `ztna install`.
+- After `ztna uninstall`: `Get-Service QuickZTNA` returns empty with no error (service fully deleted).
+- `ztna.exe` and `ztna-svc.exe` remain in the install directory after `ztna uninstall` (only the SCM registration is removed, not the binaries).
+
+**Fail criteria:**
+- `ztna install` fails: "quickztna-svc not found in ... or PATH" — means service binary was not downloaded by the install script.
+- Service `START_TYPE` is `DEMAND_START` rather than `AUTO_START` (will not start on boot).
+- `ztna.exe` is deleted by `ztna uninstall` (only the SCM registration should be removed).
+
+---
+
+## Summary
+
+| Sub-test | Machine | What is verified | Pass signal |
+|----------|---------|-----------------|-------------|
+| ST1 | Linux-C | systemd unit written and service started | Unit file correct; `systemctl status` active |
+| ST2 | Linux-C | Guard against double-install without `--force` | Non-zero exit without `--force`; success with it |
+| ST3 | Linux-C | Service survives reboot | Active after reboot; `After=network-online.target` |
+| ST4 | Linux-C | `ztna uninstall` removes all artifacts | Unit file, binary deleted; `ztna` CLI untouched |
+| ST5 | Win-A | Windows service install and uninstall | `AUTO_START`; fully removed after uninstall |

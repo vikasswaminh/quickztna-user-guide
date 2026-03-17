@@ -1,0 +1,271 @@
+---
+title: "API Key Scope Enforcement"
+topic: "API Keys & Programmatic Access"
+order: 98
+machines: ["Win-A"]
+summary: "Verify that API key scopes are stored as a JSONB array and that scope metadata is returned correctly; test rate limiting enforcement via Valkey."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+API keys carry a `scopes` field stored as a JSONB array in the `api_keys` table. The `verifyApiKey` function in `backend/src/handlers/api-key-auth.ts` returns the scopes to callers, and individual handlers are responsible for checking whether the key's scopes permit the requested operation. This chapter tests that scopes are stored correctly, returned with the key context, and that the rate limiter (`checkRateLimit`) blocks excessive requests.
+
+Key facts from source code:
+
+- **Scopes field:** `JSONB NOT NULL DEFAULT '[]'::jsonb` in the `api_keys` table
+- **Valid scope values:** `read`, `write`, `admin`, `machines`, `dns`, `acl`, `billing`, `audit`
+- **Empty scopes = full access:** as shown in `APIKeysPage.tsx` line 128 — `"No scopes = full access"`
+- **verifyApiKey return value:** `{ org_id, scopes: string[], key_id }` — scopes parsed via `parseJsonField(record.scopes, [])`
+- **Rate limiting:** `checkRateLimit(env.RATE_LIMITS, 'apikey:<key_id>', rpm, 60)` — returns false when exceeded; API key request returns null (treated as 401 by callers)
+- **Rate limit default:** 60 requests per minute if `rate_limit_rpm` is not set
+- **Scope options in UI:** `machines:read`, `machines:write`, `acls:read`, `acls:write`, `dns:read`, `dns:write`, `users:read`, `users:write`, `audit:read`, `settings:read`, `settings:write` (UI uses colon-separated compound values; backend `create_api_key` validates against bare scope names: `read`, `write`, `admin`, `machines`, `dns`, `acl`, `billing`, `audit`)
+
+Note: The UI (`APIKeysPage.tsx`) inserts compound scope strings like `machines:read` directly into the `scopes` JSONB array. The `create_api_key` handler validates against the shorter list of bare scope names. Both paths write to the same `api_keys.scopes` column.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | API calls to inspect scope storage and rate limiting |
+
+Prerequisites: You have a valid JWT token (`TOKEN`) and org ID (`ORG_ID`).
+
+---
+
+## ST1 — Scopes Are Stored as JSONB Array
+
+**What it verifies:** When creating a key with scopes, the `scopes` field is persisted as a JSON array and returned correctly by the CRUD API.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a key with three scopes:
+
+```bash
+TOKEN="YOUR_JWT_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"scoped-key-test\",
+    \"scopes\": [\"machines\", \"dns\", \"read\"],
+    \"expiry_days\": 30
+  }" | python3 -m json.tool
+```
+
+Save the returned `id` as `KEY_ID`.
+
+2. Query the key from the database via CRUD:
+
+```bash
+KEY_ID="<uuid from step 1>"
+
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&id=eq.$KEY_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** The `scopes` field is a JSON array: `["machines", "dns", "read"]`.
+
+3. Create a key with no scopes:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"no-scope-key\",
+    \"expiry_days\": 7
+  }" | python3 -m json.tool
+```
+
+Query via CRUD — the `scopes` field should be `[]` (empty array), not null.
+
+**Pass:** Three-scope key has `scopes: ["machines", "dns", "read"]`. No-scope key has `scopes: []`. Neither is null.
+
+**Fail / Common issues:**
+- `scopes` is null instead of `[]` — the default `'[]'::jsonb` in the DB schema would not have applied if the column was not included in the INSERT. The handler at `api-key-auth.ts` line 125 explicitly passes `JSON.stringify(scopes || [])`.
+
+---
+
+## ST2 — Invalid Scopes Are Rejected Before Storage
+
+**What it verifies:** The handler validates each scope value against the allowed list before inserting. No partial inserts occur if any scope is invalid.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, attempt a key with one valid and one invalid scope:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"partial-bad-scope\",
+    \"scopes\": [\"machines\", \"INVALID_SCOPE\", \"dns\"]
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 400):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_SCOPES",
+    "message": "Invalid scopes: INVALID_SCOPE. Valid: read, write, admin, machines, dns, acl, billing, audit"
+  }
+}
+```
+
+2. Verify no key named `"partial-bad-scope"` was created:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&revoked=eq.false" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Confirm `"partial-bad-scope"` does not appear in the results.
+
+**Pass:** HTTP 400 returned. No row inserted. The `"partial-bad-scope"` key does not exist.
+
+**Fail / Common issues:**
+- The key was inserted despite the invalid scope — the validation check at `api-key-auth.ts` lines 107–112 runs before the INSERT; if it is passing, the scope filter is broken.
+
+---
+
+## ST3 — All Eight Valid Scopes Are Accepted
+
+**What it verifies:** Each of the eight valid scope values — `read`, `write`, `admin`, `machines`, `dns`, `acl`, `billing`, `audit` — is accepted individually and in combination.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a key with all eight scopes:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"all-scopes-key\",
+    \"scopes\": [\"read\", \"write\", \"admin\", \"machines\", \"dns\", \"acl\", \"billing\", \"audit\"],
+    \"expiry_days\": 1
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 201):** Key created successfully.
+
+2. Query via CRUD and verify all eight scopes are stored:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&revoked=eq.false" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Locate the `"all-scopes-key"` row and confirm `scopes` contains all eight values.
+
+**Pass:** HTTP 201. CRUD query shows all eight scopes in the array.
+
+**Fail / Common issues:**
+- Only some scopes appear — the array was serialized or deserialized incorrectly.
+
+---
+
+## ST4 — Rate Limiter Blocks Excessive Requests
+
+**What it verifies:** When a key's `rate_limit_rpm` is set to a low value (e.g., 5), the Valkey `checkRateLimit` function stops authenticating the key after that many requests within one minute.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a key with a very low rate limit (note: minimum value configurable via the API directly is 1):
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"rate-limit-test-key\",
+    \"rate_limit_rpm\": 5,
+    \"expiry_days\": 1
+  }" | python3 -m json.tool
+```
+
+Save the `key` value as `RATE_KEY`.
+
+2. Make 5 requests (should all succeed):
+
+```bash
+RATE_KEY="qztna_<your key>"
+
+for i in $(seq 1 5); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    "https://login.quickztna.com/api/terraform/machines" \
+    -H "X-Api-Key: $RATE_KEY")
+  echo "Request $i: HTTP $STATUS"
+done
+```
+
+3. Immediately make a 6th request:
+
+```bash
+curl -s "https://login.quickztna.com/api/terraform/machines" \
+  -H "X-Api-Key: $RATE_KEY" | python3 -m json.tool
+```
+
+**Expected behavior:** The first 5 requests return HTTP 200. After the rate limit is exceeded, `verifyApiKey` returns null (rate limited), causing the Terraform handler to return HTTP 401 with `"Invalid or revoked API key"`. (The handler does not distinguish between "not found" and "rate limited" in its 401 response — both surface the same message.)
+
+**Pass:** The first 5 requests succeed. The 6th request (within the same minute window) returns HTTP 401.
+
+**Fail / Common issues:**
+- All requests succeed indefinitely — the Valkey rate limiter may not be running or `checkRateLimit` may be returning true regardless. Verify Valkey is accessible from the API container.
+- Requests fail after fewer than 5 — previous requests against this key in this minute window may have already consumed part of the quota. Wait for the next minute and repeat.
+
+---
+
+## ST5 — Scope Metadata Visible in Dashboard
+
+**What it verifies:** The `APIKeysPage` renders scopes as badge chips. Empty scopes shows "Full Access". Keys with more than 3 scopes show a `+N` overflow badge.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, navigate to `https://login.quickztna.com/api-keys`.
+
+2. Locate the key named `"no-scope-key"` (created in ST1). Verify it shows a single badge labeled "Full Access" (grey/secondary variant).
+
+3. Locate the key named `"scoped-key-test"` (created in ST1, 3 scopes). Verify it shows 3 individual scope badges (`machines`, `dns`, `read`) with no overflow badge.
+
+4. Locate the key named `"all-scopes-key"` (created in ST3, 8 scopes). Verify it shows 3 scope badges plus a `+5` overflow badge (the UI caps visible badges at 3 per `APIKeysPage.tsx` line 187).
+
+5. Verify the rate limit column shows the correct values:
+   - `"rate-limit-test-key"` from ST4 shows `5/min`
+   - `"scoped-key-test"` shows `60/min` (the default)
+
+**Pass:** "Full Access" badge for empty scopes. Correct scope badges for scoped keys. `+N` overflow for keys with more than 3 scopes. Rate limits displayed correctly.
+
+**Fail / Common issues:**
+- All keys show "Full Access" regardless of scopes — the `scopes` JSONB is being returned as a string from the DB instead of a parsed array. Check the CRUD response format.
+- Overflow badge shows wrong number — UI slices at index 3 and counts `scopes.length - 3`; verify the full scopes array has 8 entries.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Scopes stored as JSONB array | `scopes` is `["machines","dns","read"]`; no-scope key has `[]` not null |
+| ST2 | Invalid scopes rejected atomically | HTTP 400 `INVALID_SCOPES`; no row inserted |
+| ST3 | All 8 valid scope values accepted | HTTP 201; all 8 scopes in DB |
+| ST4 | Rate limiter blocks after rpm threshold | Requests 1–5 succeed; request 6 in same minute returns 401 |
+| ST5 | Dashboard renders scope badges correctly | "Full Access" for empty; badges + overflow for scoped keys |

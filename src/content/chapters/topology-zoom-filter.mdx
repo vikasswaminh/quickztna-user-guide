@@ -1,0 +1,247 @@
+---
+title: "Topology Zoom & Filter"
+topic: "Topology Visualization"
+order: 90
+machines: ["Win-A"]
+summary: "Verify that the Machines page filter and search controls correctly narrow the visible machine inventory, providing a focused view of a subset of the network topology."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Since QuickZTNA uses the Machines page (`/machines`) as its primary topology view (the `/topology` route redirects here), the "zoom and filter" equivalent is the set of filter controls rendered above the machine table in `MachinesPage` (`src/pages/MachinesPage.tsx`).
+
+The page renders four filter controls:
+
+1. **Search box** — filters by machine name (case-insensitive substring) or tailnet IP (substring). Implemented as `m.name.toLowerCase().includes(search.toLowerCase()) || String(m.tailnet_ip || "").includes(search)`.
+
+2. **Status filter** (Select dropdown) — values: `all`, `online`, `offline`, `pending`, `quarantined`. Maps to the `status` field on each machine.
+
+3. **OS filter** (Select dropdown) — values: `all`, `linux`, `macos`, `windows`, `ios`, `android`. Maps to the `os` field.
+
+4. **Tag filter** (Select dropdown) — dynamically populated from all unique tags across all machines in the org. Only shown when at least one machine has a tag. Maps to the `tags` array field.
+
+All four filters are combined with AND logic in the `filtered` array computation. The resulting `filtered` array is then split into `pendingMachines` (status = `pending`) and `activeMachines` (all other statuses).
+
+URL state is used only for the active tab (`tab` query parameter). Filter state is local React state — filters reset on page reload.
+
+The machine count shown in the subtitle ("N devices in your network") always reflects the unfiltered `machines` array, not the filtered count.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser — filter interaction, API testing |
+
+**Prerequisite:** Win-A, Win-B (Windows), and Linux-C (Linux) are all registered. At least Win-A is online. Win-B and/or Linux-C may be offline for some sub-tests.
+
+---
+
+## ST1 -- Search Filter Narrows Visible Machines by Name
+
+**What it verifies:** Typing in the search box filters the table in real-time, showing only machines whose name or tailnet IP contains the search string.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+
+2. Confirm all 3 machines are visible in the table (Win-A, Win-B, Linux-C).
+
+3. In the search box (left of the filter row, with a magnifying glass icon), type "Win".
+
+**Expected:** Only Win-A and Win-B rows are visible. Linux-C row disappears.
+
+4. Clear the search and type "Linux".
+
+**Expected:** Only Linux-C row is visible. Win-A and Win-B rows disappear.
+
+5. Type a partial tailnet IP, e.g., "100.64".
+
+**Expected:** All 3 machines appear (all have `100.64.x.x` tailnet IPs).
+
+6. Type a highly specific IP suffix that matches only one machine (e.g., the last octet of Linux-C's IP).
+
+**Expected:** Only Linux-C is shown.
+
+7. Type a string that matches nothing (e.g., "zzzznotamachine").
+
+**Expected:** Table shows 0 rows in the active machines section. No error is shown; the empty state text "No machines found. Register your first device to get started." appears.
+
+8. Clear the search box.
+
+**Expected:** All 3 machines reappear immediately.
+
+**Pass:** Search filter correctly narrows rows by name and tailnet IP. Empty search restores all rows. Non-matching search shows empty state.
+
+---
+
+## ST2 -- Status Filter Shows Only Machines of Selected Status
+
+**What it verifies:** The status dropdown filters machines by their `status` field, isolating online, offline, pending, or quarantined machines.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ensure at least one machine is `online` (Win-A itself) and at least one is `offline` (e.g., Win-B with `ztna down`).
+
+2. Open the Status dropdown (second filter control, labelled "All Status").
+
+3. Select "Online".
+
+**Expected:** Only machines with `status = "online"` appear. Win-A row is visible. Win-B row disappears (if Win-B is offline).
+
+4. Select "Offline".
+
+**Expected:** Only machines with `status = "offline"` appear. Win-A row disappears. Win-B row is visible (if offline).
+
+5. Select "All Status" to restore the full list.
+
+**Expected:** All 3 machines are visible again.
+
+6. Verify the API returns the expected counts for each status:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Count the machines per status in the API response and verify the filter matches.
+
+**Pass:** Status filter correctly isolates machines by status. Switching back to "All Status" restores the full list.
+
+---
+
+## ST3 -- OS Filter Isolates Windows and Linux Machines
+
+**What it verifies:** The OS filter narrows the topology view to machines of a specific operating system, useful for OS-specific policy reviews.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, with all machines visible, open the OS dropdown (third filter control, labelled "All OS").
+
+2. Select "Windows".
+
+**Expected:** Only Win-A and Win-B rows are visible (both `os = "windows"`). Linux-C row disappears.
+
+3. Select "Linux".
+
+**Expected:** Only Linux-C row is visible (`os = "linux"`). Win-A and Win-B rows disappear.
+
+4. Select "macOS".
+
+**Expected:** 0 rows visible (no macOS machines in the test setup). Empty state text appears.
+
+5. Select "All OS" to restore.
+
+**Expected:** All 3 machines visible.
+
+6. Verify OS values via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,os" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Win-A and Win-B have `"os": "windows"`, Linux-C has `"os": "linux"`.
+
+**Pass:** OS filter correctly partitions the topology by operating system. Non-existent OS selection shows empty state without error.
+
+---
+
+## ST4 -- Tag Filter Shows Only Tagged Machines
+
+**What it verifies:** After assigning tags to machines, the tag filter dropdown appears and correctly narrows the table to machines bearing the selected tag.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, assign a tag to Linux-C via the API:
+```bash
+LINUX_C_ID="LINUX_C_MACHINE_ID"
+
+curl -s -X PATCH "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&id=eq.$LINUX_C_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"tags\": [\"prod\", \"linux-server\"]}" | python3 -m json.tool
+```
+
+**Expected:** Response with `"success": true`.
+
+2. Reload `https://login.quickztna.com/machines`.
+
+**Expected:** A fourth filter dropdown labelled "All Tags" is now visible (the tag filter only renders when `allTags.length > 0`). The Linux-C row shows "prod" and "linux-server" tag badges under its name.
+
+3. Open the Tag dropdown and select "prod".
+
+**Expected:** Only Linux-C row is visible (it is the only machine with the "prod" tag). Win-A and Win-B rows disappear.
+
+4. Select "linux-server" from the tag dropdown.
+
+**Expected:** Only Linux-C row visible.
+
+5. Select "All Tags" to restore the full list.
+
+**Expected:** All 3 machines visible.
+
+6. Combine tag filter with OS filter: select OS "Linux" AND Tag "prod".
+
+**Expected:** Only Linux-C is visible (it is both Linux and has "prod" tag).
+
+7. Cleanup -- remove tags from Linux-C:
+```bash
+curl -s -X PATCH "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&id=eq.$LINUX_C_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"tags\": []}" | python3 -m json.tool
+```
+
+**Pass:** Tag filter appears after tags are added. Single-tag filter correctly isolates tagged machines. Combined OS + tag filter applies AND logic. Cleanup removes tags.
+
+---
+
+## ST5 -- Combined Filters and Tab Navigation Scope the Topology View
+
+**What it verifies:** Multiple filters apply simultaneously with AND logic. Switching between tabs (All Machines, Subnets, Setup, DNS) does not reset filter state, and the tab state is persisted in the URL.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+
+2. Set the Status filter to "Online" and OS filter to "Windows" simultaneously.
+
+**Expected:** Only machines that are BOTH `online` AND `os = "windows"` are shown. For the standard test setup with Win-A online and Win-B offline, only Win-A should appear.
+
+3. Also type "Win" in the search box.
+
+**Expected:** All three filters are active simultaneously. Only machines matching all three conditions are shown.
+
+4. Note the current URL -- it should be `https://login.quickztna.com/machines` (no tab query param, since "machines" is the default tab).
+
+5. Click the "Subnets" tab.
+
+**Expected:** URL updates to `https://login.quickztna.com/machines?tab=subnets`. The Subnet Routes content loads in a Suspense boundary. The filter controls are not shown on this tab (the filter row is inside the "machines" TabsContent).
+
+6. Click the "DNS" tab.
+
+**Expected:** URL updates to `https://login.quickztna.com/machines?tab=dns`. DNS records management loads.
+
+7. Click the "All Machines" tab to return to the machine table.
+
+**Expected:** The filter state (Status = Online, OS = Windows, search = "Win") is preserved from before -- filter state is local React state and persists across tab switches within the same page session.
+
+8. Reload the page.
+
+**Expected:** All filters reset to defaults (Status = All, OS = All, search empty). Only the tab (`tab=machines`) is not persisted in URL; it resets to the default "machines" tab.
+
+**Pass:** Multiple filters apply with AND logic. Tab switching preserves filter state within a session. Page reload resets filter state (filters are not URL-persisted).
+
+**Fail / Common issues:**
+- Tag filter dropdown not appearing after adding tags -- reload the page. The `allTags` list is derived from the fetched machine data; it updates on the next fetch.
+- Combined filters show unexpected results -- each filter condition must ALL be true for a row to appear. If a machine appears unexpectedly, check its status, OS, and tag fields via the API.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Search filter narrows by name and IP | Name/IP substring match; empty search restores all; no-match shows empty state |
+| ST2 | Status filter isolates by machine status | Online, offline, pending, quarantined correctly filtered; "All" restores full list |
+| ST3 | OS filter partitions by operating system | Windows shows Win-A + Win-B; Linux shows Linux-C; non-existent OS shows empty |
+| ST4 | Tag filter shows only tagged machines | Tag dropdown appears after tagging; single and combined tag/OS filters work |
+| ST5 | Combined filters apply AND logic; tabs preserve state | All three filters simultaneously applied; tab switch preserves filter state; reload resets filters |

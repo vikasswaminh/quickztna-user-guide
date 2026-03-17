@@ -1,0 +1,230 @@
+---
+title: "Linux Install via One-Liner"
+topic: "Client Install & Setup"
+order: 106
+machines: ["Linux-C"]
+summary: "Verify that the install.sh one-liner correctly detects the OS and architecture, downloads the ztna binary to /usr/local/bin, runs a post-install service setup, and prints the expected success message."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Linux installer lives at `https://login.quickztna.com/install.sh` and is served as a static file from the `public/` directory of the web app. When piped to `sh`, it performs the following sequence:
+
+1. Detects OS via `uname -s` and architecture via `uname -m` (supports `amd64` and `arm64`).
+2. Downloads the `ztna` binary from `https://login.quickztna.com/api/releases/latest/linux/amd64` (or the versioned URL `https://login.quickztna.com/api/releases/vVERSION/quickztna-VERSION-linux-amd64` when `ZTNA_VERSION` is set).
+3. Optionally downloads `quickztna-svc` alongside it when a pinned version is specified.
+4. Verifies a SHA-256 checksum if a `.sha256` sidecar file is available.
+5. Installs the binary to `/usr/local/bin/ztna` (using `sudo` if the directory is not writable by the current user).
+6. Runs `ztna install` to register the systemd unit `quickztna-svc.service`.
+7. Prints either "ZTNA installed. Run 'ztna login' to authenticate." (no key) or "Connected to ZTNA Network. Please ask admin to approve your machine for further VPN access." (key provided via `ZTNA_AUTH_KEY`).
+
+The installer is completely silent by default — `info()` and `ok()` are no-ops; only `fail()` writes to stderr.
+
+Install path: `/usr/local/bin/ztna`
+Service binary path: `/usr/local/bin/quickztna-svc`
+Service unit: `/etc/systemd/system/quickztna-svc.service`
+Config directory created by `ztna install`: `/etc/quickztna`
+
+## Your Test Setup
+
+| Machine | Role | Notes |
+|---------|------|-------|
+| <MachineRef name="Linux-C" /> | Target install machine | Cloud/DO Linux, run as root or sudo-capable user |
+
+---
+
+## ST1 — Clean Install, No Auth Key
+
+**Objective:** Confirm the one-liner installs the binary and prints the correct final message.
+
+**Steps:**
+
+1. SSH into <MachineRef name="Linux-C" />.
+2. Confirm `ztna` is not present:
+   ```bash
+   which ztna 2>/dev/null || echo "not found"
+   ```
+3. Run the installer:
+   ```bash
+   curl -fsSL https://login.quickztna.com/install.sh | sh
+   ```
+4. After completion, check the installed binary:
+   ```bash
+   which ztna
+   ztna version
+   ```
+
+**Expected output (last line of installer):**
+```
+ZTNA installed. Run 'ztna login' to authenticate.
+```
+
+**Expected output of `ztna version`:**
+```
+ztna version 3.2.13 (built <timestamp>, linux/amd64)
+```
+
+**Pass criteria:**
+- Exit code 0 from the curl pipe.
+- `which ztna` returns `/usr/local/bin/ztna`.
+- `ztna version` prints a version string beginning with `ztna version`.
+- Final printed line matches "ZTNA installed. Run 'ztna login' to authenticate."
+
+**Fail criteria:**
+- Installer exits with non-zero code.
+- `ztna` not found in PATH after install.
+- Any line beginning with `✗` printed to stderr.
+
+---
+
+## ST2 — Binary Permissions and Ownership
+
+**Objective:** Confirm the installed binary has correct executable permissions.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, after ST1 completes:
+   ```bash
+   ls -la /usr/local/bin/ztna
+   stat -c "%a %U %G" /usr/local/bin/ztna
+   ```
+
+**Expected output:**
+```
+-rwxr-xr-x  1 root root  ...  /usr/local/bin/ztna
+755 root root
+```
+
+**Pass criteria:**
+- Permissions are `755` (octal).
+- Owner is `root`.
+- File is non-zero in size (at least 10 MB for the Go binary).
+
+**Fail criteria:**
+- Permissions less restrictive than `755` (e.g., `777`).
+- File is 0 bytes (download truncated silently).
+- File not executable by other users.
+
+---
+
+## ST3 — Architecture Detection (arm64)
+
+**Objective:** Confirm the installer selects the correct architecture binary for ARM machines.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, check the actual architecture:
+   ```bash
+   uname -m
+   ```
+2. If the machine is `x86_64`, simulate an arm64 environment by inspecting the download URL logic directly:
+   ```bash
+   curl -fsSL https://login.quickztna.com/install.sh | grep -A5 'detect_arch'
+   ```
+3. Confirm the script maps `aarch64` and `arm64` to `arm64`, and `x86_64` to `amd64`.
+
+**Expected output from grep:**
+```
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   echo "amd64" ;;
+    aarch64|arm64)   echo "arm64" ;;
+```
+
+**Pass criteria:**
+- Script contains explicit mappings for both `aarch64` and `arm64` to `arm64`.
+- Script contains `x86_64|amd64` mapping to `amd64`.
+- An unsupported architecture causes `fail "Unsupported architecture: ..."` (script exits non-zero).
+
+**Fail criteria:**
+- ARM mapping is absent — would cause wrong binary download on Raspberry Pi or ARM cloud VMs.
+
+---
+
+## ST4 — Re-install Idempotency
+
+**Objective:** Confirm running the installer a second time over an existing install succeeds cleanly.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, with `ztna` already installed from ST1:
+   ```bash
+   curl -fsSL https://login.quickztna.com/install.sh | sh
+   echo "Exit code: $?"
+   ztna version
+   ```
+
+**Expected behaviour:**
+
+The script stops any running `ztna` daemon and uninstalls the existing service before overwriting the binary:
+```bash
+"$BINARY_NAME" down >/dev/null 2>&1 || true
+"$BINARY_NAME" uninstall >/dev/null 2>&1 || true
+```
+
+The re-install should complete without error.
+
+**Expected output (final line):**
+```
+ZTNA installed. Run 'ztna login' to authenticate.
+```
+
+**Pass criteria:**
+- Exit code 0.
+- `ztna version` still reports a valid version string after re-install.
+- No "permission denied" or "file busy" errors.
+
+**Fail criteria:**
+- Non-zero exit code.
+- Error about existing file being locked or busy.
+- Binary replaced with a zero-byte file.
+
+---
+
+## ST5 — Pinned Version Install via ZTNA_VERSION
+
+**Objective:** Confirm that setting `ZTNA_VERSION` downloads the versioned binary from the release API path.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />:
+   ```bash
+   ZTNA_VERSION=3.2.13 curl -fsSL https://login.quickztna.com/install.sh | sh
+   ```
+2. After completion:
+   ```bash
+   ztna version
+   ```
+
+**Expected download URL used by script (verify by inspecting the script):**
+```
+https://login.quickztna.com/api/releases/v3.2.13/quickztna-3.2.13-linux-amd64
+```
+
+**Expected output of `ztna version`:**
+```
+ztna version 3.2.13 (built ..., linux/amd64)
+```
+
+**Pass criteria:**
+- Script uses the versioned API URL, not the `latest` redirect.
+- Installed binary reports version `3.2.13`.
+- Service binary `quickztna-svc` is also downloaded (when a pinned version is provided, the script attempts to fetch `quickztna-svc-VERSION-linux-amd64` as well).
+
+**Fail criteria:**
+- Binary reports a version other than `3.2.13`.
+- 404 error from the download URL (release not published to R2).
+
+---
+
+## Summary
+
+| Sub-test | What is verified | Pass signal |
+|----------|-----------------|-------------|
+| ST1 | Clean install, correct final message | `ztna version` works; correct last line |
+| ST2 | Binary permissions and ownership | `755`, owned by root, non-zero size |
+| ST3 | Architecture detection mapping | Correct `uname -m` case statements present |
+| ST4 | Re-install idempotency | Exit 0, no file-busy errors |
+| ST5 | Pinned version via `ZTNA_VERSION` | Versioned URL used; binary reports correct version |

@@ -1,0 +1,210 @@
+---
+title: "Allow Exit Nodes Toggle & Verification"
+topic: "Organization Settings & Network Config"
+order: 122
+machines: ["Win-A", "Linux-C"]
+summary: "Toggle the allow_exit_nodes setting for the org and verify that machines can or cannot advertise as exit nodes based on the setting."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Exit nodes allow a machine in the tailnet to route all internet-bound traffic from other peers through itself. The org-level `allow_exit_nodes` boolean in the `org_settings` table controls whether this capability is permitted.
+
+**Backend — `handlers/org-management.ts`, action `update_org_settings`:**
+- **Endpoint**: `POST /api/org-management` with `action: "update_org_settings"`, `org_id`, `allow_exit_nodes`
+- **Authorization**: `isOrgAdmin` required
+- **DB column**: `org_settings.allow_exit_nodes` (boolean, default `false`)
+- **Write path**: If a row exists for the org, it issues `UPDATE org_settings SET allow_exit_nodes = ?, updated_at = NOW() WHERE org_id = ?`. If no row exists, it inserts one with the provided value.
+- **Response**: `{ "updated": true }`
+
+**Frontend — `SettingsPage.tsx`:**
+- The "Network Features" card contains an **Exit Nodes** toggle (Switch component).
+- The switch reads `settings?.allow_exit_nodes ?? false` from the `org_settings` CRUD fetch.
+- On toggle, it calls `updateSettings({ allow_exit_nodes: v })`, which issues `PATCH /api/db/org_settings` with `eq("org_id", currentOrg.id)`.
+- Note: The frontend uses the generic CRUD API (`/api/db/org_settings`) for this update, while the direct `POST /api/org-management` action also works.
+
+**CLI verification**: When `allow_exit_nodes` is `true`, a machine may advertise itself as an exit node using `ztna set --advertise-exit-node` on <MachineRef name="Linux-C" />.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser session — toggles the setting |
+| <MachineRef name="Linux-C" /> | Connected to tailnet — tests exit node advertisement |
+
+Prerequisites: Both machines are registered and online. <MachineRef name="Linux-C" /> has `ztna` installed and is connected (`ztna up`).
+
+---
+
+## ST1 — Toggle Exit Nodes ON via Dashboard
+
+**What it verifies:** The Exit Nodes switch in the Settings UI writes `allow_exit_nodes = true` to the `org_settings` table.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as an org admin on <MachineRef name="Win-A" />.
+2. Navigate to **Settings** > **General** tab.
+3. Scroll to the **Network Features** card.
+4. Locate the **Exit Nodes** row. Confirm the toggle is currently OFF (grey).
+5. Click the toggle to enable Exit Nodes.
+
+**Expected behavior:**
+- The switch animates to the ON (blue/accent) state immediately.
+- No error toast appears.
+- Opening browser DevTools > Network, you should see a successful PATCH request to `/api/db/org_settings` with body containing `allow_exit_nodes: true`.
+
+**Pass:** Switch is ON, no error toast, network request returns HTTP 200.
+
+**Fail / Common issues:**
+- Toast "Failed to update settings" — open DevTools Network tab. Check the PATCH response. A 403 means your role is not `admin` or `owner`. A 404 means the `org_settings` row does not exist and the CRUD update found no rows to update (in that case, use the API path in ST2 which handles upsert).
+
+---
+
+## ST2 — Enable Exit Nodes via API (Upsert Path)
+
+**What it verifies:** The `update_org_settings` action in `handleOrgManagement` upserts the `org_settings` row correctly.
+
+**Steps:**
+1. Using an admin JWT:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org_settings","org_id":"<org_id>","allow_exit_nodes":true}'
+```
+
+**Expected behavior:**
+- HTTP 200
+- Response body:
+```json
+{
+  "success": true,
+  "data": {
+    "updated": true
+  }
+}
+```
+- Reload the Settings page: Exit Nodes toggle is ON.
+
+**Pass:** API returns `updated: true`, UI toggle reflects the new state.
+
+**Fail / Common issues:**
+- HTTP 403 `FORBIDDEN` — caller is not an admin.
+- HTTP 400 `MISSING_FIELDS` — `org_id` is missing from the body.
+
+---
+
+## ST3 — Advertise Exit Node from Linux-C When Enabled
+
+**What it verifies:** With `allow_exit_nodes = true`, a machine can successfully advertise as an exit node without being blocked.
+
+**Steps:**
+1. Ensure `allow_exit_nodes` is `true` (from ST1 or ST2).
+2. On <MachineRef name="Linux-C" />, run:
+
+```bash
+sudo ztna set --advertise-exit-node
+```
+
+3. Check the status:
+
+```bash
+ztna status
+```
+
+**Expected behavior:**
+- `ztna set --advertise-exit-node` returns without error.
+- `ztna status` output includes a line such as:
+```
+ExitNode: advertising
+```
+- In the dashboard, navigating to **Machines** and clicking <MachineRef name="Linux-C" /> shows an "Exit Node" badge on the machine detail page.
+
+**Pass:** Exit node advertisement accepted. Machine detail shows exit node capability active.
+
+**Fail / Common issues:**
+- Error "exit nodes not allowed for this org" — the `allow_exit_nodes` flag is still `false`. Verify the API call in ST2 succeeded and the Settings page toggle is ON.
+- `ztna status` shows no exit node info — the `--advertise-exit-node` flag may require a restart: run `ztna down && ztna up` to re-register the advertisement.
+
+---
+
+## ST4 — Toggle Exit Nodes OFF and Verify Restriction
+
+**What it verifies:** Disabling exit nodes at the org level prevents the advertisement.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, toggle Exit Nodes OFF on the Settings page (or via API with `allow_exit_nodes: false`).
+2. Via API:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org_settings","org_id":"<org_id>","allow_exit_nodes":false}'
+```
+
+3. On <MachineRef name="Linux-C" />, run `ztna down` and then `ztna up` to re-register.
+4. Then attempt:
+
+```bash
+sudo ztna set --advertise-exit-node
+```
+
+**Expected behavior:**
+- The `allow_exit_nodes` toggle on the Settings page is now OFF.
+- The `ztna set --advertise-exit-node` command returns an error or the advertisement is ignored by the control plane.
+- `ztna status` does not show "ExitNode: advertising".
+
+**Pass:** Exit node advertisement is blocked or removed when the org-level flag is `false`.
+
+**Fail / Common issues:**
+- Exit node still shows as advertising after toggling OFF — the machine heartbeat has not yet re-evaluated the org setting. Wait for the next heartbeat cycle (30 seconds) or run `ztna down && ztna up` to force a re-registration.
+
+---
+
+## ST5 — Non-Admin Cannot Change Exit Node Setting
+
+**What it verifies:** The `isOrgAdmin` guard blocks `member` and `auditor` roles from modifying `allow_exit_nodes`.
+
+**Steps:**
+1. Log in as a `member` (not admin/owner) and copy their access token.
+2. Attempt to enable exit nodes:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <member_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_org_settings","org_id":"<org_id>","allow_exit_nodes":true}'
+```
+
+**Expected behavior:**
+- HTTP 403
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin required"
+  }
+}
+```
+
+**Pass:** Non-admin is blocked with 403 `FORBIDDEN`.
+
+**Fail / Common issues:**
+- HTTP 200 returned — the `isOrgAdmin` check is not being executed. Ensure the handler is routing the `update_org_settings` case correctly in the switch statement.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Dashboard Exit Nodes toggle ON | Switch animates ON, PATCH to `/api/db/org_settings` succeeds |
+| ST2 | API `update_org_settings` upsert | 200 `updated: true`, `allow_exit_nodes = true` in DB |
+| ST3 | Linux-C advertises exit node | `ztna set --advertise-exit-node` succeeds, machine detail shows badge |
+| ST4 | Toggle OFF blocks advertisement | `allow_exit_nodes = false` prevents exit node registration |
+| ST5 | Non-admin blocked | 403 `FORBIDDEN` for `member` role |

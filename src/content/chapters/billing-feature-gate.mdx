@@ -1,0 +1,242 @@
+---
+title: "Feature Gate Enforcement"
+topic: "Billing & Plans"
+order: 92
+machines: ["Win-A"]
+summary: "Verify that plan-gated features return FEATURE_GATED (403) on the free plan and are allowed on the appropriate paid plans — tested via the feature-check endpoint and live gated handlers."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Feature gating is enforced by two components working together:
+
+**`feature-gate.ts` middleware** (`backend/src/middleware/feature-gate.ts`):
+- `checkFeature(db, orgId, feature)` — reads `billing_subscriptions` for the org's plan, then queries `plan_features WHERE plan = ? AND feature = ?`. Workforce plan skips the DB lookup and always returns `true`.
+- `requireFeature(db, orgId, feature, request)` — calls `checkFeature`; if false, returns a `403` response with `{ code: 'FEATURE_GATED', message: 'This feature requires an upgraded plan. Feature: <feature>' }`.
+
+**`handleFeatureCheck`** (`platform-admin.ts`, registered at `POST /api/feature-check`):
+- Returns the full list of enabled feature keys for the org's current plan.
+- Result is cached in Valkey under `features:{org_id}` for 600 seconds.
+- Cache is invalidated on every Razorpay webhook event that changes the plan.
+
+**`plan_features` DB table** — seeded by migration `035_new_pricing_tiers.sql`:
+
+| Feature key | Free | Business | Workforce |
+|---|---|---|---|
+| `security_digest` | yes | yes | yes |
+| `policy_drift` | yes | yes | yes |
+| `access_heatmap` | yes | yes | yes |
+| `risk_engine` | yes | yes | yes |
+| `dns_filtering` | no | yes | yes |
+| `faas_firewall` | no | yes | yes |
+| `session_recording` | no | yes | yes |
+| `compliance_reports` | no | yes | yes |
+| `ai_chat` | no | no | yes |
+| `remote_desktop` | no | no | yes |
+| `workforce_analytics` | no | no | yes |
+| `dlp` | no | no | yes |
+
+Child orgs inherit the parent org's plan via `org_group_id` when no subscription row exists for the child.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — call feature-check and gated endpoints as org admin |
+
+---
+
+## ST1 — feature-check Returns Correct Feature List for Free Plan
+
+**What it verifies:** `POST /api/feature-check` returns only the four free-tier features for a free-plan org.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, obtain a JWT for a free-plan org:
+```bash
+TOKEN=$(curl -s -X POST https://login.quickztna.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['access_token'])")
+```
+
+2. Call the feature-check endpoint:
+```bash
+curl -s -X POST https://login.quickztna.com/api/feature-check \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"YOUR_ORG_ID"}' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "plan": "free",
+    "features": [
+      "security_digest",
+      "policy_drift",
+      "access_heatmap",
+      "risk_engine"
+    ],
+    "is_superadmin": false
+  }
+}
+```
+
+**Pass:** `data.plan` is `"free"`. `data.features` contains exactly the four free keys. No paid features (e.g., `dns_filtering`, `session_recording`) appear in the list.
+
+**Fail / Common issues:**
+- `UNAUTHORIZED` (401) — token expired or malformed. Re-run the login step.
+- `MISSING_FIELDS` (400) — `org_id` missing from request body.
+- Paid features appear in the list — a stale `plan_features` row may exist. Check:
+```bash
+# (Run on production server)
+docker exec quickztna-api-1 psql $DATABASE_URL -c \
+  "SELECT * FROM plan_features WHERE plan = 'free';"
+```
+
+---
+
+## ST2 — Gated Endpoint Returns FEATURE_GATED on Free Plan
+
+**What it verifies:** A handler that calls `requireFeature` returns `{ code: 'FEATURE_GATED' }` with HTTP 403 when the org is on the free plan and the feature is not enabled.
+
+`session_recording` is a Business+ feature. The `session-recording.ts` handler calls `requireFeature(db, orgId, 'session_recording', request)` before processing.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, with a **free-plan** org token, call the session recording endpoint:
+```bash
+curl -s -X POST https://login.quickztna.com/api/session-recording \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"YOUR_ORG_ID","action":"list"}' | python3 -m json.tool
+```
+
+**Expected response (HTTP 403):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "FEATURE_GATED",
+    "message": "This feature requires an upgraded plan. Feature: session_recording"
+  }
+}
+```
+
+**Pass:** HTTP status is 403. `error.code` is `"FEATURE_GATED"`. `error.message` names the gated feature.
+
+**Fail / Common issues:**
+- HTTP 200 returned — the org may already be on a paid plan. Verify with `feature-check` first (ST1 above).
+- HTTP 401 — token is for a different org or is expired.
+- HTTP 404 — wrong endpoint path. Verify the route is `/api/session-recording`.
+
+---
+
+## ST3 — Workforce Plan Bypasses plan_features Table Entirely
+
+**What it verifies:** The `checkFeature` function short-circuits for workforce plan — it returns `true` for any feature without querying `plan_features`. This means even features not seeded in the table are accessible.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, log in as the superadmin (`vikas@networkershome.com`) or as an admin of a workforce-plan org.
+2. Call feature-check:
+```bash
+curl -s -X POST https://login.quickztna.com/api/feature-check \
+  -H "Authorization: Bearer $WORKFORCE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"YOUR_WORKFORCE_ORG_ID"}' | python3 -m json.tool
+```
+
+**Expected:** `data.plan` is `"workforce"`. `data.features` contains all workforce-exclusive keys including `remote_desktop`, `workforce_analytics`, `dlp`, `ai_chat`, `window_tracking`.
+
+3. Call a workforce-exclusive endpoint (remote desktop) to confirm it is not blocked:
+```bash
+curl -s -X POST https://login.quickztna.com/api/remote-desktop \
+  -H "Authorization: Bearer $WORKFORCE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"YOUR_WORKFORCE_ORG_ID","action":"list"}' | python3 -m json.tool
+```
+
+**Expected:** HTTP 200 with `"success": true` (or a logical response from the handler — not a `FEATURE_GATED` error).
+
+**Pass:** No `FEATURE_GATED` errors on any endpoint when using a workforce org token.
+
+**Fail / Common issues:**
+- `FEATURE_GATED` returned even for workforce — the `billing_subscriptions.plan` field may not be `"workforce"`. Check:
+```bash
+curl -s "https://login.quickztna.com/api/db/billing_subscriptions?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## ST4 — Feature-Check Cache Invalidation After Plan Change
+
+**What it verifies:** The Valkey cache key `features:{org_id}` is invalidated when the Razorpay webhook fires `subscription.activated`, so the next `feature-check` call reflects the new plan immediately (within one request).
+
+This is a simulation test — we verify cache behaviour by observing response timing and content changes without a live Razorpay event.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, call `feature-check` for your org. Note `data.plan` and response time.
+2. Call it again immediately. The second call should be faster (cache hit).
+3. On the production server, manually flush the cache key:
+```bash
+ssh root@172.99.189.211 \
+  "docker exec quickztna-valkey-1 valkey-cli DEL features:YOUR_ORG_ID"
+```
+
+4. Call `feature-check` again. The response time will be slightly higher (cache miss, DB query).
+
+**Expected:** All three calls return `"success": true` with the same `data.plan`. The third call (after cache flush) has a slightly higher latency — typically 10–50 ms more than the cached responses.
+
+**Pass:** Cache flush does not break the endpoint. Plan data is correct before and after the flush.
+
+**Fail / Common issues:**
+- Cache flush returns `(integer) 0` — the cache key did not exist (either the TTL already expired or it was never set). This is acceptable; the endpoint will re-populate it on the next call.
+- Response after flush shows a different plan — this would indicate a DB vs. cache inconsistency that existed before the flush. The flush corrected it.
+
+---
+
+## ST5 — Child Org Inherits Parent Plan
+
+**What it verifies:** When an org has no row in `billing_subscriptions` but belongs to an org group as a child, `checkFeature` looks up the parent org's plan and inherits it.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, identify a child org ID. If none exists, skip to the pass note below.
+2. Call `feature-check` for the child org:
+```bash
+curl -s -X POST https://login.quickztna.com/api/feature-check \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"CHILD_ORG_ID"}' | python3 -m json.tool
+```
+
+**Expected:** `data.plan` matches the parent org's plan (not `"free"`), even though the child org has no direct `billing_subscriptions` row.
+
+3. Verify the parent's plan:
+```bash
+curl -s "https://login.quickztna.com/api/db/billing_subscriptions?org_id=PARENT_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Pass:** Child org's `feature-check` plan matches the parent org's `billing_subscriptions.plan`.
+
+**Note:** If your test environment has no org groups, this sub-test can be marked as N/A. The inheritance logic is in `handleFeatureCheck` and `checkFeature` in `feature-gate.ts` — both check `organizations.org_group_id` and `organizations.org_role = 'child'`.
+
+**Fail / Common issues:**
+- Child returns `"free"` despite parent being on Business — the child's `org_role` in the `organizations` table may not be set to `"child"`, or `org_group_id` is NULL.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Free plan feature list | feature-check returns only 4 free-tier features |
+| ST2 | FEATURE_GATED enforcement | Gated handler returns HTTP 403 with `FEATURE_GATED` code |
+| ST3 | Workforce bypass | Workforce plan never blocked; all features accessible |
+| ST4 | Cache invalidation | Plan data correct after manual Valkey cache flush |
+| ST5 | Child org plan inheritance | Child org inherits parent's plan via org_group_id |

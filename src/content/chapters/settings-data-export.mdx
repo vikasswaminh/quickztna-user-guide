@@ -1,0 +1,271 @@
+---
+title: "Org Data Export from Settings"
+topic: "Organization Settings & Network Config"
+order: 125
+machines: ["Win-A"]
+summary: "Export org data — machines list, audit logs, and compliance report — via POST /api/export in JSON and CSV formats, and verify the response structure and content."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The export system is implemented in `handlers/export-data.ts` (`handleExportData`). It exposes three export actions via a single endpoint:
+
+- **Endpoint**: `POST /api/export`
+- **Request body fields**: `action`, `org_id`, `format` (optional: `"csv"` for CSV output, omit for JSON)
+- **Authorization**: `isOrgMember` for basic access; `isOrgAdmin` required for all three actions (`audit_logs`, `machines`, `compliance_report`)
+- **Audit log source**: Loki (not PostgreSQL) — queries via `queryAuditLogs` from `services/loki.ts`
+
+**Three export actions:**
+
+| Action | Output | Source |
+|--------|--------|--------|
+| `machines` | Machine list with `id`, `name`, `tailnet_ip`, `os`, `status`, `last_seen`, `has_key`, `tags` | `machines` table |
+| `audit_logs` | Audit events for `days` back (default 30, max 10,000 rows) | Loki |
+| `compliance_report` | Aggregated compliance snapshot: machine stats, posture, ACL rules, certs, threats | Multiple tables + Loki |
+
+**CSV safety:** The handler applies `csvSafe()` to all field values before writing — values starting with `=`, `+`, `-`, `@`, tab, or carriage return are prefixed with a single quote to prevent spreadsheet formula injection.
+
+**Note:** There is no export button in the Settings UI (the page does not expose an export card). All exports are performed via direct API calls.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — performs all export API calls |
+
+Prerequisites: An admin JWT token is available. At least one machine is registered in the org (for the machines export to return data). At least one audit log event exists (for the audit logs export to return data).
+
+---
+
+## ST1 — Export Machine List as JSON
+
+**What it verifies:** The `machines` action queries the `machines` table and returns a correctly structured JSON array.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open a terminal (Git Bash, PowerShell, or WSL) and run:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"machines","org_id":"<org_id>"}'
+```
+
+**Expected behavior:**
+- HTTP 200
+- Response body:
+```json
+{
+  "success": true,
+  "data": {
+    "machines": [
+      {
+        "id": "...",
+        "name": "linux-c",
+        "tailnet_ip": "100.x.x.x",
+        "os": "linux",
+        "status": "online",
+        "last_seen": "2026-03-17T...",
+        "public_key": "...",
+        "tags": "[]",
+        "advertised_routes": null,
+        "created_at": "..."
+      }
+    ],
+    "count": 1
+  }
+}
+```
+- The `count` field matches the number of objects in the `machines` array.
+
+**Pass:** JSON response contains the machine list with all expected fields.
+
+**Fail / Common issues:**
+- HTTP 403 `FORBIDDEN` "Admin required" — your token is for a `member` role. Export requires `isOrgAdmin`.
+- `machines` array is empty — no machines are registered. Register <MachineRef name="Linux-C" /> first using `ztna login` + `ztna up`.
+- HTTP 400 `MISSING_FIELDS` — `action` or `org_id` is missing from the request body.
+
+---
+
+## ST2 — Export Machine List as CSV
+
+**What it verifies:** Passing `"format": "csv"` returns a valid CSV string rather than a JSON array, with the correct column headers.
+
+**Steps:**
+1. Run the same export call with `format: "csv"` added:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"machines","org_id":"<org_id>","format":"csv"}'
+```
+
+**Expected behavior:**
+- HTTP 200
+- Response `data.csv` field contains a multi-line CSV string. First line is the header:
+```
+id,name,tailnet_ip,os,status,last_seen,has_key,tags
+```
+- Subsequent lines contain one row per machine.
+- The `has_key` column contains `yes` if the machine has a registered WireGuard public key, `no` otherwise.
+- `data.count` matches the number of data rows (excluding the header).
+
+**Pass:** CSV header is present and correct, data rows match the machine count.
+
+**Fail / Common issues:**
+- `data.csv` contains no data rows — the `machines` table is empty for this `org_id`.
+- A field containing a comma is not quoted — the `csvEscapeField` function wraps fields containing commas in double quotes. Verify by checking a machine name that contains a comma.
+
+---
+
+## ST3 — Export Audit Logs as JSON
+
+**What it verifies:** The `audit_logs` action queries Loki for recent events and returns structured log entries.
+
+**Steps:**
+1. Ensure at least one audit event exists (any settings change in a previous sub-test generates one).
+2. Export last 7 days of audit logs:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"audit_logs","org_id":"<org_id>","days":7}'
+```
+
+**Expected behavior:**
+- HTTP 200
+- Response body:
+```json
+{
+  "success": true,
+  "data": {
+    "logs": [
+      {
+        "id": "...",
+        "action": "settings.updated",
+        "resource_type": "org_settings",
+        "resource_id": "...",
+        "user_id": "...",
+        "created_at": "...",
+        "details": "..."
+      }
+    ],
+    "count": 1
+  }
+}
+```
+- The `count` field matches `logs` array length.
+- The `days` parameter limits the time window: only logs from within the last 7 days are returned.
+
+**Pass:** Audit log entries returned with correct structure.
+
+**Fail / Common issues:**
+- `logs` array is empty — Loki may not have received events yet, or the Loki instance is unreachable. Check that a settings change was made (ST2 and ST3 of earlier chapters generate `settings.updated` events logged via `logAudit` in `SettingsPage.tsx`).
+- HTTP 500 — Loki connection error. This is a backend infrastructure issue, not a test failure.
+
+---
+
+## ST4 — Export Audit Logs as CSV
+
+**What it verifies:** The CSV format for audit logs uses the correct header row and applies formula-injection sanitization.
+
+**Steps:**
+1. Run the audit logs export with CSV format:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"audit_logs","org_id":"<org_id>","format":"csv","days":30}'
+```
+
+**Expected behavior:**
+- HTTP 200
+- `data.csv` first line is exactly:
+```
+id,action,resource_type,resource_id,user_id,created_at,details
+```
+- Each subsequent line contains one audit event.
+- If any field value starts with `=`, `+`, `-`, or `@`, it is prefixed with a single quote in the CSV output (formula injection prevention).
+
+**Pass:** Header row matches, data rows are present, no unquoted formula-injection characters.
+
+**Fail / Common issues:**
+- Header columns in wrong order — the handler defines the order explicitly as: `id`, `action`, `resource_type`, `resource_id`, `user_id`, `created_at`, `details`. If order is wrong, the handler was modified.
+
+---
+
+## ST5 — Export Compliance Report
+
+**What it verifies:** The `compliance_report` action aggregates data from multiple tables (machines, posture_reports, acl_rules, issued_certificates, threat_checks, abac_policies, ip_allowlist) plus Loki and returns a structured JSON report.
+
+**Steps:**
+1. Request a compliance report:
+
+```bash
+curl -s -X POST https://login.quickztna.com/api/export \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"compliance_report","org_id":"<org_id>"}'
+```
+
+2. Inspect the returned JSON structure.
+
+**Expected behavior:**
+- HTTP 200
+- Response `data` contains:
+  - `generated_at`: ISO timestamp
+  - `org_id`: matches the request
+  - `report_type`: `"compliance"`
+  - `summary` object with sub-keys: `machines` (total/online/quarantined), `posture` (total/compliant/compliance_rate), `acl_rules`, `abac_policies`, `certificates` (total/active), `threats` (total/blocked), `ip_allowlist_entries`, `quarantine_events_30d`
+  - `posture_policy`: null if no posture policy exists, or object with `require_disk_encryption`, `require_firewall`, `require_antivirus`, `max_patch_age_days`
+  - `non_compliant_machines`: array (empty if all machines are compliant)
+  - `recent_quarantine_events`: array of recent quarantine events from Loki
+
+Example minimal response:
+```json
+{
+  "success": true,
+  "data": {
+    "generated_at": "2026-03-17T10:00:00.000Z",
+    "org_id": "<org_id>",
+    "report_type": "compliance",
+    "summary": {
+      "machines": { "total": 2, "online": 2, "quarantined": 0 },
+      "posture": { "total": 0, "compliant": 0, "compliance_rate": 100 },
+      "acl_rules": 3,
+      "abac_policies": 0,
+      "certificates": { "total": 0, "active": 0 },
+      "threats": { "total": 0, "blocked": 0 },
+      "ip_allowlist_entries": 0,
+      "quarantine_events_30d": 0
+    },
+    "posture_policy": null,
+    "non_compliant_machines": [],
+    "recent_quarantine_events": []
+  }
+}
+```
+
+**Pass:** All top-level keys are present in the response. `summary.machines.total` is a non-negative integer matching the number of machines in the org.
+
+**Fail / Common issues:**
+- HTTP 403 `FORBIDDEN` — non-admin token used.
+- `summary.machines.total` is 0 despite registered machines — ensure `org_id` in the request matches exactly the org where the machines are registered (UUID, case-sensitive).
+- `compliance_rate` is 0 instead of 100 when there are no posture reports — the handler computes `postureStats?.total ? Math.round(...)  : 100`, so an empty `posture_reports` table should yield `compliance_rate: 100`. If it shows 0, there may be posture report rows with `compliant = false`.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | `machines` export JSON | All machine fields returned, `count` matches array length |
+| ST2 | `machines` export CSV | Header `id,name,tailnet_ip,os,status,last_seen,has_key,tags`, data rows present |
+| ST3 | `audit_logs` export JSON | Loki entries returned, `count` matches, `days` param respected |
+| ST4 | `audit_logs` export CSV | Header `id,action,resource_type,resource_id,user_id,created_at,details`, formula chars escaped |
+| ST5 | `compliance_report` export | All summary keys present, `machines.total` accurate, `compliance_rate: 100` with no posture data |

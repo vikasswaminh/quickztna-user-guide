@@ -1,0 +1,390 @@
+---
+title: "JIT Grant Expiry Enforcement"
+topic: "Governance & JIT Access"
+order: 68
+machines: ["Win-A", "Linux-C"]
+summary: "Verify JIT grants expire after their duration window, that manual revocation disables the linked ACL rule, and that expired grants cannot be re-approved."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+JIT grants are inherently time-bounded. This chapter tests the expiry and revocation lifecycle after a grant has been approved.
+
+**Expiry mechanics** (set during `jit_approve`):
+- `expires_at` is computed as `NOW() + requested_duration_hours * 3600000` milliseconds.
+- The linked ACL rule in `acl_rules` also has `expires_at` set to the same value.
+- The `enforce-key-expiry` cron task sweeps the `acl_rules` table and disables rules where `expires_at <= NOW()`. This runs on a scheduled interval server-side -- the handler itself does not enforce expiry at query time.
+- A grant remains `status = 'approved'` in `jit_access_grants` even after expiry; the enforcement is via the ACL rule's `enabled` flag.
+
+**`jit_revoke`** (org admin only):
+- Sets `status = 'revoked'` and `revoked_at = NOW()` on the grant.
+- Sets `enabled = false` on all `acl_rules` where `jit_grant_id` matches the grant ID.
+- Audit event: `jit.revoked`.
+
+**`jit_list`** filter: pass `status: "approved"` to see active grants, or omit for all statuses.
+
+**Governance metrics** `get_metrics` returns `jit_access.active_grants` -- the count of grants where `status = 'approved' AND expires_at > NOW()`.
+
+**DB tables touched:** `jit_access_grants`, `acl_rules`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin PowerShell: approvals, revocations, verification |
+| <MachineRef name="Linux-C" /> | Linux shell: verify ACL rule state via API; check metrics post-expiry |
+
+**Prerequisites:** At least one approved JIT grant exists (from Chapter 67 -- ST3, or create a fresh one). You need an admin JWT token.
+
+---
+
+## ST1 -- Verify Approved Grant and Linked ACL Rule
+
+**What it verifies:** An approved grant has a correct `expires_at` and is linked to an ACL rule that is currently `enabled: true`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, list approved grants:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_list",
+    "org_id": "YOUR_ORG_ID",
+    "status": "approved"
+  }'
+```
+
+**Expected:** One or more grants with `status: "approved"` and a non-null `expires_at` in the future.
+
+2. For one grant, verify the `expires_at` matches the requested duration. If the grant was approved at `T` with `requested_duration_hours: 2`, then `expires_at` should be `T + 2 hours` (within a few seconds of tolerance).
+
+3. Use the `acl_rule_id` returned during approval to inspect the linked rule:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** The rule has `enabled: true`, `expires_at` matching the grant's `expires_at`, and `jit_grant_id` matching the grant's `id`.
+
+4. On <MachineRef name="Linux-C" />, verify the same rule via the API:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** Same result -- `enabled: true`.
+
+**Pass:** Grant shows `status: "approved"`, `expires_at` matches `approval_time + requested_duration_hours`. Linked ACL rule is `enabled: true` with matching `expires_at` and `jit_grant_id`.
+
+**Fail / Common issues:**
+- No approved grants in the list -- create a new JIT request and approve it (Chapter 67 -- ST3) before running this sub-test.
+- `expires_at` is null on the ACL rule -- the rule was created before the `expires_at` column was added to `acl_rules` (migration 002). The column should exist; if not, the migration did not run.
+
+---
+
+## ST2 -- Revoke a Grant Early (Manual Revocation)
+
+**What it verifies:** `jit_revoke` immediately disables the linked ACL rule and transitions the grant to `status: "revoked"`, without waiting for expiry.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, pick an approved grant and revoke it:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_revoke",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "APPROVED_GRANT_UUID"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "grant_id": "APPROVED_GRANT_UUID",
+    "status": "revoked"
+  },
+  "error": null
+}
+```
+
+2. Verify the grant status:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_list",
+    "org_id": "YOUR_ORG_ID",
+    "status": "revoked"
+  }'
+```
+
+**Expected:** The grant appears with `status: "revoked"` and a non-null `revoked_at` timestamp.
+
+3. Verify the ACL rule is now disabled:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `enabled: false`.
+
+4. On <MachineRef name="Linux-C" />, confirm from that side:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `enabled: false`.
+
+**Pass:** `jit_revoke` returns `status: "revoked"`. The grant row has a `revoked_at` timestamp. The linked ACL rule is `enabled: false`.
+
+**Fail / Common issues:**
+- ACL rule remains `enabled: true` -- the handler runs `UPDATE acl_rules SET enabled = false WHERE jit_grant_id = ? AND org_id = ?`. If the rule's `jit_grant_id` column is null (rule was created before migration 002 added the column), the UPDATE matches zero rows. Verify the rule has `jit_grant_id` set.
+- HTTP 403 -- `jit_revoke` requires org admin.
+- Attempting to revoke an already-revoked grant succeeds silently -- the UPDATE is idempotent (no status check before running). This is by design.
+
+---
+
+## ST3 -- Approve a Grant on a Pending-State Grant Cannot Happen Twice
+
+**What it verifies:** Attempting to approve a grant that is no longer `'pending'` (already `'approved'`, `'denied'`, or `'revoked'`) returns `INVALID_STATE`.
+
+**Steps:**
+
+1. Create a fresh JIT request:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_request",
+    "org_id": "YOUR_ORG_ID",
+    "source_selector": "tag:test-src",
+    "destination_selector": "tag:test-dst",
+    "duration_hours": 1
+  }'
+```
+
+Note the `grant_id`.
+
+2. Approve it:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_approve",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "FRESH_GRANT_UUID"
+  }'
+```
+
+**Expected:** HTTP 200, `status: "approved"`.
+
+3. Revoke it immediately:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_revoke",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "FRESH_GRANT_UUID"
+  }'
+```
+
+**Expected:** HTTP 200, `status: "revoked"`.
+
+4. Now try to approve the revoked grant again:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_approve",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "FRESH_GRANT_UUID"
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_STATE",
+    "message": "Grant is already revoked"
+  }
+}
+```
+
+**Pass:** Re-approving a revoked grant returns HTTP 400 `INVALID_STATE`. The message reflects the current status of the grant.
+
+**Fail / Common issues:**
+- Second approval succeeds and creates a second ACL rule -- the handler's `if (grant.status !== 'pending')` check is not firing. Verify the grant was actually revoked (the `jit_list` with `status: "revoked"` should show it).
+
+---
+
+## ST4 -- Governance Metrics Reflect Active Grant Count
+
+**What it verifies:** `get_metrics` correctly counts only grants where `status = 'approved' AND expires_at > NOW()`. Revoked or expired grants are not included.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, note the current active grant count:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_metrics",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+Note `data.jit_access.active_grants`.
+
+2. Create and approve a new grant:
+
+```powershell
+# Create
+$req = curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action":"jit_request","org_id":"YOUR_ORG_ID","source_selector":"tag:metrics-src","destination_selector":"tag:metrics-dst","duration_hours":1}'
+$grantId = ($req | ConvertFrom-Json).data.grant_id
+
+# Approve
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d "{`"action`":`"jit_approve`",`"org_id`":`"YOUR_ORG_ID`",`"grant_id`":`"$grantId`"}"
+```
+
+3. Re-check `get_metrics`:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_metrics",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** `data.jit_access.active_grants` is one higher than before.
+
+4. Now revoke the grant:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d "{`"action`":`"jit_revoke`",`"org_id`":`"YOUR_ORG_ID`",`"grant_id`":`"$grantId`"}"
+```
+
+5. Re-check `get_metrics` once more:
+
+**Expected:** `data.jit_access.active_grants` returns to the original value. The revoked grant is no longer counted.
+
+**Pass:** Active grant count increments after approval, decrements after revocation. Revoked grants are excluded from the count.
+
+**Fail / Common issues:**
+- Count does not change -- the metrics query filters on `status = 'approved' AND expires_at > NOW()`. If `expires_at` was null (old data), the grant would be excluded from both before and after counts. Verify `expires_at` is set on the grant.
+- Count decrements immediately after revocation -- this is the correct behavior. The SQL `expires_at > NOW()` combined with `status = 'approved'` is evaluated at query time.
+
+---
+
+## ST5 -- Request History Includes Full Lifecycle
+
+**What it verifies:** `get_request_history` shows all grants across all statuses with requester and approver emails joined from `user_credentials`.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, query the full request history:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/governance" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "get_request_history",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "requests": [
+      {
+        "id": "<uuid>",
+        "status": "revoked",
+        "source_selector": "tag:test-src",
+        "destination_selector": "tag:test-dst",
+        "requested_duration_hours": 1,
+        "reason": null,
+        "requester_email": "member@example.com",
+        "approver_email": "admin@example.com",
+        "granted_at": "2026-03-17T...",
+        "expires_at": "2026-03-17T...",
+        "revoked_at": "2026-03-17T...",
+        "denial_reason": null
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+2. Verify the history contains grants from all the sub-tests above (pending, approved, denied, revoked statuses).
+
+3. Verify that `requester_email` and `approver_email` are populated (not null) for grants that were approved or denied. These come from a JOIN on `user_credentials`.
+
+4. For the denied grant from Chapter 67 -- ST4, verify `denial_reason` is populated if the `denial_reason` column exists on the DB (migration 024/025).
+
+5. Confirm the response is ordered by `created_at DESC` (most recent grant appears first).
+
+**Pass:** `get_request_history` returns grants across all statuses. `requester_email` and `approver_email` are populated for reviewed grants. `denial_reason` is present for denied grants. Results are ordered newest first.
+
+**Fail / Common issues:**
+- `requester_email: null` -- the JOIN on `user_credentials` uses `CAST(jag.requester_user_id AS uuid)`. If the UUID format in `jit_access_grants` does not match the format in `user_credentials`, the JOIN returns null. Verify both tables store UUIDs in the same format.
+- `denial_reason` field absent entirely -- the handler dynamically includes this column only if the `SELECT denial_reason FROM jit_access_grants LIMIT 0` probe query succeeds. If it throws, `hasDenialReason = false` and the field is not included.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Approved grant has `expires_at` matching `approval_time + duration_hours`; linked ACL rule is `enabled: true` |
+| ST2 | `jit_revoke` immediately sets `enabled: false` on the linked ACL rule and transitions grant to `"revoked"` |
+| ST3 | Attempting to approve a non-pending grant returns HTTP 400 `INVALID_STATE` with the current status in the message |
+| ST4 | `get_metrics.jit_access.active_grants` counts only approved, non-expired grants; decrements on revocation |
+| ST5 | `get_request_history` shows all statuses with joined requester/approver emails; ordered newest first |

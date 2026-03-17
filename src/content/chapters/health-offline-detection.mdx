@@ -1,0 +1,331 @@
+---
+title: "Offline Machine Detection"
+topic: "Health & Monitoring"
+order: 85
+machines: ["Win-A", "Linux-C"]
+summary: "Verify all three offline detection paths — graceful shutdown heartbeat, cleanup cron job after 3-minute silence, and ephemeral machine deletion — plus the edge cases around quarantine and admin-disable."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+A machine can be detected as offline through three distinct paths:
+
+**Path 1 — Graceful shutdown (`ztna down`)**
+The client sends a final heartbeat with `status: "offline"` before stopping. `machine-heartbeat.ts` processes this normally, sets `status = 'offline'` and `last_seen = NOW()`, and broadcasts a WebSocket `UPDATE` event because `statusChanged = true`. Status transitions to offline within seconds.
+
+**Path 2 — Cleanup cron job (`cleanup-machines.ts`)**
+The `handleCleanupMachines` handler runs on a schedule and executes two SQL operations:
+
+```sql
+-- Delete ephemeral machines not seen for 3 minutes
+DELETE FROM machines
+WHERE ephemeral = TRUE AND last_seen < NOW() - INTERVAL '3 minutes'
+RETURNING id, name, org_id
+
+-- Mark non-ephemeral machines offline
+UPDATE machines SET status = 'offline'
+WHERE status = 'online' AND last_seen < NOW() - INTERVAL '3 minutes'
+RETURNING id, name, org_id
+```
+
+For each machine marked offline or deleted, it calls `broadcastEvent` to push `UPDATE` or `DELETE` WebSocket events.
+
+**Path 3 — Hard kill (no graceful shutdown)**
+Same outcome as Path 2 but triggered by a process crash or SIGKILL. The machine continues to appear `online` in the DB until the cleanup job runs (up to ~3 minutes).
+
+**Edge cases that block offline detection:**
+
+- **Quarantined machines:** `machine-heartbeat.ts` detects `status = 'quarantined'` and updates `last_seen` without changing the status. Quarantine is only lifted by posture compliance resolution. The cleanup job's SQL `WHERE status = 'online'` does not touch quarantined machines.
+- **Admin-disabled machines:** When `admin_disabled = TRUE`, the heartbeat handler updates `last_seen` but returns `status: "offline"` to the client. The DB `status` remains whatever it was. The cleanup job would mark such a machine offline if it was `online` in the DB when the heartbeat stopped.
+
+The data source for the Health page is:
+```
+GET /api/db/machines?org_id=<org_id>&select=id,name,tailnet_ip,os,status,last_seen,created_at,version
+```
+
+The Health page re-fetches this list whenever a WebSocket event arrives on the `machines` channel, so all three detection paths are reflected in real time.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — Health page observation + API queries |
+| <MachineRef name="Linux-C" /> | VPN target — controlled shutdown and kill for offline detection tests |
+
+---
+
+## ST1 — Graceful Offline via `ztna down`
+
+**What it verifies:** `ztna down` sends an offline heartbeat that immediately sets `status = "offline"` in the DB and pushes a WebSocket `UPDATE` event.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open `/health`. Confirm <MachineRef name="Linux-C" /> shows `online` (green dot).
+
+2. On <MachineRef name="Linux-C" />, stop the VPN:
+```bash
+ztna down
+```
+
+**Expected CLI output:**
+```
+VPN stopped.
+```
+
+3. Within 5-10 seconds, observe the Health page on <MachineRef name="Win-A" />. Linux-C's row should update to `offline` (grey dot, grey badge) without a manual page refresh.
+
+4. Confirm via API:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "Linux-C",
+      "status": "offline",
+      "last_seen": "2026-03-17T10:35:12.456Z"
+    }
+  ]
+}
+```
+
+5. Note that `last_seen` reflects the time of the final offline heartbeat — it is set to `NOW()` in `machine-heartbeat.ts` even for offline-status heartbeats.
+
+**Pass:** Status transitions to `offline` within seconds of `ztna down`. Health page updates without manual refresh. `last_seen` is current.
+
+**Fail / Common issues:**
+- Status stays `online` for more than 30 seconds after `ztna down` — the offline heartbeat may have failed (e.g. network already down when `ztna down` ran). The cleanup job will eventually mark it offline at the 3-minute mark.
+- `VPN not running` printed by `ztna down` — the client was already stopped. Status should already be `offline` or will be set offline by the cleanup job.
+
+---
+
+## ST2 — Hard Kill Offline Detection via Cleanup Job
+
+**What it verifies:** When a machine is killed without a graceful shutdown, the cleanup cron job marks it offline after 3 minutes of missed heartbeats.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open `/health`. Note the current `last_seen` for Linux-C.
+
+2. On <MachineRef name="Linux-C" />, force-kill the ztna process:
+```bash
+sudo pkill -9 ztna
+```
+
+No output is expected (hard kill).
+
+3. On <MachineRef name="Win-A" />, observe the Health page. Linux-C will initially still show `online`. You may see it transition to `Stale` after 10 minutes (yellow dot, Stale badge, 50% availability) before the cleanup job fires.
+
+4. Wait approximately 3 minutes. The cleanup job runs and executes:
+```sql
+UPDATE machines SET status = 'offline'
+WHERE status = 'online' AND last_seen < NOW() - INTERVAL '3 minutes'
+```
+
+5. After the job runs, observe the Health page — Linux-C should transition to `offline`.
+
+6. Verify timing by checking `last_seen` relative to current time:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+The gap between `last_seen` and current UTC time should be at least 3 minutes when the status changes to `offline`.
+
+**Pass:** Hard-killed machine transitions to `offline` after ~3 minutes. Health page updates via WebSocket `UPDATE` event from the cleanup job.
+
+**Fail / Common issues:**
+- Machine transitions to `offline` in under 1 minute — the cleanup job may have run more frequently than expected. Check `cron.ts` for the job interval.
+- Machine stays `online` for more than 10 minutes after kill — the cleanup job may not be running. Check backend logs: `ssh root@172.99.189.211 "docker logs quickztna-api-1 --tail 50"` and look for cron job execution entries.
+
+---
+
+## ST3 — Ephemeral Machine Deletion
+
+**What it verifies:** Machines registered with `ephemeral = TRUE` are deleted (not just marked offline) by the cleanup job after 3 minutes of no heartbeat. The WebSocket event type is `DELETE`, not `UPDATE`.
+
+**Steps:**
+
+1. Register an ephemeral machine via auth key. First, create an ephemeral auth key:
+```bash
+curl -s -X POST https://login.quickztna.com/api/db/auth_keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"ephemeral\": true,
+    \"description\": \"Ephemeral test key\"
+  }" | python3 -m json.tool
+```
+
+Note the returned `key` value (format: `tskey-auth-xxx`).
+
+2. On <MachineRef name="Linux-C" />, register and connect with the ephemeral key:
+```bash
+ztna up --auth-key=tskey-auth-xxx
+```
+
+3. On <MachineRef name="Win-A" />, confirm the ephemeral machine appears on the Health page with `online` status.
+
+4. Hard-kill the ztna process on <MachineRef name="Linux-C" />:
+```bash
+sudo pkill -9 ztna
+```
+
+5. Wait approximately 3 minutes. The cleanup job runs:
+```sql
+DELETE FROM machines
+WHERE ephemeral = TRUE AND last_seen < NOW() - INTERVAL '3 minutes'
+RETURNING id, name, org_id
+```
+
+6. On <MachineRef name="Win-A" />, the ephemeral machine row should **disappear entirely** from the Health page (not just go grey). The WebSocket delivers a `DELETE` event which triggers the re-fetch, and the machine is no longer in the DB.
+
+7. Verify the machine is gone:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+The ephemeral machine should not appear in the response.
+
+**Pass:** Ephemeral machine row disappears from the Health page after ~3 minutes. No lingering `offline` entry remains in the DB.
+
+**Fail / Common issues:**
+- Ephemeral machine stays as `offline` entry — verify the machine was registered with `ephemeral = TRUE`. The cleanup SQL targets `WHERE ephemeral = TRUE` specifically; non-ephemeral machines are only marked offline, never deleted by cleanup.
+- `tskey-auth-xxx` key has no `ephemeral` flag set — check the auth key record: `GET /api/db/auth_keys?org_id=$ORG_ID`. Ephemeral machines require the auth key itself to have `ephemeral = true`.
+
+---
+
+## ST4 — Quarantined Machine Does Not Go Offline
+
+**What it verifies:** A quarantined machine keeps sending heartbeats (updating `last_seen`) but the cleanup job does not mark it `offline` because its `status` is not `online`.
+
+**Steps:**
+
+1. If you have a machine that can be quarantined (requires a posture policy violation), put it into quarantine via the admin API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"quarantine\",
+    \"machine_id\": \"LINUX_C_MACHINE_ID\",
+    \"org_id\": \"$ORG_ID\"
+  }" | python3 -m json.tool
+```
+
+2. On <MachineRef name="Linux-C" />, ensure the VPN is still running. The machine will continue to send heartbeats. Each heartbeat to `machine-heartbeat.ts` detects `status = 'quarantined'` and:
+   - Updates `last_seen = NOW()`
+   - Returns `{ status: 'quarantined', quarantined: true }` to the client
+   - Does NOT change the status
+
+3. Wait 10 minutes. Verify via API that the machine is still in `quarantined` status (not `offline`):
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "data": [
+    {
+      "name": "Linux-C",
+      "status": "quarantined",
+      "last_seen": "2026-03-17T10:45:00.000Z"
+    }
+  ]
+}
+```
+
+4. The cleanup job SQL is `WHERE status = 'online'`, so quarantined machines are safe. Confirm by checking the Health page — the machine should show `quarantined` badge (rendered as a secondary badge by the component due to the `capitalize` class) with a fresh `last_seen`.
+
+5. Unquarantine to restore normal operation:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"unquarantine\",
+    \"machine_id\": \"LINUX_C_MACHINE_ID\",
+    \"org_id\": \"$ORG_ID\"
+  }" | python3 -m json.tool
+```
+
+**Pass:** Quarantined machine keeps `last_seen` current via heartbeats but is never marked `offline` by the cleanup job.
+
+**Fail / Common issues:**
+- Machine is marked offline despite being quarantined — this would mean the heartbeat is not updating `last_seen`. Verify the machine is successfully authenticating the heartbeat (node_key is valid).
+- Quarantine action returns 403 — only org admins can quarantine machines.
+
+---
+
+## ST5 — Recovery: Offline Machine Returns Online After `ztna up`
+
+**What it verifies:** An offline machine returns to `online` status as soon as it sends a heartbeat with `status: "online"`, and the Health page reflects this immediately.
+
+**Steps:**
+
+1. Ensure <MachineRef name="Linux-C" /> is currently `offline` (either from ST1 or ST2 above).
+
+2. On <MachineRef name="Win-A" />, keep the Health page open with DevTools WebSocket Messages visible.
+
+3. On <MachineRef name="Linux-C" />, restart the VPN:
+```bash
+ztna up
+```
+
+4. On <MachineRef name="Win-A" />, within 5-10 seconds observe:
+   - DevTools receives a WebSocket `UPDATE` event: `{ "event": "UPDATE", "payload": { "id": "...", "status": "online", "last_seen": "..." } }`
+   - Health page re-fetches machine list
+   - Linux-C row transitions to green dot, `online` badge, 100% availability bar
+
+5. Confirm via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "data": [
+    {
+      "name": "Linux-C",
+      "status": "online",
+      "last_seen": "2026-03-17T10:50:30.000Z"
+    }
+  ]
+}
+```
+
+6. The WebSocket `UPDATE` event is broadcast because `statusChanged = (machine.status !== resolvedStatus)` in `machine-heartbeat.ts` evaluates to `true` (previous status was `offline`, new is `online`).
+
+**Pass:** Machine transitions back to `online` within seconds of `ztna up`. Health page updates automatically. Availability score jumps to 100%.
+
+**Fail / Common issues:**
+- Machine stays `offline` despite `ztna up` — the heartbeat may be failing. Check `ztna status` on Linux-C for the connection state. Look for `PENDING_APPROVAL` (403) if the machine was moved to pending status while offline.
+- Health page does not auto-update — WebSocket may have disconnected during the offline period. If the page was open for more than 90 seconds without a ping, the server may have evicted the connection. The client will reconnect within 5 seconds, after which it will receive subsequent events.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Graceful offline via `ztna down` | Status = offline within seconds; `last_seen` updated; WebSocket UPDATE event delivered |
+| ST2 | Hard kill offline via cleanup job | Status = offline after ~3 min; cleanup job SQL fires; WebSocket UPDATE event delivered |
+| ST3 | Ephemeral machine deletion | Ephemeral machine row deleted after ~3 min; WebSocket DELETE event; no DB remnant |
+| ST4 | Quarantine blocks offline marking | Quarantined machine keeps fresh `last_seen` but cleanup job ignores it (not `online`) |
+| ST5 | Recovery to online | `ztna up` → heartbeat with `status: online` → WebSocket UPDATE → Health page shows online |

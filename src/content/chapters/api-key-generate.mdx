@@ -1,0 +1,328 @@
+---
+title: "Generate API Key"
+topic: "API Keys & Programmatic Access"
+order: 96
+machines: ["Win-A"]
+summary: "Create scoped management API keys with configurable expiry, rate limits, and scope restrictions for programmatic access to the QuickZTNA control plane."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+API keys provide programmatic access to the QuickZTNA management API — distinct from auth keys (which register machines). This chapter tests the `create_api_key` action in `backend/src/handlers/api-key-auth.ts` via `POST /api/key-management`.
+
+Key facts from source code:
+
+- **Endpoint:** `POST /api/key-management` (alias: `POST /api/api-keys`)
+- **Action:** `"create_api_key"`
+- **Required fields:** `action`, `org_id`, `name`
+- **Optional fields:** `scopes` (string array), `rate_limit_rpm` (int, default 60), `expiry_days` (int, 1–90, default 30)
+- **Auth:** JWT required, caller must be org admin or owner (`isOrgAdmin` check)
+- **Zero Standing Privilege policy:** expiry is mandatory; maximum is 90 days; permanent keys are not allowed
+- **Valid scopes:** `read`, `write`, `admin`, `machines`, `dns`, `acl`, `billing`, `audit`
+- **Key format:** `qztna_` followed by 64 hex characters (32 random bytes)
+- **Key prefix stored in DB:** `qztna_XXXXXXXX...` (first 8 hex chars of raw key + ellipsis)
+- **Storage table:** `api_keys` in PostgreSQL (`key_hash` column stores SHA256 of full key including prefix)
+- **Response on success:** HTTP 201, `{ id, key, key_prefix, name, expiry_days }`
+- **The full key is returned exactly once** — it cannot be retrieved again
+
+The frontend (`src/pages/APIKeysPage.tsx`) also inserts keys directly via the CRUD endpoint `POST /api/db/api_keys`, generating the key material client-side. The `create_api_key` handler action on `POST /api/key-management` is the server-authoritative path used here.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + API calls (admin user) |
+
+---
+
+## ST1 — Create a Basic API Key with Default Settings
+
+**What it verifies:** An admin can create an API key with no explicit scopes (full access) and the default 30-day expiry.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, obtain a JWT access token. Log into the dashboard at `https://login.quickztna.com`, open browser DevTools, go to Application > Local Storage, and copy the `access_token` value. Also note your `org_id` from the URL or org settings.
+
+2. Create a basic API key:
+
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"my-terraform-key\"
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "key": "qztna_<64 hex chars>",
+    "key_prefix": "qztna_xxxxxxxx...",
+    "name": "my-terraform-key",
+    "expiry_days": 30
+  }
+}
+```
+
+3. Copy and securely store the `key` value immediately. It will not be shown again.
+
+**Pass:** HTTP 201. The `key` field starts with `qztna_`. `expiry_days` defaults to 30. The `id` is a valid UUID.
+
+**Fail / Common issues:**
+- `UNAUTHORIZED` (401) — JWT is missing or expired. Re-authenticate and obtain a fresh token.
+- `FORBIDDEN` (403) — caller does not have admin or owner role in the org.
+- `MISSING_FIELDS` (400) — `name`, `action`, or `org_id` missing from the request body.
+
+---
+
+## ST2 — Create a Scoped API Key
+
+**What it verifies:** A key can be created with a limited set of scopes. Invalid scope values are rejected before the key is stored.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a read-only machines key:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"readonly-machines-key\",
+    \"scopes\": [\"machines\", \"read\"],
+    \"expiry_days\": 14
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "key": "qztna_<64 hex chars>",
+    "key_prefix": "qztna_xxxxxxxx...",
+    "name": "readonly-machines-key",
+    "expiry_days": 14
+  }
+}
+```
+
+2. Now attempt to create a key with an invalid scope value:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"bad-scope-key\",
+    \"scopes\": [\"machines\", \"superpower\"]
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 400):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_SCOPES",
+    "message": "Invalid scopes: superpower. Valid: read, write, admin, machines, dns, acl, billing, audit"
+  }
+}
+```
+
+**Pass:** First request returns HTTP 201 with scoped key. Second request returns HTTP 400 with `INVALID_SCOPES` and lists valid scope values.
+
+**Fail / Common issues:**
+- The invalid scope request returns 201 — the scope validation at `api-key-auth.ts` line 108 would be bypassed.
+
+---
+
+## ST3 — Create a Key with Custom Rate Limit
+
+**What it verifies:** The `rate_limit_rpm` field is stored and enforced. Valid values: 30, 60, 120, 300, 1000 (as shown in the UI; backend accepts any positive integer).
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a high-throughput key:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"ci-pipeline-key\",
+    \"scopes\": [\"machines\", \"acl\", \"dns\"],
+    \"rate_limit_rpm\": 300,
+    \"expiry_days\": 30
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "key": "qztna_<64 hex chars>",
+    "key_prefix": "qztna_xxxxxxxx...",
+    "name": "ci-pipeline-key",
+    "expiry_days": 30
+  }
+}
+```
+
+2. Verify the key was stored with the correct rate limit by querying the CRUD API:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&revoked=eq.false" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. Find the row where `name` is `"ci-pipeline-key"` and confirm `rate_limit_rpm` is `300`.
+
+**Pass:** Key created with HTTP 201. CRUD query shows `rate_limit_rpm: 300` for the new key.
+
+**Fail / Common issues:**
+- `rate_limit_rpm` shows 60 in the DB — the value was not passed correctly in the request body.
+
+---
+
+## ST4 — Zero Standing Privilege: Expiry is Enforced
+
+**What it verifies:** The backend enforces the Zero Standing Privilege policy — `expiry_days` must be between 1 and 90. Values outside this range and omitting expiry entirely with an attempt to set a permanent key are rejected.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, attempt to create a key with `expiry_days` of 91:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"long-lived-key\",
+    \"expiry_days\": 91
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 400):**
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "expiry_days must be an integer between 1 and 90 (zero standing privilege policy)"
+  }
+}
+```
+
+2. Attempt with `expiry_days: 0`:
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"zero-expiry-key\",
+    \"expiry_days\": 0
+  }" | python3 -m json.tool
+```
+
+**Expected (HTTP 400):** Same `INVALID_INPUT` error — 0 is not between 1 and 90.
+
+3. Create a valid 90-day key (the maximum allowed):
+
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_api_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"max-expiry-key\",
+    \"expiry_days\": 90
+  }" | python3 -m json.tool
+```
+
+**Expected:** HTTP 201 — exactly 90 is the maximum and is accepted.
+
+**Pass:** 91-day and 0-day requests return HTTP 400 with `INVALID_INPUT`. 90-day request succeeds with HTTP 201.
+
+**Fail / Common issues:**
+- 91 days is accepted — the ZSP validation check at `api-key-auth.ts` line 102 is not running.
+
+---
+
+## ST5 — Verify Key Appears in Dashboard UI
+
+**What it verifies:** After creation via the API, the key is visible in the `APIKeysPage` UI, which fetches from `GET /api/db/api_keys` filtered by `org_id` and `revoked=false`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create a key via the dashboard UI:
+   - Navigate to `https://login.quickztna.com/api-keys`
+   - Click "Create API Key"
+   - Enter name `"dashboard-test-key"`, select scopes `machines:read` and `audit:read`, set rate limit to 60/min and expiry to 30 days
+   - Click "Generate Key"
+
+2. The dialog shows the full key prefixed `ztna_`. Copy it now.
+
+3. Click "Done". Confirm the key appears in the table with:
+   - Name: `dashboard-test-key`
+   - Prefix: `ztna_XXXXXXXX...` (partial, for reference)
+   - Scopes: `machines:read` and `audit:read` badges
+   - Rate Limit: `60/min`
+   - Usage: `0 calls`
+   - Expires: a date approximately 30 days from today
+
+4. Verify the key is stored in the database via the CRUD API:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/api_keys?org_id=$ORG_ID&revoked=eq.false" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Pass:** Key appears in both the UI table and the CRUD API response. `revoked` is `false`. `usage_count` is 0.
+
+**Fail / Common issues:**
+- Key does not appear in the table after clicking Done — `fetchKeys()` may not have re-run. Reload the page.
+- Scopes show as "Full Access" despite selecting scopes — the frontend uses client-side key generation and stores scopes directly; verify the insert succeeded without error in browser DevTools Network tab.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Basic key creation with defaults | HTTP 201, key starts with `qztna_`, `expiry_days: 30` |
+| ST2 | Scoped key + invalid scope rejection | HTTP 201 for valid scopes; HTTP 400 `INVALID_SCOPES` for unknown scope |
+| ST3 | Custom rate limit stored correctly | HTTP 201; CRUD query shows correct `rate_limit_rpm` |
+| ST4 | Zero Standing Privilege expiry enforcement | HTTP 400 for `expiry_days` outside 1–90 range; 90 accepted |
+| ST5 | Dashboard UI shows created keys | Key visible in `/api-keys` page with correct name, scopes, and expiry |

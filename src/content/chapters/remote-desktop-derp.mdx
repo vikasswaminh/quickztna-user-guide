@@ -1,0 +1,333 @@
+---
+title: "Session Quality Under DERP Relay"
+topic: "Remote Desktop"
+order: 119
+machines: ["Win-A", "Win-B"]
+summary: "Verify remote desktop session behaviour when WebRTC ICE falls back to TURN/DERP relay, measuring frame rate, latency impact, and session continuity under relay-only conditions."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA remote desktop uses WebRTC with JPEG-over-DataChannel for the media path. ICE negotiation attempts to establish a direct peer-to-peer connection first. When NAT traversal fails, the DataChannel falls back to TURN relay, which routes through one of the four QuickZTNA DERP/TURN droplets.
+
+**ICE server configuration:** The `handleRemoteDesktop` handler reads enabled `derp_regions` from the database and builds ICE server entries for both STUN (port 3478) and TURN (port 3479, UDP and TCP). When no regions are configured, it falls back to `stun:vpn.quickztna.com:3478` and `turn:vpn.quickztna.com:3479`. These same ICE servers are passed to the agent in the `agent_commands` `parameters` JSON (`ice_servers` field).
+
+**DERP relay droplets:** Four DigitalOcean droplets serve as TURN relays:
+- blr1: `139.59.26.108`
+- nyc1: `142.93.7.116`
+- lon1: `142.93.39.6`
+- sfo3: `137.184.190.98`
+
+**Session continuity:** The WebRTC `RTCPeerConnection` handles ICE candidate exchange and relay selection transparently. Once the DataChannel is established (whether P2P or relayed), the JPEG streaming and input injection pipelines operate identically — the relay is invisible to both `session.go` and `RemoteDesktopViewer.tsx`.
+
+**What changes under DERP relay:**
+- Round-trip latency increases by approximately 30-100ms depending on the relay region
+- Bandwidth is limited by the relay server's network capacity
+- JPEG quality may drop due to slower frame delivery triggering the adaptive quality system (3+ consecutive slow frames at >1.5x frame budget triggers quality reduction by 5)
+- Frame rate may drop from the 8-15 fps P2P range to 4-8 fps on relay
+
+**Quality adaptation:** `session.go:captureLoop` measures `elapsed` time per frame against `frameDuration` (1s/15fps = 66ms). If elapsed exceeds `frameBudgetSlack * frameDuration` (99ms), `consecutiveSlow` increments. After 3 consecutive slow frames, JPEG quality drops by 5 (floored at `jpegQualityLow` = 30). During relay, the additional RTT adds to the effective elapsed time, increasing the likelihood of quality reduction.
+
+**DataChannel unordered semantics:** Both P2P and relay paths use `ordered: false, maxRetransmits: 0` for the `"video"` DataChannel. Under relay, SCTP retransmission is not performed — if a chunk is lost in the relay path, the frame is partially received and evicted by the viewer's chunk reassembly logic (which discards incomplete frames when a newer frame arrives).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Viewer — browser observes FPS and DataChannel state |
+| <MachineRef name="Win-B" /> | Target — agent measures frame timing; TURN relay path used |
+
+**Prerequisites:**
+- Remote desktop feature enabled (Business or Enterprise plan)
+- DERP/TURN servers configured in `derp_regions` table, or fallback `vpn.quickztna.com:3479` is reachable
+- `quickztna-svc.exe` running on Win-B
+- To force DERP relay: block direct UDP/TCP between Win-A's network and Win-B's network at the OS or router level (or run Win-B behind a symmetric NAT that prevents direct P2P)
+
+---
+
+## ST1 -- Verify ICE Servers Are Included in Initiate Response
+
+**What it verifies:** The `initiate` response includes properly structured TURN ICE server entries, not just STUN.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, call `initiate` and inspect the ICE server list:
+```powershell
+$body = @{
+    action       = "initiate"
+    org_id       = "$ORG_ID"
+    machine_id   = "$MACHINE_ID"
+    session_type = "admin"
+} | ConvertTo-Json
+
+$init = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$init.data.ice_servers | ConvertTo-Json -Depth 3
+```
+
+2. Verify the response includes at least one TURN entry alongside the STUN entry:
+```powershell
+$stunServers = $init.data.ice_servers | Where-Object { $_.urls -match "^stun:" }
+$turnServers = $init.data.ice_servers | Where-Object { $_.urls -match "^turn:" }
+
+Write-Host "STUN servers: $($stunServers.Count)"
+Write-Host "TURN servers: $($turnServers.Count)"
+
+# Verify TURN credential structure
+$turnServers | ForEach-Object {
+    Write-Host "TURN URL: $($_.urls -join ', ')"
+    Write-Host "  username: $($_.username)"
+    Write-Host "  credential: $($_.credential)"
+}
+```
+
+**Expected:**
+```json
+[
+  { "urls": ["stun:vpn.quickztna.com:3478"] },
+  {
+    "urls": ["turn:vpn.quickztna.com:3479?transport=udp", "turn:vpn.quickztna.com:3479?transport=tcp"],
+    "username": "quickztna",
+    "credential": "quickztna-turn-relay"
+  }
+]
+```
+
+3. Verify that the same ICE servers are passed to the agent by checking the `agent_commands` row after sending an offer:
+```powershell
+# After initiating a full session and sending the offer:
+$cmds = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/db/agent_commands?org_id=eq.$ORG_ID&machine_id=eq.$MACHINE_ID&command_type=eq.rdp_session" `
+    -Headers @{ Authorization = "Bearer $TOKEN" }
+
+$params = $cmds.data[0].parameters | ConvertFrom-Json
+$params.ice_servers | ConvertTo-Json -Depth 3
+```
+
+The agent receives the same ICE server list, enabling it to allocate a TURN relay candidate.
+
+**Pass:** Both STUN and TURN entries are present; TURN entries have `username` and `credential`; agent command includes `ice_servers` in parameters.
+
+**Fail / Common issues:**
+- Only STUN in `ice_servers` -- no `derp_regions` are configured in the database and the handler built the fallback list. The fallback includes TURN on `vpn.quickztna.com:3479`. If that is missing, check the fallback logic in `handleRemoteDesktop`.
+- Missing `username`/`credential` on TURN -- TURN requires authentication. The handler always includes `username: "quickztna"` and `credential: "quickztna-turn-relay"` for all TURN entries.
+
+---
+
+## ST2 -- Force DERP Relay Path and Establish Session
+
+**What it verifies:** The session can be established and remains stable when ICE selects a TURN relay candidate rather than a direct P2P path.
+
+**Steps:**
+
+1. To force relay on <MachineRef name="Win-B" />, temporarily block direct UDP traffic from Win-A's IP. Open an administrator PowerShell on Win-B:
+```powershell
+# Replace with Win-A's actual public/tailnet IP
+$WIN_A_IP = "100.64.x.x"  # Win-A tailnet IP
+
+# Block direct UDP from Win-A (forces ICE to use TURN relay)
+New-NetFirewallRule -DisplayName "RDP-Test-Block" -Direction Inbound `
+    -RemoteAddress $WIN_A_IP -Protocol UDP -Action Block
+```
+
+2. On <MachineRef name="Win-A" />, open the remote desktop page and connect. Observe the connection time -- relay connections take longer for ICE to settle (STUN times out, then TURN is tried).
+
+3. Once "Connected" appears, note:
+   - FPS counter value (expect 4-8 fps under relay, compared to 8-15 fps P2P)
+   - Visual latency: move the mouse and observe the delay before the cursor moves on Win-B
+
+4. Check the ICE candidate type in browser DevTools:
+   - Open DevTools → Application → or run in console:
+```javascript
+// After connecting, inspect ICE candidate stats
+const pc = /* cannot access directly from console */;
+// Use chrome://webrtc-internals/ in Chrome to see ICE candidate pair selected
+```
+
+   Navigate to `chrome://webrtc-internals/` (Chrome) or `about:webrtc` (Firefox) in a separate tab. Find the active session and look at the selected candidate pair — it should show `relay` type for both local and remote candidates when using TURN.
+
+5. Verify the session is stable by leaving it connected for 2 minutes. Check that frames continue arriving (FPS counter does not drop to 0).
+
+6. After testing, remove the firewall rule on Win-B:
+```powershell
+Remove-NetFirewallRule -DisplayName "RDP-Test-Block"
+```
+
+**Pass:** Session establishes over TURN relay (visible in webrtc-internals); FPS is reduced but non-zero; no session disconnection during 2-minute hold.
+
+**Fail / Common issues:**
+- WebRTC stuck in "Connecting to host..." and never reaches "Connected" -- TURN server is not reachable from Win-B's network. Check that `turn:vpn.quickztna.com:3479` UDP and TCP are accessible from Win-B.
+- Session connects but FPS is 0 -- the DataChannel opened but the agent's `captureLoop` may have encountered an error. Check Win-B agent logs.
+- `chrome://webrtc-internals` not accessible -- use `about:webrtc` in Firefox instead, or check the browser console for `RTCPeerConnection.getStats()` output.
+
+---
+
+## ST3 -- Adaptive Quality Reduction Under Relay Latency
+
+**What it verifies:** The agent's adaptive quality system reduces JPEG quality when relay-added latency causes frames to exceed the frame budget, and the viewer continues receiving valid frames.
+
+**Steps:**
+
+1. With the relay-forced session from ST2 still active (or re-establish it), monitor the agent log on <MachineRef name="Win-B" />:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 200 -Wait |
+    Select-String "reducing JPEG quality|frame sent"
+```
+
+2. Move the mouse continuously in the viewer on <MachineRef name="Win-A" /> to increase frame change density (changed pixels = larger JPEG = longer encode+send time).
+
+3. After 10-20 seconds of activity, verify quality reduction events appear in the log:
+```
+reducing JPEG quality  new=45  elapsed_ms=110
+reducing JPEG quality  new=40  elapsed_ms=108
+```
+
+The `elapsed_ms` should exceed the 99ms budget (1.5x of 66ms target frame time at 15 fps).
+
+4. After reducing mouse activity (static desktop), verify quality starts recovering:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 50 |
+    Select-String "frame sent" | Select-Object -Last 10
+```
+
+Watch the `quality=` field gradually increase (by 1 per smooth frame) toward 70. Under relay conditions, quality may stabilise at an intermediate value (e.g., 45-55) rather than reaching 70 if the relay RTT consistently keeps frames near the budget.
+
+5. On <MachineRef name="Win-A" />, verify the FPS counter reflects the reduced throughput:
+   - P2P baseline: 8-15 fps
+   - Relay with quality 50: 5-10 fps
+   - Relay with quality 30: 4-8 fps
+
+**Pass:** Agent log shows quality reduction events during high-activity relay conditions; quality recovers incrementally during low-activity periods; viewer continues displaying frames throughout.
+
+**Fail / Common issues:**
+- No quality reduction events even under relay -- either the relay RTT is low (sub-30ms) and frames are still within budget, or the desktop is static and individual frames are small (compressing well). Try with a video playing on Win-B.
+- Quality stuck at 30 but viewer still receives frames -- this is expected behaviour. Quality 30 produces the smallest possible JPEG for a given frame. The session remains functional at low quality.
+- No frames received during quality 30 phase -- check if the DataChannel was closed. Under extreme congestion, SCTP flow control can stall `dc.Send()`. Check agent logs for `"datachannel send error"`.
+
+---
+
+## ST4 -- Session Continuity After Temporary Relay Disruption
+
+**What it verifies:** A brief interruption to the relay path does not immediately terminate the session -- WebRTC ICE reconnects or the viewer's "Reconnect" button allows recovery.
+
+**Steps:**
+
+1. With an active relay session (from ST2), simulate a brief disruption on <MachineRef name="Win-B" /> by adding and then removing a firewall rule that blocks the TURN server:
+```powershell
+# Block TURN server temporarily
+New-NetFirewallRule -DisplayName "RDP-TURN-Block" -Direction Outbound `
+    -RemoteAddress "vpn.quickztna.com" -Protocol UDP -Action Block
+
+# Wait 15 seconds to observe viewer behaviour
+Start-Sleep -Seconds 15
+
+# Restore
+Remove-NetFirewallRule -DisplayName "RDP-TURN-Block"
+```
+
+2. On <MachineRef name="Win-A" />, observe the viewer toolbar during the 15-second block:
+   - FPS counter should drop to 0
+   - Connection state may change to "Connecting to host..." (blue dot) as WebRTC detects the relay failure and attempts ICE restart
+   - After the block is removed, WebRTC should recover and frames resume
+
+3. If the session does not auto-recover within 30 seconds, click the "Reconnect" button in the viewer toolbar. This triggers the full `connect()` flow again (initiate → offer → poll → setRemoteDescription).
+
+4. Verify the session was auto-terminated and a new one was created:
+```powershell
+# List recent sessions for the machine
+$list = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{
+        action   = "list"
+        org_id   = $ORG_ID
+        limit    = 5
+        status   = $null  # all statuses
+    } | ConvertTo-Json)
+
+$list.data.sessions | Select-Object id, status, created_at, ended_at, duration_seconds |
+    Where-Object { $_.machine_name -eq "Win-B" } | Format-Table
+```
+
+You should see the old session in `disconnected` state and a new session in `active` state.
+
+**Pass:** FPS drops to 0 during relay block; session either auto-recovers (WebRTC ICE restart) or recovers via Reconnect button within 60 seconds; session history shows the reconnect created a new session.
+
+**Fail / Common issues:**
+- Viewer shows "Connected" with FPS=0 for extended time -- WebRTC `connectionState` may not have transitioned to `"disconnected"` despite no data flow. WebRTC's keepalive timeout (typically 30 seconds of silence) eventually triggers `"failed"` state. The viewer responds to `"failed"` by transitioning to `"disconnected"` state.
+- "Reconnect" button not visible -- the button only appears when `connState` is `"disconnected"` or `"error"`. If the state remains `"connecting"`, the button is not shown. Wait for WebRTC to time out.
+- New session blocked by `SESSION_EXISTS` after reconnect -- the viewer's `connect()` handles this via auto-terminate logic (calls `action: "terminate"` with the stale session ID, then retries initiate).
+
+---
+
+## ST5 -- Relay vs P2P Frame Rate Comparison
+
+**What it verifies:** Measured FPS under relay is lower than P2P but remains functional, confirming the relay path is a viable (if degraded) fallback.
+
+**Steps:**
+
+1. On <MachineRef name="Win-B" />, remove any firewall rules from previous sub-tests:
+```powershell
+Get-NetFirewallRule | Where-Object { $_.DisplayName -like "RDP-*" } | Remove-NetFirewallRule
+```
+
+2. Establish a fresh remote desktop session on <MachineRef name="Win-A" /> without any relay forcing. Let it run for 60 seconds. Record FPS (read from viewer toolbar):
+```
+P2P baseline FPS: ___
+```
+
+3. Apply the firewall rule to force relay (from ST2). Wait for reconnection. Record FPS:
+```
+Relay FPS: ___
+```
+
+4. From agent logs, compare frame sizes and chunk counts:
+```powershell
+# Under P2P — recent frames:
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" |
+    Select-String "frame sent" | Select-Object -Last 5
+
+# After forcing relay and reconnecting — recent frames:
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" |
+    Select-String "frame sent" | Select-Object -Last 5
+```
+
+Compare the `quality=` and `size=` fields. Under relay, quality should be lower and size smaller due to adaptation.
+
+5. Compare the input responsiveness:
+   - Under P2P: move the mouse in the viewer and observe the visual lag (typically 50-150ms)
+   - Under relay: same test, lag should be noticeably higher (150-400ms depending on relay region)
+
+6. Document the comparison:
+```
+| Metric           | P2P   | DERP Relay |
+|------------------|-------|------------|
+| FPS              | ___   | ___        |
+| JPEG quality     | ___   | ___        |
+| Mouse lag (est.) | ___ms | ___ms      |
+```
+
+**Pass:** Both P2P and relay sessions are functional; relay FPS is reduced but above 4 fps; mouse input remains responsive in both modes.
+
+**Fail / Common issues:**
+- P2P and relay FPS are identical (both low) -- both paths may be going through relay because direct UDP is blocked on Win-A's network. Check `chrome://webrtc-internals` to confirm P2P is actually P2P.
+- Relay FPS drops below 3 -- the relay server may be overloaded or the geographic distance to the relay is very large. The DERP relay closest to the machines should be selected by ICE based on RTT.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | TURN servers in ICE config | Initiate response includes TURN entries with credentials; agent command includes same |
+| ST2 | Session over relay | Session establishes via TURN; FPS reduced but non-zero |
+| ST3 | Adaptive quality under relay | Agent reduces JPEG quality when relay latency exceeds frame budget |
+| ST4 | Relay disruption recovery | Brief relay block recovers via WebRTC ICE restart or Reconnect button |
+| ST5 | Relay vs P2P comparison | Quantified FPS and quality difference between direct and relay paths |

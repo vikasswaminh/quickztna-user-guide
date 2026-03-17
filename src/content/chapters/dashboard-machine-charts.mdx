@@ -1,0 +1,215 @@
+---
+title: "Machine Status Charts"
+topic: "Dashboard & Analytics"
+order: 77
+machines: ["Win-A"]
+summary: "Verify the Active Machines list and Team list on the dashboard — correct machines shown, last_seen timestamps formatted correctly, tailnet hostname construction, and member initials rendering."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The bottom half of `DashboardPage.tsx` renders two side-by-side cards: "Active Machines" and "Team". Both are populated from the `useDashboardData` hook's response.
+
+**Active Machines card:**
+- Source: `recentMachines` — derived as `onlineMachines.slice(0, 4)` where `onlineMachines` = machines with `status === 'online'`
+- The machines list is pre-sorted by `last_seen DESC` from the SQL query: `SELECT id, name, tailnet_ip, status, last_seen FROM machines WHERE org_id = ? ORDER BY last_seen DESC`
+- Each row shows: machine name, tailnet hostname (`name.slug.zt.net`), and last_seen formatted via `toLocaleTimeString()`
+- Empty state: "No machines online"
+
+**Team card:**
+- Source: `recentMembers` — derived as `members.slice(0, 4)` from the org_members JOIN profiles query
+- Members are ordered by `joined_at ASC` from the SQL
+- Each row shows: avatar initials (derived from `full_name.split(" ").map(n => n[0]).join("").toUpperCase()`), full name, and role
+- Empty state: "No members yet"
+
+The hostname shown for each machine is `m.name + "." + currentOrg.slug + ".zt.net"` — this is computed client-side in `DashboardPage.tsx`. It does not query the DNS records table.
+
+The `last_seen` value is formatted with `new Date(m.last_seen).toLocaleTimeString()` — this uses the browser's locale, so the format is locale-dependent (e.g., `10:30:45 AM` on en-US).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard inspection + API verification |
+
+---
+
+## ST1 — Active Machines List Renders Correctly
+
+**What it verifies:** The Active Machines card shows up to 4 online machines sorted by most-recent `last_seen`, with correct name and hostname.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, set credentials:
+```bash
+TOKEN="YOUR_ADMIN_JWT_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+```
+
+2. Query online machines sorted by `last_seen DESC`:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.online&select=id,name,tailnet_ip,last_seen&order=last_seen.desc" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. Note the first 4 machines in the response — these should be the machines shown in the Active Machines card.
+
+4. Open the dashboard at `https://login.quickztna.com/dashboard` on <MachineRef name="Win-A" />.
+
+5. Scroll to the Active Machines card. Verify:
+   - The machine names match the top 4 results from step 2.
+   - The hostname under each name reads `machinename.orgslug.zt.net`.
+
+**Expected card content (example, 2 online machines):**
+```
+Active Machines
+● Win-A     Win-A.myorg.zt.net      10:30:45 AM
+● Linux-C   Linux-C.myorg.zt.net    10:28:12 AM
+```
+
+**Pass:** Up to 4 online machines are shown in `last_seen DESC` order. Each hostname is `name.slug.zt.net` where `slug` is the org slug shown in the page header.
+
+**Fail / Common issues:**
+- Card shows "No machines online" despite machines running — the `status` field may not be `online` (e.g., `pending`). Check the machines page for actual status.
+- Hostname slug is wrong — the slug is derived from `currentOrg.slug` in the React context. Verify the org slug via `GET /api/db/organizations?id=eq.ORG_ID`.
+
+---
+
+## ST2 — Last Seen Timestamp Formatting
+
+**What it verifies:** The `last_seen` timestamp in the Active Machines card is formatted using `toLocaleTimeString()` and reflects the machine's most recent heartbeat time.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, note the current time in your local timezone (HH:MM:SS).
+
+2. Ensure at least one machine is online. Get the machine's `last_seen` from the API:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.online&select=name,last_seen&order=last_seen.desc&limit=1" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Note the ISO timestamp, e.g., `"2026-03-17T10:30:45.123Z"`.
+
+3. Convert that UTC timestamp to local time (UTC+5:30 example: `10:30:45Z` = `16:00:45 IST`).
+
+4. On the dashboard Active Machines card, read the timestamp next to the machine's name.
+
+**Expected:** The time displayed matches the `last_seen` value converted to local browser time using `toLocaleTimeString()`. For `en-US` locale: `4:00:45 PM`. For `en-GB`: `16:00:45`.
+
+**Pass:** The displayed time is within 1 minute of the `last_seen` value from the API (accounting for heartbeat interval). It is in local time format, not UTC.
+
+**Fail / Common issues:**
+- Timestamp shows a time far in the past — the machine's `ztna up` daemon may not have sent a recent heartbeat. Check `ztna status` on the machine.
+- Timestamp shows `—` — `last_seen` is `null` in the database. This can happen on machines registered with `auth-key` that have never sent a heartbeat.
+
+---
+
+## ST3 — Team Card Member Display and Initials
+
+**What it verifies:** The Team card correctly renders member initials, full names, and roles — with initials derived from the first letter of each word in `full_name`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, query org members with their profile names:
+```bash
+curl -s -X POST https://login.quickztna.com/api/db/_rpc \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"fn\":\"get_org_members\",\"_org_id\":\"$ORG_ID\"}" | python3 -m json.tool
+```
+
+2. For each member in the response, manually compute the expected initials:
+   - Full name `"Vikas Swaminh"` → initials `"VS"`
+   - Full name `"Jane Doe"` → initials `"JD"`
+   - Full name `"Unknown"` (when `full_name` is null) → initials `"U"`
+   - Single word `"Alice"` → initials `"A"`
+
+3. On the dashboard Team card, verify each member row shows:
+   - A circular avatar with computed initials
+   - The full name
+   - The role (e.g., `owner`, `admin`, `member`) — displayed capitalized via CSS `capitalize`
+
+**Expected card content:**
+```
+Team
+[VS] Vikas Swaminh    owner
+[JD] Jane Doe         member
+```
+
+**Pass:** Initials are uppercase, correctly extracted from the `full_name` field. Role is displayed. For members with `full_name = null`, the code uses `"Unknown"` and renders initials `"U"`.
+
+**Fail / Common issues:**
+- Initials show `"?"` — the code falls back to `"?"` when `full_name` is empty string or missing individual split parts. Verify the `profiles` table has a `full_name` value for the user.
+- "No members yet" appears despite members existing — the `recentMembers` list comes from the RPC; check that `org_members` has rows for this org.
+
+---
+
+## ST4 — Empty State Rendering
+
+**What it verifies:** When no machines are online or no members exist, the dashboard renders the correct empty state messages instead of broken UI.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, temporarily verify an empty state. If you cannot take all machines offline, query for the count first:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.online&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print('online:', len(d.get('data',d.get('results',[]))))"
+```
+
+2. If zero online machines exist, open the dashboard. The Active Machines card should display:
+```
+No machines online
+```
+
+3. For the Team card empty state, this would require an org with no members, which is not a realistic test scenario. Confirm the Team card shows members correctly when the org has members.
+
+4. Verify the loading skeleton state: Open DevTools Network tab, throttle to "Slow 3G", then navigate to the dashboard. During load, you should see skeleton placeholders (gray animated rectangles) in place of the metric cards and the Active Machines / Team lists.
+
+**Expected skeleton count:** 4 skeleton cards in the 2-column grid during load, then 2 skeleton rows (one for Active Machines, one for Team) when data is arriving.
+
+**Pass:** Empty state messages render cleanly (no JavaScript errors in the console). Skeleton loading state appears during data fetch. Cards switch to content once `useDashboardData` resolves.
+
+**Fail / Common issues:**
+- Page crashes to blank — a JavaScript error in the member initials code. Open DevTools console for the error detail.
+- Skeletons never disappear — the `useDashboardData` query is stuck. Check the Network tab for the `_rpc` request; it may be returning an error.
+
+---
+
+## ST5 — "Active Machines" Slice Limit (4 max)
+
+**What it verifies:** Even when more than 4 machines are online, the Active Machines card displays at most 4, since `recentMachines` is `onlineMachines.slice(0, 4)`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, count online machines:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.online&select=id,name,last_seen&order=last_seen.desc" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); ms=d.get('data',d.get('results',[])); print(f'{len(ms)} online'); [print(m[\"name\"]) for m in ms[:6]]"
+```
+
+2. If 4 or more machines are online, open the dashboard and count the rows in the Active Machines card.
+
+3. Verify that no more than 4 machines are listed, and the 4 shown are the ones with the most recent `last_seen` timestamps from step 1.
+
+4. Note: The "Network Status" card still shows the full `onlineCount` (e.g., "5/6 Online") — only the Active Machines list is capped at 4. This is intentional.
+
+**Pass:** Active Machines card shows exactly `min(onlineCount, 4)` rows. The rows correspond to the top 4 by `last_seen DESC` order.
+
+**Fail / Common issues:**
+- More than 4 rows shown — this would be a regression in `DashboardPage.tsx`. Check the `recentMachines` derivation in `use-dashboard-data.ts` (line: `onlineMachines.slice(0, 4)`).
+- Fewer than 4 rows despite more being online — the `recentMachines` derivation filters on `status === 'online'` client-side after the RPC returns all machines. Verify the `status` values in the API response are actually `'online'`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Active Machines list | Shows up to 4 online machines in `last_seen DESC` order with correct hostnames |
+| ST2 | Last seen timestamp | Time is formatted with `toLocaleTimeString()` and matches the machine's `last_seen` value |
+| ST3 | Team card initials | Member initials are uppercase first-letters of `full_name` words; role is displayed |
+| ST4 | Empty states | "No machines online" and loading skeletons render without errors |
+| ST5 | 4-machine slice limit | Active Machines card never shows more than 4 rows even when more are online |

@@ -1,0 +1,344 @@
+---
+title: "Create Access Review"
+topic: "Governance & JIT Access"
+order: 66
+machines: ["Win-A"]
+summary: "Create an access review campaign and verify it auto-populates decisions for all active machines and enabled ACL rules."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Access review campaigns let an org admin periodically audit which machines and ACL rules should still have access. This chapter tests the `create_review_campaign` and `submit_review_decision` actions inside `handleGovernance` (`backend/src/handlers/governance.ts`), routed via `POST /api/governance`.
+
+When a campaign is created, the handler:
+1. Inserts a row into `access_review_campaigns` with `status = 'pending'`.
+2. Auto-populates `access_review_decisions` rows -- one per active machine (status not `'pending'`) and one per enabled ACL rule (`enabled = true`).
+3. Each decision row starts with `decision = NULL` (unreviewed).
+
+When a decision is submitted via `submit_review_decision`:
+- `decision` must be one of `'approve'`, `'revoke'`, or `'modify'`.
+- If `decision = 'revoke'` and `resource_type = 'acl_rule'`, the ACL rule is disabled (`enabled = false`).
+- If `decision = 'revoke'` and `resource_type = 'machine'`, the machine status is set to `'offline'`.
+- When all decisions in a campaign have a non-NULL `decision`, the campaign is automatically set to `status = 'completed'`.
+
+Required fields for `create_review_campaign`: `name`, `reviewer_user_id`, `due_date`. Requires org admin role. Audit event written to Loki: `access_review.created`.
+
+**DB tables touched:** `access_review_campaigns`, `access_review_decisions`, `machines`, `acl_rules`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | PowerShell for all API calls and dashboard verification |
+
+**Prerequisites:** At least one machine registered and online, at least one ACL rule enabled. You need an org admin JWT token and the `reviewer_user_id` UUID of a member in the org (can be the same admin user).
+
+---
+
+## ST1 -- Create a Review Campaign
+
+**What it verifies:** The `create_review_campaign` action inserts the campaign row and returns the count of decisions auto-populated.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, get the current user's ID from the token introspection endpoint (or use the ID you already know). Then create the campaign:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_review_campaign",
+    "org_id": "YOUR_ORG_ID",
+    "name": "Q1 2026 Access Review",
+    "description": "Quarterly review of all machine and ACL rule access",
+    "reviewer_user_id": "YOUR_USER_UUID",
+    "due_date": "2026-04-01T00:00:00Z"
+  }'
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "campaign_id": "<uuid>",
+    "machines_to_review": 2,
+    "rules_to_review": 3
+  },
+  "error": null
+}
+```
+
+The counts reflect how many active machines and enabled ACL rules exist in the org at the moment of creation. Record the `campaign_id` for later sub-tests.
+
+2. Verify the campaign exists by listing all campaigns:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_review_campaigns",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** The campaign with name `"Q1 2026 Access Review"` appears in `data.campaigns` with `status: "pending"`.
+
+**Pass:** HTTP 201, `campaign_id` is a UUID, `machines_to_review` and `rules_to_review` are non-negative integers. Campaign appears in `list_review_campaigns` with `status: "pending"`.
+
+**Fail / Common issues:**
+- HTTP 403 -- your token is not an org admin. The handler calls `isOrgAdmin()` before inserting.
+- `machines_to_review: 0` when machines exist -- machines in `'pending'` status are excluded. Only machines where `status != 'pending'` are counted.
+- Missing `due_date` returns HTTP 400 with `code: "MISSING_FIELDS"`.
+
+---
+
+## ST2 -- Verify Decisions Are Auto-Populated
+
+**What it verifies:** The `get_review_decisions` action returns one decision row per machine and per enabled ACL rule, all with `decision: null`.
+
+**Steps:**
+
+1. Using the `campaign_id` from ST1, fetch the decisions:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_review_decisions",
+    "org_id": "YOUR_ORG_ID",
+    "campaign_id": "CAMPAIGN_UUID"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "decisions": [
+      {
+        "id": "<uuid>",
+        "campaign_id": "CAMPAIGN_UUID",
+        "resource_type": "machine",
+        "resource_id": "<machine-uuid>",
+        "machine_name": "Win-A",
+        "decision": null,
+        "notes": null,
+        "decided_at": null
+      },
+      {
+        "id": "<uuid>",
+        "campaign_id": "CAMPAIGN_UUID",
+        "resource_type": "acl_rule",
+        "resource_id": "<rule-uuid>",
+        "machine_name": null,
+        "decision": null,
+        "notes": null,
+        "decided_at": null
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+2. Count the decisions returned. The total should match `machines_to_review + rules_to_review` from the ST1 response.
+
+3. Confirm every row has `decision: null` -- none have been reviewed yet.
+
+**Pass:** Decision count matches the sum from ST1. All rows have `decision: null` and `decided_at: null`. Rows are split between `resource_type: "machine"` and `resource_type: "acl_rule"`.
+
+**Fail / Common issues:**
+- `decisions: []` -- the campaign ID is wrong, or the rollback fired during campaign creation (decision population failed). Check the API logs for `Review campaign rollback`.
+- Missing `campaign_id` returns HTTP 400 with `code: "MISSING_FIELDS"`.
+
+---
+
+## ST3 -- Submit an Approve Decision
+
+**What it verifies:** Submitting `decision: "approve"` on a machine decision row updates the row and does not change the machine's status.
+
+**Steps:**
+
+1. From the decisions list in ST2, pick a decision row with `resource_type: "machine"`. Copy its `id` (this is the decision row ID, not the machine ID).
+
+2. Submit an approve decision:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "submit_review_decision",
+    "org_id": "YOUR_ORG_ID",
+    "decision_id": "DECISION_ROW_UUID",
+    "decision": "approve",
+    "notes": "Machine verified active and compliant"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "decision_id": "DECISION_ROW_UUID",
+    "decision": "approve"
+  },
+  "error": null
+}
+```
+
+3. Verify the machine's status is unchanged (still `online`):
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/machines?org_id=YOUR_ORG_ID&id=eq.MACHINE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `status: "online"` -- approving a machine does not modify its status.
+
+4. Re-fetch the campaign decisions and confirm the reviewed row now has `decision: "approve"` and a non-null `decided_at`.
+
+**Pass:** Decision row is updated with `decision: "approve"` and a `decided_at` timestamp. Machine status is unchanged.
+
+**Fail / Common issues:**
+- HTTP 403 -- the user submitting must be either the campaign's `reviewer_user_id` or an org admin.
+- HTTP 404 with `code: "NOT_FOUND"` -- the `decision_id` is the UUID from `access_review_decisions`, not the machine UUID or campaign UUID.
+
+---
+
+## ST4 -- Submit a Revoke Decision on an ACL Rule
+
+**What it verifies:** Submitting `decision: "revoke"` on an ACL rule decision row disables the rule (`enabled = false`).
+
+**Steps:**
+
+1. From the decisions list in ST2, pick a decision row with `resource_type: "acl_rule"`. Note its `resource_id` (the ACL rule UUID).
+
+2. First, confirm the ACL rule is currently enabled:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `enabled: true`.
+
+3. Submit a revoke decision:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "submit_review_decision",
+    "org_id": "YOUR_ORG_ID",
+    "decision_id": "DECISION_ROW_UUID",
+    "decision": "revoke",
+    "notes": "Rule no longer needed after segmentation restructure"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "decision_id": "DECISION_ROW_UUID",
+    "decision": "revoke"
+  },
+  "error": null
+}
+```
+
+4. Verify the ACL rule is now disabled:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** `enabled: false`.
+
+**Pass:** ACL rule is disabled after the revoke decision. The decision row shows `decision: "revoke"` with a `decided_at` timestamp.
+
+**Fail / Common issues:**
+- Rule remains `enabled: true` -- the handler checks `resource_type === 'acl_rule'` before running the UPDATE. Verify the decision row's `resource_type` is `"acl_rule"` and not `"machine"`.
+- Re-enabling the rule: use the CRUD API `PATCH /api/db/acl_rules` to restore it after testing.
+
+---
+
+## ST5 -- Campaign Auto-Completes When All Decisions Are Submitted
+
+**What it verifies:** When the last null-decision row is reviewed, the campaign status automatically transitions to `'completed'`.
+
+**Steps:**
+
+1. From the decisions list in ST2, identify all remaining decision rows that still have `decision: null` (those not reviewed in ST3 and ST4).
+
+2. Submit an `"approve"` decision for each remaining row. For each one:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "submit_review_decision",
+    "org_id": "YOUR_ORG_ID",
+    "decision_id": "REMAINING_DECISION_UUID",
+    "decision": "approve"
+  }'
+```
+
+3. After submitting the final decision, list campaigns to check the status:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_review_campaigns",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** The campaign now shows `status: "completed"` and a non-null `completed_at` timestamp.
+
+4. Also verify via the governance metrics that pending campaigns count has decreased:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_metrics",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** `data.access_reviews.pending_campaigns` decrements by 1 compared to before the campaign was completed.
+
+**Pass:** Campaign transitions to `status: "completed"` with a `completed_at` timestamp after all decisions are non-null. Governance metrics reflect the reduced pending campaign count.
+
+**Fail / Common issues:**
+- Campaign remains `"pending"` after all decisions submitted -- the handler checks `COUNT(*) WHERE decision IS NULL`. If any row still has `decision: null`, the campaign stays open. Verify all decision rows were submitted.
+- `get_metrics` still shows the campaign as pending -- the query filters for `status IN ('pending', 'active')`, so a `'completed'` campaign is excluded. If the count did not drop, the UPDATE to `'completed'` may not have fired.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | `create_review_campaign` inserts a campaign row (HTTP 201) and returns counts of auto-populated decisions |
+| ST2 | `get_review_decisions` returns one null-decision row per active machine and per enabled ACL rule |
+| ST3 | `submit_review_decision` with `"approve"` updates the decision row without modifying the machine |
+| ST4 | `submit_review_decision` with `"revoke"` on an ACL rule disables the rule in `acl_rules` |
+| ST5 | Campaign auto-transitions to `status: "completed"` when all decision rows are reviewed |

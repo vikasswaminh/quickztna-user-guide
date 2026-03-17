@@ -1,0 +1,279 @@
+---
+title: "Remote Shell Access Control"
+topic: "Remote Shell"
+order: 114
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify that the remote shell feature gate, admin-only enforcement, and org membership checks correctly restrict shell access — and that non-admin users and wrong-org callers are rejected at every layer."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Remote shell access is controlled by three independent enforcement layers, each of which must pass before a session token is issued or a WebSocket is accepted:
+
+**Layer 1 -- Feature Gate (`requireFeature`)**
+Both `handleRemoteShell` (REST, `remote-shell.ts`) and `createRemoteShellWsHandler` (WebSocket, `remote-shell-ws.ts`) call `requireFeature(db, org_id, 'remote_management', request)`. If the org's plan does not include the `remote_management` feature, the request is rejected with 403 before any admin check.
+
+**Layer 2 -- Admin-Only Enforcement (`isOrgAdmin`)**
+`handleRemoteShell` calls `isOrgAdmin(db, user.user_id, org_id)` for every action. `createRemoteShellWsHandler` calls `isOrgAdmin(env.DB, userId, orgId)` inside `validateShellConnection`. Regular org members (non-admin role) cannot create sessions, list scripts, or execute scripts. The WebSocket closes with code 4003 if the admin check fails.
+
+**Layer 3 -- Machine Org Ownership**
+The machine lookup includes `org_id` in the WHERE clause: `SELECT ... FROM machines WHERE id = ? AND org_id = ?`. A valid machine UUID from a different org returns `NOT_FOUND`, not `FORBIDDEN` -- this prevents cross-org information disclosure.
+
+**WebSocket close codes used:**
+- `4001` -- missing params or invalid/expired JWT
+- `4003` -- admin access required or feature not available
+- `4004` -- machine not found or machine is offline
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin user's machine (org A, admin role) |
+| <MachineRef name="Win-B" /> | Non-admin user's machine (org A, member role) |
+| <MachineRef name="Linux-C" /> | Target machine for shell sessions |
+
+Prerequisites:
+- Two test user accounts in the same org: one admin, one member (not admin).
+- Obtain a JWT for each user from the login page.
+- The org is on the Workforce plan with `remote_management` enabled.
+- <MachineRef name="Linux-C" /> is online.
+
+---
+
+## ST1 -- Non-Admin User Cannot Create a Shell Session
+
+**What it verifies:** A user with member (non-admin) role is rejected by `isOrgAdmin` when attempting `create_session`, even when the org has `remote_management` enabled.
+
+**Steps:**
+1. Log in as the non-admin member user. Obtain their JWT (from DevTools or the login API response).
+2. On <MachineRef name="Win-B" />, attempt session creation using the member token:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer MEMBER_USER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_session",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin access required"
+  }
+}
+```
+HTTP status is 403.
+
+3. Confirm the same rejection applies to all actions: `list_scripts`, `add_script`, `execute_script`, `execution_history`, `delete_script`, `update_execution`.
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer MEMBER_USER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "list_scripts", "org_id": "YOUR_ORG_ID"}'
+```
+**Expected:** Same 403 `FORBIDDEN`.
+
+**Pass:** Every `remote-shell` action returns 403 `FORBIDDEN` for non-admin users. No action leaks data or partial results to non-admins.
+
+**Fail / Common issues:**
+- Getting 200 for `list_scripts` with a member token -- check that `isOrgAdmin` is called before the action switch, not inside individual case blocks. In the current implementation the admin check is at line 30-31, before the switch statement.
+
+---
+
+## ST2 -- Feature Gate Blocks Free/Business Plan Orgs
+
+**What it verifies:** The `remote_management` feature gate prevents orgs on Free or Business plans from accessing any remote shell action, regardless of admin role.
+
+**Steps:**
+1. Create or use a test org on the Free plan (or Business plan where `remote_management` is not included).
+2. Log in as an admin of that org. Obtain their JWT.
+3. Attempt session creation:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer FREE_ORG_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_session",
+    "org_id": "FREE_ORG_ID",
+    "machine_id": "ANY_MACHINE_ID"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "FEATURE_NOT_AVAILABLE",
+    "message": "..."
+  }
+}
+```
+HTTP status is 403.
+
+4. Navigate to the Remote Management page (`/remote-management`) in the dashboard for this org.
+5. Confirm the frontend shows the `FeatureUpgradeCard` component (plan upgrade prompt) rather than the terminal UI. The page checks `featureData.features.includes("remote_management")` before rendering.
+
+**Pass:** Free/Business plan orgs receive 403 `FEATURE_NOT_AVAILABLE` on all REST actions. The dashboard shows an upgrade prompt.
+
+**Fail / Common issues:**
+- The feature gate check occurs after `getAuthedUser` and `isOrgAdmin`. If the feature gate returns an error but the test also has an invalid token, the 401 from auth will be returned first. Ensure you use a valid admin token.
+- Superadmin users (`platform_role = 'superadmin'`) may bypass feature gates depending on the `requireFeature` implementation. Use a regular admin account for this test.
+
+---
+
+## ST3 -- Cross-Org Machine Access Is Blocked
+
+**What it verifies:** An admin from org A cannot open a shell session to a machine that belongs to org B, even when both machine IDs and org IDs are valid.
+
+**Steps:**
+1. You need two orgs (A and B) with machines in each. The machine UUIDs can be found via `GET /api/db/machines?org_id=ORG_B_ID` using an admin token for org B.
+2. Log in as an admin of org A. Obtain their JWT.
+3. Attempt to create a session using org A's ID but org B's machine ID:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer ORG_A_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "create_session",
+    "org_id": "ORG_A_ID",
+    "machine_id": "ORG_B_MACHINE_ID"
+  }'
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Machine not found"
+  }
+}
+```
+HTTP status is 404.
+
+4. Verify the response is `NOT_FOUND` (not `FORBIDDEN`). The handler does `WHERE id = ? AND org_id = ?`, so a machine in another org is indistinguishable from a non-existent machine.
+
+**Pass:** Cross-org machine access returns 404 `NOT_FOUND`, not 403. The machine UUID is not disclosed as belonging to another org.
+
+**Fail / Common issues:**
+- Getting 200 with a token -- the `org_id` passed belongs to the machine's actual org, not org A. Confirm the `org_id` in the request body matches org A.
+
+---
+
+## ST4 -- WebSocket Rejected for Non-Admin User
+
+**What it verifies:** The WebSocket `validateShellConnection` function in `remote-shell-ws.ts` applies the same admin check as the REST handler, so a member-role user cannot bypass the REST layer by connecting directly to the WebSocket endpoint.
+
+**Steps:**
+1. Obtain a valid JWT for the non-admin member user (same as ST1).
+2. Obtain a valid `shell_token` -- this requires a successful `create_session` call, which already requires admin. For this test, construct a fake `shell_token` to verify the WebSocket auth check fires before the token is validated against the agent.
+3. On <MachineRef name="Win-B" />, attempt a WebSocket connection using the member's JWT:
+
+Using a browser console (or a WebSocket test tool like `wscat`):
+```javascript
+// In browser console on Win-B
+const ws = new WebSocket(
+  'wss://login.quickztna.com/api/remote-shell/ws' +
+  '?token=MEMBER_JWT' +
+  '&org_id=YOUR_ORG_ID' +
+  '&machine_id=LINUX_C_MACHINE_ID' +
+  '&shell_token=fake-token'
+);
+ws.onclose = (e) => console.log('Closed:', e.code, e.reason);
+```
+
+**Expected:** WebSocket closes with code `4003` and reason `"Admin access required"`.
+
+4. Verify the sequence in `validateShellConnection`: JWT verification happens before admin check. Test with an invalid JWT:
+```javascript
+const ws = new WebSocket(
+  'wss://login.quickztna.com/api/remote-shell/ws' +
+  '?token=invalid.jwt.here' +
+  '&org_id=YOUR_ORG_ID' +
+  '&machine_id=LINUX_C_MACHINE_ID' +
+  '&shell_token=fake-token'
+);
+ws.onclose = (e) => console.log('Closed:', e.code, e.reason);
+```
+**Expected:** Closes with code `4001`, reason `"Invalid or expired token"`.
+
+5. Test with missing parameters:
+```javascript
+const ws = new WebSocket('wss://login.quickztna.com/api/remote-shell/ws');
+ws.onclose = (e) => console.log('Closed:', e.code, e.reason);
+```
+**Expected:** Closes with code `4001`, reason `"Missing token, org_id, or machine_id"`.
+
+**Pass:** WebSocket close codes 4001 (auth/params failure) and 4003 (admin check failure) are returned in the correct sequence. A member-role user cannot obtain a live PTY connection.
+
+**Fail / Common issues:**
+- WebSocket closes with code 1006 (abnormal closure) instead of 4003 -- the server may have crashed before sending the close frame. Check API container logs: `docker logs quickztna-api-1 --tail 50`.
+- `wscat` requires Node.js: `npm install -g wscat`. Then: `wscat -c 'wss://login.quickztna.com/api/remote-shell/ws?token=...'`
+
+---
+
+## ST5 -- Script Execution Blocked for Non-Members of the Org
+
+**What it verifies:** A user who is not a member of the org at all (neither admin nor member) cannot execute scripts or list scripts, even with a valid JWT.
+
+**Steps:**
+1. Create a third user account that is not a member of the test org.
+2. Log in as that user and obtain their JWT.
+3. Attempt to list scripts:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer NON_MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "list_scripts", "org_id": "YOUR_ORG_ID"}'
+```
+
+**Expected:** HTTP 403, code `FORBIDDEN`, message `"Admin access required"`.
+
+Note: The handler calls `isOrgAdmin` (not `isOrgMember`) before the action switch. A user who is not in the org at all will also fail the admin check, producing the same 403 `FORBIDDEN` as a non-admin member.
+
+4. Verify the same applies to the `execute_script` action:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/remote-shell" `
+  -H "Authorization: Bearer NON_MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "execute_script",
+    "org_id": "YOUR_ORG_ID",
+    "script_id": "ANY_SCRIPT_UUID",
+    "machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+**Expected:** Same 403 response.
+
+5. Confirm no information leakage: the error message is the same for non-members and non-admin members -- neither reveals whether the org exists, whether the machine exists, or how many scripts are stored.
+
+**Pass:** Non-members and non-admins both receive 403 `FORBIDDEN` with `"Admin access required"`. The response does not distinguish between "not a member" and "not an admin".
+
+**Fail / Common issues:**
+- Getting 401 instead of 403 -- the token may be expired or invalid. Use a freshly obtained JWT.
+- Getting 404 for the org -- the `org_id` in the request does not exist. The feature gate runs first and may return an error before the admin check if the org has no feature records.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Non-admin org members receive 403 `FORBIDDEN` on all `remote-shell` actions; admin check is at the handler level, before the action switch |
+| ST2 | Free/Business plan orgs receive 403 `FEATURE_NOT_AVAILABLE`; the dashboard renders an upgrade prompt instead of the terminal |
+| ST3 | Cross-org machine access returns 404 `NOT_FOUND` (not 403), preventing org membership disclosure |
+| ST4 | WebSocket closes with code 4001 for auth failures and 4003 for admin failures; member-role users cannot bypass REST auth via direct WebSocket connection |
+| ST5 | Non-org-members receive the same 403 `FORBIDDEN` as non-admin members; no information about org structure is leaked |

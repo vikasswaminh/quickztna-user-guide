@@ -1,0 +1,363 @@
+---
+title: "Remote Desktop Session Initiation"
+topic: "Remote Desktop"
+order: 116
+machines: ["Win-A", "Win-B"]
+summary: "Verify the full WebRTC signaling handshake: initiate, offer, agent command dispatch, answer polling, and session activation via handleRemoteDesktop."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Remote desktop in QuickZTNA is a WebRTC signaling relay. The browser never connects directly to the agent over HTTP — instead, the backend (`handleRemoteDesktop` in `backend/src/handlers/remote-desktop.ts`) acts as a rendezvous point for SDP and ICE data. All screen data flows over a SCTP DataChannel after WebRTC peer connection is established.
+
+The full initiation sequence is:
+
+1. **`action: "initiate"`** — Browser posts to `POST /api/remote-desktop` with `machine_id`, `org_id`, and `session_type: "admin"`. The handler verifies the machine is `online`, checks org admin authorization, checks for existing active sessions, creates a row in `remote_desktop_sessions` with `status = 'pending'`, and returns `session_id`, `ice_servers`, `tailnet_ip`, and `port: 2223`.
+
+2. **Browser creates `RTCPeerConnection`** — Using the ICE servers returned by initiate (STUN/TURN from `derp_regions`, or fallback `stun:vpn.quickztna.com:3478`). Two DataChannels are created by the viewer: `"input"` (ordered) and `"control"` (ordered).
+
+3. **`action: "offer"`** — Browser waits for ICE gathering to complete (up to 5 seconds), then posts the full SDP offer to `POST /api/remote-desktop`. The handler stores the SDP in `remote_desktop_sessions.sdp_offer`, transitions status to `'signaling'`, inserts an `agent_commands` row with `command_type: 'rdp_session'` containing the SDP, ICE servers, and a one-time agent token, then broadcasts a `remote_desktop` realtime event.
+
+4. **Agent picks up the command** — The `quickztna-svc` Windows service polls `agent_commands` on its heartbeat cycle. `command_executor.go:160` dispatches `execRDPSession()`, which calls `wfRemoteDesktop.HandleOfferFromBackend(sessionID, sdpOffer, iceServers)` in `pkg/remotedesktop/server.go`. The server creates a `Session` via `NewSession()`, calls `session.HandleOffer()` which creates the agent-side `RTCPeerConnection`, registers the `"video"` DataChannel (unordered, maxRetransmits=0), and waits for ICE gathering (30-second timeout).
+
+5. **Agent posts answer** — `pkg/ztna/remote_desktop.go:SendRDAnswer()` posts `action: "answer"` with `node_key` and `sdp_answer` to the backend. The handler authenticates via `sha256(node_key)`, verifies the caller machine matches the session, stores the answer, transitions status to `'connecting'`, and broadcasts a realtime event.
+
+6. **Browser polls status** — `RemoteDesktopViewer.tsx` polls `action: "status"` every 2 seconds for up to 44 seconds. Once `sdp_answer` is present, it calls `pc.setRemoteDescription()` which completes the WebRTC handshake.
+
+7. **`action: "connected"`** — Once `pc.connectionState === "connected"`, the viewer posts `action: "connected"` which transitions the session to `status = 'active'` and records `started_at`.
+
+The feature is gated by `remote_desktop` plan feature (`requireFeature`), which returns HTTP 403 on free/starter plans. The `remote_desktop_sessions` table (migration `028_remote_desktop.sql`) tracks the full lifecycle with status values: `pending`, `signaling`, `connecting`, `active`, `disconnected`, `rejected`, `expired`.
+
+Sessions expire automatically — the `status` handler inline-expires rows in `pending`, `signaling`, or `connecting` state that are older than 2 minutes.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Viewer — browser initiates the remote desktop session |
+| <MachineRef name="Win-B" /> | Target — `quickztna-svc` running with `-tags workforce` build; screen captured |
+
+**Prerequisites:**
+- Both machines registered and `online` in the same org
+- Org on Business or Enterprise plan (feature gate: `remote_desktop`)
+- `quickztna-svc.exe` installed and running on <MachineRef name="Win-B" /> (built with `go build -tags workforce`)
+- Admin JWT token stored as `$TOKEN`, org ID as `$ORG_ID`, Win-B machine ID as `$MACHINE_ID`
+
+---
+
+## ST1 -- Initiate Action Returns Session and ICE Servers
+
+**What it verifies:** `action: "initiate"` creates a session row and returns a valid `session_id` with ICE server list.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, post the initiate request:
+```powershell
+$body = @{
+    action     = "initiate"
+    org_id     = "$ORG_ID"
+    machine_id = "$MACHINE_ID"
+    session_type = "admin"
+} | ConvertTo-Json
+
+$init = Invoke-RestMethod -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$init.data | ConvertTo-Json -Depth 4
+```
+
+2. Capture the session ID for subsequent steps:
+```powershell
+$SESSION_ID = $init.data.session_id
+Write-Host "Session: $SESSION_ID"
+Write-Host "Tailnet IP: $($init.data.tailnet_ip)"
+Write-Host "Port: $($init.data.port)"
+Write-Host "ICE servers: $($init.data.ice_servers.Count)"
+```
+
+3. Verify the session row was created with `status = 'pending'`:
+```powershell
+$sess = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$sess.data.session | Select-Object id, status, session_type, machine_id
+```
+
+**Expected response shape:**
+```json
+{
+  "session_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "token": "xxxxxxxx-xxxx-...",
+  "tailnet_ip": "100.64.x.x",
+  "port": 2223,
+  "machine_name": "Win-B",
+  "ice_servers": [
+    { "urls": ["stun:vpn.quickztna.com:3478"] },
+    { "urls": ["turn:vpn.quickztna.com:3479?transport=udp", "turn:vpn.quickztna.com:3479?transport=tcp"],
+      "username": "quickztna", "credential": "quickztna-turn-relay" }
+  ],
+  "consent_required": false
+}
+```
+
+**Pass:** `success: true`, `data.session_id` is a UUID, `data.port` is `2223`, status row shows `status: "pending"`.
+
+**Fail / Common issues:**
+- `MACHINE_OFFLINE` (HTTP 400) -- Win-B is not connected to the mesh. Run `ztna up` on Win-B.
+- `FORBIDDEN` (HTTP 403) -- the user is not an org admin. Admin role required for `session_type: "admin"`.
+- `FEATURE_NOT_ENABLED` (HTTP 403) -- the org is on Free or Starter plan. Upgrade to Business.
+- `SESSION_EXISTS` (HTTP 409) -- a stale session exists. Terminate it first (see ST5).
+
+---
+
+## ST2 -- SDP Offer Delivery Creates Agent Command
+
+**What it verifies:** `action: "offer"` stores the SDP offer, transitions session to `signaling`, and inserts an `agent_commands` row with `command_type: 'rdp_session'`.
+
+**Steps:**
+
+1. Construct a minimal SDP offer string to simulate the browser (or observe from browser DevTools on the real page). For direct API testing, use a well-formed offer string. Here we verify the state machine by checking what the handler does with a real offer from the UI flow:
+
+   Navigate to `https://login.quickztna.com/remote-desktop/MACHINE_ID?name=Win-B` in a browser on <MachineRef name="Win-A" />. Open DevTools Network tab and filter for `remote-desktop`.
+
+2. Watch the network requests. You should see three sequential requests:
+   - `POST /api/remote-desktop` with `action: "initiate"` → status 200, `session_id` returned
+   - `POST /api/remote-desktop` with `action: "offer"` → status 200, `status: "signaling"`
+   - Repeated `POST /api/remote-desktop` with `action: "status"` every 2 seconds
+
+3. After the offer is sent, verify the session transitioned to `signaling`:
+```powershell
+$poll = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$poll.data.session.status
+$poll.data.session.sdp_offer -ne $null
+```
+
+4. Verify the `agent_commands` row was created:
+```powershell
+$cmds = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/db/agent_commands?org_id=eq.$ORG_ID&machine_id=eq.$MACHINE_ID&command_type=eq.rdp_session&status=eq.pending" `
+    -Headers @{ Authorization = "Bearer $TOKEN" }
+
+$cmds.data | Select-Object id, command_type, status, created_at | Format-Table
+```
+
+**Expected:** At least one row with `command_type: "rdp_session"` and `status: "pending"`.
+
+**Pass:** Session status is `"signaling"`, `sdp_offer` is non-null, `agent_commands` row exists with `command_type: "rdp_session"`.
+
+**Fail / Common issues:**
+- `INVALID_STATE` -- the session is not in `pending` state when offer is sent. Initiate a fresh session.
+- `NOT_FOUND` -- session ID does not match. Confirm `$SESSION_ID` was captured from the initiate response.
+- No `agent_commands` row -- the handler inserts the command only after storing the offer. If offer returned 200 but no command row exists, check for DB write errors in API logs.
+
+---
+
+## ST3 -- Agent Picks Up Command and Posts SDP Answer
+
+**What it verifies:** The `quickztna-svc` service on Win-B detects the `rdp_session` command during its heartbeat cycle, processes it through `execRDPSession` and `HandleOfferFromBackend`, and posts an answer back.
+
+**Steps:**
+
+1. On <MachineRef name="Win-B" />, check the service logs to observe command pickup:
+```powershell
+Get-EventLog -LogName Application -Source "QuickZTNA*" -Newest 30 |
+    Where-Object { $_.Message -like "*rdp*" -or $_.Message -like "*remote desktop*" } |
+    Select-Object TimeGenerated, Message | Format-List
+```
+
+Or if the service writes to a log file:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 50 |
+    Select-String "rdp|remote.desktop|session"
+```
+
+2. The agent logs you should see (from `session.go` and `server.go`):
+```
+remote desktop negotiate  session_id=<id>  remote=backend-relayed
+screen capture started    session_id=<id>  fps=15
+frame sent                session_id=<id>  frame=1  size=85432  chunks=2  wxh=1280x720  quality=50
+```
+
+3. From <MachineRef name="Win-A" />, poll the session status until the answer arrives:
+```powershell
+for ($i = 0; $i -lt 22; $i++) {
+    Start-Sleep -Seconds 2
+    $poll = Invoke-RestMethod `
+        -Uri "https://login.quickztna.com/api/remote-desktop" `
+        -Method POST `
+        -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+        -Body (@{ action = "status"; session_id = $SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+    $status = $poll.data.session.status
+    $hasAnswer = $poll.data.session.sdp_answer -ne $null
+    Write-Host "[$i] status=$status  has_answer=$hasAnswer"
+
+    if ($hasAnswer) { Write-Host "Answer received!"; break }
+    if ($status -in "expired", "rejected", "failed") { Write-Host "Session failed: $status"; break }
+}
+```
+
+4. After the answer is received, the session status should be `"connecting"`.
+
+**Pass:** Within 30 seconds, `sdp_answer` is populated in the status response and `status` is `"connecting"`.
+
+**Fail / Common issues:**
+- No answer after 44 seconds -- the service may not be running, or it was not built with `-tags workforce`. Check Win-B service status.
+- Agent logs show `"session denied by user"` -- Win-B's `requestUserConsent()` (in `consent_windows.go`) blocked the session. This is a system-level consent check.
+- Agent logs show `"max concurrent sessions reached"` -- Win-B already has 3 active sessions (the `maxConcurrentSessions` limit). Terminate stale sessions.
+- Status transitions to `"expired"` -- the session was in `signaling` or `connecting` state for more than 2 minutes before the agent responded.
+
+---
+
+## ST4 -- WebRTC Connected State and Session Activation
+
+**What it verifies:** After the browser applies the SDP answer, WebRTC reaches `"connected"` state and the viewer posts `action: "connected"` to transition the session to `active`.
+
+**Steps:**
+
+1. This test is best verified in the browser. Navigate to the remote desktop page:
+```
+https://login.quickztna.com/remote-desktop/MACHINE_ID?name=Win-B
+```
+
+2. Watch the toolbar status indicator in `RemoteDesktopViewer`. It progresses through states:
+   - "Initiating session..." (yellow dot)
+   - "Signaling..." (yellow dot)
+   - "Connecting to host..." (blue dot)
+   - "Connected" (green dot) + FPS counter appears
+
+3. Once "Connected" is shown, verify the session is marked `active` via the API:
+```powershell
+$active = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$active.data.session | Select-Object status, started_at
+```
+
+4. Check the audit log for `remote.desktop_connected`:
+```powershell
+# Audit logs are in Loki — check via Grafana at http://188.166.155.128:3000
+# Query: {job="audit"} | json | action="remote.desktop_connected" | resource_id="<session_id>"
+```
+
+**Pass:** Session `status` is `"active"`, `started_at` is non-null, FPS counter shows 8-15 fps in the viewer toolbar.
+
+**Fail / Common issues:**
+- WebRTC stuck at `"connecting"` (blue dot) for more than 30 seconds -- ICE candidates failed to negotiate. Check if both machines are on the same tailnet. STUN may be timing out; DERP relay will be used as fallback.
+- Browser shows "Timeout waiting for host agent to respond" -- the poll loop exhausted 22 iterations (44 seconds) without an answer. This indicates the agent command was not picked up. Verify the heartbeat interval on Win-B.
+
+---
+
+## ST5 -- Stale Session Auto-Termination and Recovery
+
+**What it verifies:** If a session exists in an active state when the viewer tries to initiate, the viewer auto-terminates it and retries. Sessions in `pending`/`signaling`/`connecting` older than 2 minutes auto-expire.
+
+**Steps:**
+
+1. Simulate a stale session by initiating without completing:
+```powershell
+$stale = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "initiate"; org_id = $ORG_ID; machine_id = $MACHINE_ID; session_type = "admin" } | ConvertTo-Json)
+
+$STALE_SESSION_ID = $stale.data.session_id
+Write-Host "Stale session: $STALE_SESSION_ID"
+```
+
+2. Now attempt a second initiate. Expect `SESSION_EXISTS` (HTTP 409):
+```powershell
+$retry = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "initiate"; org_id = $ORG_ID; machine_id = $MACHINE_ID; session_type = "admin" } | ConvertTo-Json) `
+    -ErrorAction SilentlyContinue
+
+$retry | ConvertTo-Json -Depth 3
+```
+
+3. Verify `error.code` is `"SESSION_EXISTS"` and `error.session_id` matches the stale session.
+
+4. Terminate the stale session using `action: "terminate"`:
+```powershell
+$term = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{
+        action     = "terminate"
+        org_id     = $ORG_ID
+        session_id = $STALE_SESSION_ID
+    } | ConvertTo-Json)
+
+$term.data.terminated_count
+```
+
+5. Verify `terminated_count` is `1`, then confirm a fresh initiate succeeds:
+```powershell
+$fresh = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "initiate"; org_id = $ORG_ID; machine_id = $MACHINE_ID; session_type = "admin" } | ConvertTo-Json)
+
+$fresh.success
+$fresh.data.session_id
+```
+
+6. To test auto-expiry, wait 2+ minutes on a session stuck in `pending` and then call `status`:
+```powershell
+Start-Sleep -Seconds 130
+
+$expired = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $STALE_SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$expired.data.session.status  # Should be "expired"
+```
+
+7. Clean up any test sessions:
+```powershell
+Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "terminate"; org_id = $ORG_ID; machine_id = $MACHINE_ID } | ConvertTo-Json)
+```
+
+**Pass:** Second initiate returns `SESSION_EXISTS` with the stale session ID; `terminate` returns `terminated_count: 1`; fresh initiate succeeds; sessions older than 2 minutes show `status: "expired"`.
+
+**Fail / Common issues:**
+- `terminate` returns `terminated_count: 0` -- the stale session was already in a terminal state (`disconnected`, `expired`). That is acceptable; the fresh initiate should succeed.
+- `terminate` returns `FORBIDDEN` -- only org admins can terminate. Confirm the token belongs to an admin user.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | Initiate creates session | `session_id` returned, `status: "pending"`, `port: 2223` |
+| ST2 | Offer dispatches agent command | `status: "signaling"`, `agent_commands` row with `command_type: "rdp_session"` |
+| ST3 | Agent posts SDP answer | `sdp_answer` populated within 30 seconds, `status: "connecting"` |
+| ST4 | WebRTC reaches connected | `status: "active"`, `started_at` set, FPS visible in viewer |
+| ST5 | Stale session recovery | `SESSION_EXISTS` on conflict, `terminate` clears it, auto-expiry at 2 minutes |

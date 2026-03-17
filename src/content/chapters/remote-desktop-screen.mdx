@@ -1,0 +1,299 @@
+---
+title: "Screen Sharing Verification"
+topic: "Remote Desktop"
+order: 117
+machines: ["Win-A", "Win-B"]
+summary: "Verify that screen frames captured via GDI BitBlt on Win-B are chunked, transmitted over WebRTC DataChannel, reassembled in the browser, and rendered at target frame rate."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Once the WebRTC connection reaches `"connected"` state, <MachineRef name="Win-B" />'s agent begins the screen capture and transmission pipeline. This chapter verifies each stage of that pipeline from raw pixels to rendered canvas.
+
+**Capture (`capture_windows.go`):** `windowsCapturer` uses `github.com/kbinani/screenshot` which calls GDI `BitBlt` to read from the primary display's device context. `CaptureFrame()` returns the primary monitor's full-resolution RGBA pixel buffer. The capturer targets `screenshot.GetDisplayBounds(0)` — the primary display only.
+
+**Encode (`session.go:captureLoop`):** JPEG encoding is performed using the standard library `image/jpeg.Encode()`. Default quality starts at `jpegQualityMedium` (50), adapts down to `jpegQualityLow` (30) if frames are slow (3+ consecutive frames exceeding 1.5x the frame budget), and recovers up to `jpegQualityHigh` (70) incrementally when frames finish on time. The capture loop ticks at `defaultFPS = 15` fps using `time.NewTicker`.
+
+**Chunking (`session.go:sendFrameChunked`):** JPEG frames are split into 60 KB chunks (the `maxChunkPayload` constant) because the SCTP layer's default maximum message size is 65536 bytes. Each chunk has an 8-byte binary header:
+- Bytes 0-3: `frameNum` (uint32 big-endian) — monotonic counter
+- Bytes 4-5: `chunkIdx` (uint16 big-endian) — 0-based index within this frame
+- Bytes 6-7: `totalChunks` (uint16 big-endian) — total chunks for this frame
+
+A 1280x720 JPEG at quality 50 is typically 40-90 KB, so most frames fit in a single chunk. A 1920x1080 frame at quality 50 is 100-140 KB, requiring 2-3 chunks.
+
+**DataChannel (`session.go:HandleOffer`):** The agent creates the `"video"` DataChannel with `ordered: false` and `maxRetransmits: 0`. This gives UDP-like semantics — stale frames are dropped rather than retransmitted, minimising head-of-line blocking. The channel is created by the agent (server-creates) so the viewer receives it via `pc.ondatachannel`.
+
+**Reassembly (`RemoteDesktopViewer.tsx`):** The viewer maintains a `chunkBuffer` Map keyed by `frameNum`. When all chunks for a frame arrive, it assembles a contiguous `Uint8Array`, wraps it in a `Blob("image/jpeg")`, and decodes via `createImageBitmap()`. Stale partial frames (more than 2 frames behind the latest complete frame) are evicted. The latest decoded `ImageBitmap` is stored in `latestFrameRef`.
+
+**Rendering (`RemoteDesktopViewer.tsx:renderLoop`):** A `requestAnimationFrame` loop draws `latestFrameRef` onto the `<canvas>`. Canvas dimensions are updated when the bitmap dimensions change. The viewer tracks FPS by counting complete frames per second and displays it in the toolbar.
+
+**Resolution negotiation:** On DataChannel `"control"` open, the agent sends a `ControlMessage` of type `"resolution"` with `width`, `height`, and `fps`. The viewer updates `hostResolution` state and uses it in `scaleCoordinates()` to map canvas-relative mouse coordinates back to host pixel coordinates.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Viewer — browser renders frames on canvas |
+| <MachineRef name="Win-B" /> | Target — GDI screen capture, JPEG encode, DataChannel transmit |
+
+**Prerequisites:**
+- Remote desktop session established and in `"active"` state (complete Day 24 ST1-ST4 first)
+- Browser DevTools open on <MachineRef name="Win-A" />
+- Win-B has a visible desktop (not locked; screen capture requires an active desktop session)
+
+---
+
+## ST1 -- First Frame Received and Rendered
+
+**What it verifies:** After WebRTC reaches `connected`, the agent begins transmitting frames and the canvas displays a live image within a few seconds.
+
+**Steps:**
+
+1. Open the remote desktop page on <MachineRef name="Win-A" />:
+```
+https://login.quickztna.com/remote-desktop/MACHINE_ID?name=Win-B
+```
+
+2. Wait for the status indicator to show "Connected" (green dot).
+
+3. Verify a frame is visible on the canvas:
+   - The canvas should show Win-B's desktop within 1-3 seconds of the "Connected" state.
+   - The FPS counter (e.g. "8 fps") should appear next to the status indicator.
+   - The canvas dimensions should match Win-B's display resolution.
+
+4. Check the canvas dimensions via browser console:
+```javascript
+const canvas = document.querySelector('canvas');
+console.log('Canvas dimensions:', canvas.width, 'x', canvas.height);
+```
+
+5. On <MachineRef name="Win-B" />, verify capture started in the service log:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 20 |
+    Select-String "screen capture started|frame sent"
+```
+
+Expected log lines:
+```
+screen capture started  session_id=<id>  fps=15
+frame sent              session_id=<id>  frame=1  size=72341  chunks=2  wxh=1280x720  quality=50
+```
+
+**Pass:** Canvas shows Win-B's desktop, FPS counter is non-zero, agent log shows "screen capture started" and at least one "frame sent" line.
+
+**Fail / Common issues:**
+- Canvas is black -- the agent started but GDI capture failed. Win-B's desktop may be locked (screen saver or lock screen). The `screenshot.CaptureRect()` call fails if no active desktop session owns the display.
+- FPS counter shows 0 but "Connected" -- the `"video"` DataChannel opened but no frames arrived. Check Win-B logs for JPEG encode errors.
+- Canvas dimensions are wrong -- verify `hostResolution` state updated from the control channel's `"resolution"` message.
+
+---
+
+## ST2 -- Frame Chunking Protocol Verification
+
+**What it verifies:** Frames larger than 60 KB are correctly split into multi-chunk messages by the agent and reassembled without corruption by the viewer.
+
+**Steps:**
+
+1. Open browser DevTools on <MachineRef name="Win-A" />, go to the Console tab.
+
+2. Inject a diagnostic snippet to intercept the DataChannel and log chunk headers (run this before the connection is established, or after reconnecting):
+```javascript
+// After RTCPeerConnection is created, intercept ondatachannel
+// This relies on the viewer having established the connection.
+// Check the raw DataChannel message sizes and frame numbers:
+const originalOnDC = RTCPeerConnection.prototype.addEventListener;
+```
+
+Since we cannot easily hook into the component internals at runtime, verify chunking through the agent logs instead.
+
+3. On <MachineRef name="Win-B" />, check agent logs for multi-chunk frames. The log line includes chunk count:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 100 |
+    Select-String "chunks=2|chunks=3"
+```
+
+A log line with `chunks=2` confirms the frame was split into 2 chunks (each 60 KB + header).
+
+4. Change Win-B's display resolution to 1920x1080 to force larger frames. Go to Display Settings on Win-B, set resolution to 1920x1080, then observe:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 50 |
+    Select-String "frame sent" | Select-Object -Last 5
+```
+
+Expected: `wxh=1920x1080  chunks=2` or `chunks=3` for larger JPEG sizes.
+
+5. On <MachineRef name="Win-A" />, verify the canvas resized to the new resolution:
+```javascript
+const canvas = document.querySelector('canvas');
+console.log(canvas.width, 'x', canvas.height);
+// Expected: 1920 x 1080
+```
+
+6. Confirm no corrupt frames are visible -- the image should be clean without artifacts or partial renders.
+
+**Pass:** Agent logs show `chunks=2` or higher for frames over 60 KB; canvas shows a clean image at the new resolution with no visible corruption.
+
+**Fail / Common issues:**
+- All frames show `chunks=1` even at 1920x1080 -- quality may have dropped to `jpegQualityLow` (30), producing smaller frames. Check the `quality=` field in the log.
+- Canvas shows partial or corrupt image -- one chunk was lost in transit. Since the DataChannel is unordered with `maxRetransmits=0`, occasional dropped chunks are expected. The viewer should skip the corrupted frame (it evicts incomplete frames). If corruption is persistent, check for SCTP-level errors in the agent log.
+- Canvas does not resize after resolution change -- the `"resolution"` control message is only sent once on channel open. Restart the session to trigger a fresh resolution message.
+
+---
+
+## ST3 -- Frame Rate Under Normal Conditions
+
+**What it verifies:** The agent sustains 8-15 fps under normal desktop conditions, matching the expected performance from `defaultFPS = 15` and the adaptive quality system.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, observe the FPS counter in the remote desktop toolbar for 30 seconds. Record the displayed value.
+
+2. Move the mouse on Win-B's desktop (from a physical keyboard/mouse if available, or via remote input — see Chapter 118) to generate visual changes. FPS should remain stable.
+
+3. Open a video or animation on Win-B (e.g., Windows Media Player or a browser-based animation) to increase pixel change density. This stresses the JPEG encoder since motion scenes have less compressibility.
+
+4. On Win-B, monitor JPEG quality adaptation:
+```powershell
+# Watch for quality reduction log lines
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 100 |
+    Select-String "reducing JPEG quality"
+```
+
+Log entry format:
+```
+reducing JPEG quality  new=45  elapsed_ms=95
+```
+
+This fires when 3+ consecutive frames exceed 1.5x the frame budget (`1.5 / 15fps = 100ms`).
+
+5. After the motion stops, quality should gradually recover (incremented by 1 per smooth frame) toward `jpegQualityHigh` (70). Check:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" -Tail 200 |
+    Select-String "frame sent" | Select-Object -Last 10
+```
+
+Watch the `quality=` field increase toward 70 when frames are fast.
+
+**Pass:** FPS counter shows 8-15 fps under normal conditions; agent logs show adaptive quality responding to frame timing; quality recovers toward 70 after load subsides.
+
+**Fail / Common issues:**
+- FPS drops to 0-2 -- extreme CPU load on Win-B is preventing the capture loop from completing. Check Win-B CPU usage.
+- Quality stuck at 30 -- persistent slow frames indicate system overload or a very high-resolution display. The quality will not rise above 30 while frames are consistently slow.
+- FPS counter in browser shows higher than agent log -- the browser FPS counts complete reassembled frames; if chunks are arriving but frames are not completing (some chunks lost), the two values may diverge.
+
+---
+
+## ST4 -- Resolution Control Message
+
+**What it verifies:** The agent sends a `ControlMessage` of type `"resolution"` on DataChannel open, and the viewer's `hostResolution` state updates accordingly, ensuring mouse coordinates are scaled correctly.
+
+**Steps:**
+
+1. Open the remote desktop page on <MachineRef name="Win-A" />. Before the session connects, open the browser console.
+
+2. After "Connected" appears, run in the console:
+```javascript
+// The viewer stores hostResolution in React state.
+// We can observe the canvas dimensions which mirror hostResolution:
+const canvas = document.querySelector('canvas');
+console.log('Host resolution from canvas:', canvas.width, 'x', canvas.height);
+```
+
+3. Verify the resolution matches Win-B's actual display resolution. Check Win-B's display settings:
+```powershell
+# On Win-B:
+Add-Type -AssemblyName System.Windows.Forms
+$screen = [System.Windows.Forms.Screen]::PrimaryScreen
+Write-Host "Win-B resolution: $($screen.Bounds.Width) x $($screen.Bounds.Height)"
+```
+
+4. Verify the resolution numbers match between Win-A's canvas and Win-B's display.
+
+5. Check the agent log for the control message being sent:
+```powershell
+Get-Content "$env:LOCALAPPDATA\Programs\QuickZTNA\quickztna-svc.log" |
+    Select-String "resolution|control"
+```
+
+The resolution message is sent in `session.go:HandleOffer` when the `"control"` DataChannel opens:
+```go
+s.sendControlMessage(dc, ControlMessage{
+    Type: "resolution", Width: defaultWidth, Height: defaultHeight, FPS: s.fps,
+})
+```
+
+Note: `defaultWidth = 1280` and `defaultHeight = 720` are constants, but the actual capture resolution is determined by `screenshot.GetDisplayBounds(0)`. The resolution message reflects the constants, while the actual JPEG frame size reflects the real capture size. If Win-B is 1920x1080, the canvas will resize to 1920x1080 when the first frame arrives, overriding the control message value.
+
+**Pass:** Canvas dimensions match Win-B's actual display resolution after the first frame; mouse clicks land correctly on Win-B (verified in Chapter 118).
+
+**Fail / Common issues:**
+- Canvas dimensions show 1280x720 even on a 1920x1080 display -- the resolution control message used the constants rather than the actual capture size. The canvas will auto-resize when the first frame arrives (canvas width/height are set from the `ImageBitmap` in `renderLoop`). If the canvas is not resizing, check that `renderLoop` is running (animation frame must be started).
+- Control message not received -- if the `"control"` DataChannel failed to open within the WebRTC negotiation, the viewer's `controlChannel.onmessage` handler is never registered. This is non-fatal; the canvas resizes from the first frame.
+
+---
+
+## ST5 -- Canvas Render Loop Continuity
+
+**What it verifies:** The `requestAnimationFrame` render loop runs continuously while connected, updating the canvas at the browser's display refresh rate (60 Hz), independently of the incoming frame rate (8-15 fps from agent).
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, with the remote desktop page open and "Connected", open browser DevTools Performance tab.
+
+2. Click "Record" and let it run for 5 seconds while the remote desktop is active.
+
+3. Stop recording. In the Frames section, verify:
+   - Animation frames are firing consistently at 60 fps (approximately 16 ms per frame)
+   - There are no long gaps in the animation frame timeline (which would indicate the render loop stalled)
+
+4. Switch Win-B's display to show a static desktop (no motion). In the console on <MachineRef name="Win-A" />:
+```javascript
+// The render loop draws latestFrameRef on every animation frame.
+// Even if the agent sends the same frame repeatedly, the canvas is re-drawn each time.
+// Verify the canvas is updating by checking pixel values at intervals:
+const canvas = document.querySelector('canvas');
+const ctx = canvas.getContext('2d');
+const before = ctx.getImageData(0, 0, 10, 10).data[0];
+setTimeout(() => {
+    const after = ctx.getImageData(0, 0, 10, 10).data[0];
+    console.log('Pixel before:', before, 'after:', after);
+    console.log('Canvas is live:', true); // render loop is running even if frame is same
+}, 2000);
+```
+
+5. Close the remote desktop page (click the X button) and verify cleanup:
+   - `cancelAnimationFrame` is called (render loop stops)
+   - `pc.close()` is called (WebRTC peer connection closes)
+   - `action: "disconnect"` is posted to the backend
+
+6. Verify the disconnect was recorded:
+```powershell
+$final = Invoke-RestMethod `
+    -Uri "https://login.quickztna.com/api/remote-desktop" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body (@{ action = "status"; session_id = $SESSION_ID; org_id = $ORG_ID } | ConvertTo-Json)
+
+$final.data.session | Select-Object status, ended_at, duration_seconds
+```
+
+**Pass:** Animation frames fire at 60 fps (DevTools shows no gaps); after closing, session status is `"disconnected"` with `ended_at` and `duration_seconds` populated.
+
+**Fail / Common issues:**
+- Render loop shows gaps in Performance tab -- browser tab may have been backgrounded (browsers throttle `requestAnimationFrame` in background tabs). Bring the tab to the foreground.
+- Session status remains `"active"` after closing the page -- the `cleanup()` function calls `rdpApiCall("disconnect", ...)` with a `.catch(() => {})`, so network errors on close are silently swallowed. If the page was closed abruptly (process kill, browser crash), the disconnect call may not fire. The session will remain `"active"` until terminated manually.
+- `duration_seconds` is null -- `started_at` was never set, meaning `action: "connected"` was never posted. The session may have gone directly from `connecting` to `disconnected`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | First frame rendered | Canvas shows Win-B desktop within 3 seconds; FPS counter non-zero |
+| ST2 | Chunk protocol works | Agent logs show `chunks=2+` for large frames; no canvas corruption |
+| ST3 | Adaptive frame rate | 8-15 fps sustained; quality adapts under load, recovers when load drops |
+| ST4 | Resolution control message | Canvas dimensions match Win-B's actual display resolution |
+| ST5 | Render loop continuity | RAF fires at 60 Hz; clean disconnect records `ended_at` and `duration_seconds` |

@@ -1,0 +1,479 @@
+---
+title: "JIT Access Request & Approval"
+topic: "Governance & JIT Access"
+order: 67
+machines: ["Win-A", "Win-B"]
+summary: "Submit a JIT access request, approve it as admin, and verify a temporary ACL rule is created. Also test denial and input validation."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Just-in-Time (JIT) access lets a non-admin user request temporary elevated access between a source and destination selector. An org admin must approve or deny the request. This chapter tests the full request-approval-denial flow inside `handleGovernance` (`backend/src/handlers/governance.ts`), routed via `POST /api/governance`.
+
+The JIT flow across four actions:
+
+**`jit_request`** (any org member):
+- Inserts a row into `jit_access_grants` with `status = 'pending'`.
+- Required fields: `source_selector`, `destination_selector`. Optional: `reason`, `ports`, `protocol`, `duration_hours`.
+- `duration_hours` is clamped to 1--24 (defaults to 1).
+- `protocol` must be one of `'tcp'`, `'udp'`, `'icmp'`, `'*'` (defaults to `'tcp'`).
+- `ports` must match the pattern `"80"`, `"80,443"`, `"1000-2000"`, or `"*"` (defaults to `"*"`).
+- Audit event: `jit.requested`.
+
+**`jit_approve`** (org admin only):
+- Validates the grant exists and is `status = 'pending'`.
+- Inserts a temporary ACL rule into `acl_rules` with `expires_at` set to `NOW() + duration_hours`.
+- Updates the grant: `status = 'approved'`, `approver_user_id`, `granted_at`, `expires_at`.
+- The ACL rule's `jit_grant_id` column links it back to the grant.
+- Audit event: `jit.approved`.
+- Returns: `grant_id`, `status`, `expires_at`, `acl_rule_id`.
+
+**`jit_deny`** (org admin only):
+- Updates `status = 'denied'`, sets `approver_user_id` and `denial_reason`.
+- No ACL rule is created.
+- Audit event: `jit.denied`.
+
+**`jit_list`** (any org member):
+- Returns up to 100 grants for the org, optionally filtered by `status`.
+
+**DB tables touched:** `jit_access_grants`, `acl_rules`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Acts as the requesting user (non-admin token for some tests, admin for approval) |
+| <MachineRef name="Win-B" /> | Provides a second registered machine to use as the destination selector |
+
+**Prerequisites:** Both machines registered and online. You need both an admin JWT token and a non-admin member JWT token. The `source_selector` and `destination_selector` can be tag expressions (e.g., `"tag:dev"`) or machine tailnet IPs.
+
+---
+
+## ST1 -- Submit a JIT Access Request
+
+**What it verifies:** Any org member can submit a JIT request. The handler inserts the grant with `status: "pending"` and returns the `grant_id`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, submit a JIT request using the non-admin member token:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_request",
+    "org_id": "YOUR_ORG_ID",
+    "source_selector": "tag:dev",
+    "destination_selector": "tag:prod-db",
+    "ports": "5432",
+    "protocol": "tcp",
+    "duration_hours": 2,
+    "reason": "Debugging production query performance issue"
+  }'
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "grant_id": "<uuid>",
+    "status": "pending"
+  },
+  "error": null
+}
+```
+
+Record the `grant_id` for use in ST2--ST4.
+
+2. Confirm the grant appears in the pending list:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_list",
+    "org_id": "YOUR_ORG_ID",
+    "status": "pending"
+  }'
+```
+
+**Expected:** The grant appears in `data.grants` with `status: "pending"` and `approver_user_id: null`.
+
+3. Check the pending count badge endpoint:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_pending_count",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** `data.pending_count` is at least 1.
+
+**Pass:** HTTP 201, `grant_id` UUID returned, `status: "pending"`. Grant visible in `jit_list`. Pending count incremented.
+
+**Fail / Common issues:**
+- HTTP 403 -- the token is not an org member. `jit_request` requires org membership (not admin).
+- HTTP 400 `MISSING_FIELDS` -- `source_selector` or `destination_selector` is absent.
+- HTTP 400 `INVALID_INPUT` -- `ports` format is invalid (e.g., `"port:80"` is not accepted; use `"80"`).
+
+---
+
+## ST2 -- Input Validation: Duration Clamping and Invalid Protocol
+
+**What it verifies:** `duration_hours` is clamped to the 1--24 range, and an invalid `protocol` falls back to `'tcp'`.
+
+**Steps:**
+
+1. Submit a request with `duration_hours: 999` (above the 24-hour maximum):
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_request",
+    "org_id": "YOUR_ORG_ID",
+    "source_selector": "tag:dev",
+    "destination_selector": "tag:prod",
+    "duration_hours": 999
+  }'
+```
+
+**Expected:** HTTP 201, `status: "pending"`. Retrieve the grant and confirm `requested_duration_hours` is `24`, not `999`.
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_list",
+    "org_id": "YOUR_ORG_ID",
+    "status": "pending"
+  }'
+```
+
+Find the new grant. **Expected:** `requested_duration_hours: 24`.
+
+2. Submit with `duration_hours: 0` (below the 1-hour minimum):
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_request",
+    "org_id": "YOUR_ORG_ID",
+    "source_selector": "tag:dev",
+    "destination_selector": "tag:prod",
+    "duration_hours": 0
+  }'
+```
+
+**Expected:** HTTP 201. `requested_duration_hours` in the stored grant is `1` (clamped up from 0).
+
+3. Submit with an invalid `protocol` value:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_request",
+    "org_id": "YOUR_ORG_ID",
+    "source_selector": "tag:dev",
+    "destination_selector": "tag:prod",
+    "protocol": "sctp"
+  }'
+```
+
+**Expected:** HTTP 201. The stored grant has `protocol: "tcp"` (invalid protocol replaced with default).
+
+4. Test invalid `ports` format:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_request",
+    "org_id": "YOUR_ORG_ID",
+    "source_selector": "tag:dev",
+    "destination_selector": "tag:prod",
+    "ports": "port:5432"
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "Invalid ports format. Use \"80\", \"80,443\", \"1000-2000\", or \"*\""
+  }
+}
+```
+
+**Pass:** `duration_hours` outside 1--24 is clamped. Invalid `protocol` falls back to `"tcp"`. Invalid `ports` format returns HTTP 400 `INVALID_INPUT`.
+
+**Fail / Common issues:**
+- `requested_duration_hours` stores the unclamped value -- `Math.min(Math.max(...))` is not running. Check the handler's `safeDuration` variable.
+- Invalid `protocol` stored as-is -- the `VALID_PROTOCOLS` include-check is not being applied.
+
+---
+
+## ST3 -- Approve a JIT Request
+
+**What it verifies:** Approving creates a temporary ACL rule linked to the grant, and the grant transitions to `status: "approved"`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" /> using the admin token, approve the grant from ST1:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_approve",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "GRANT_UUID_FROM_ST1"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "grant_id": "GRANT_UUID_FROM_ST1",
+    "status": "approved",
+    "expires_at": "2026-03-17T12:00:00.000Z",
+    "acl_rule_id": "<uuid>"
+  },
+  "error": null
+}
+```
+
+The `expires_at` should be approximately 2 hours from the time of approval (matching the `duration_hours: 2` from ST1). Record `acl_rule_id`.
+
+2. Verify the temporary ACL rule was created:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.ACL_RULE_UUID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Expected:** A rule with:
+- `name: "JIT: tag:dev → tag:prod-db"`
+- `source: "tag:dev"`, `destination: "tag:prod-db"`
+- `ports: "5432"`, `protocol: "tcp"`
+- `action: "allow"`, `enabled: true`
+- `jit_grant_id: "GRANT_UUID_FROM_ST1"`
+- `expires_at`: matching the grant's `expires_at`
+
+3. Try to approve the same grant a second time:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_approve",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "GRANT_UUID_FROM_ST1"
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_STATE",
+    "message": "Grant is already approved"
+  }
+}
+```
+
+**Pass:** Approval returns `status: "approved"` with `expires_at` and `acl_rule_id`. The ACL rule exists with the correct fields and `jit_grant_id`. Double-approve returns `INVALID_STATE`.
+
+**Fail / Common issues:**
+- HTTP 403 -- `jit_approve` requires org admin. Member tokens are rejected.
+- HTTP 404 `NOT_FOUND` -- the `grant_id` is wrong or belongs to a different org.
+- ACL rule not found -- check that the rollback did not fire. If `UPDATE jit_access_grants` failed, the handler deletes the ACL rule and returns HTTP 500.
+
+---
+
+## ST4 -- Deny a JIT Request
+
+**What it verifies:** Denying a pending request transitions it to `status: "denied"` and stores the `denial_reason`. No ACL rule is created.
+
+**Steps:**
+
+1. Create a fresh JIT request to deny (from <MachineRef name="Win-B" /> or a second request from Win-A):
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_request",
+    "org_id": "YOUR_ORG_ID",
+    "source_selector": "tag:staging",
+    "destination_selector": "tag:prod-api",
+    "ports": "443",
+    "protocol": "tcp",
+    "duration_hours": 1,
+    "reason": "Test request to be denied"
+  }'
+```
+
+Record the new `grant_id`.
+
+2. Deny the request with a reason:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_deny",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "NEW_GRANT_UUID",
+    "denial_reason": "Staging to prod-api access is not permitted outside change windows"
+  }'
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "grant_id": "NEW_GRANT_UUID",
+    "status": "denied",
+    "denial_reason": "Staging to prod-api access is not permitted outside change windows"
+  },
+  "error": null
+}
+```
+
+3. Verify no ACL rule was created for the denied grant:
+
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+Scan the results. There should be no rule with `jit_grant_id` matching the denied grant UUID.
+
+4. Check the grant history:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_request_history",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** The denied grant appears with `status: "denied"`, `denial_reason` populated, and `approver_email` showing the admin's email.
+
+**Pass:** Denied grant transitions to `status: "denied"` with `denial_reason` stored. No ACL rule is created. Grant appears in `get_request_history`.
+
+**Fail / Common issues:**
+- `denial_reason` is null even when provided -- migration 024/025 adds the `denial_reason` column. If the column does not exist on the DB, the handler falls back to the column-less UPDATE. Check that migration 025 ran.
+- HTTP 403 -- `jit_deny` requires org admin.
+
+---
+
+## ST5 -- Non-Admin Cannot Approve or Deny
+
+**What it verifies:** The `jit_approve` and `jit_deny` actions enforce admin-only access. A plain member token is rejected with HTTP 403.
+
+**Steps:**
+
+1. Using the non-admin member token (same one used in ST1), attempt to approve a pending grant:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_approve",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "ANY_PENDING_GRANT_UUID"
+  }'
+```
+
+**Expected error (HTTP 403):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin required"
+  }
+}
+```
+
+2. Also test `jit_deny` with the member token:
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_deny",
+    "org_id": "YOUR_ORG_ID",
+    "grant_id": "ANY_PENDING_GRANT_UUID"
+  }'
+```
+
+**Expected error (HTTP 403):** Same `FORBIDDEN` / `"Admin required"` response.
+
+3. Confirm `jit_request` and `jit_list` still work for the member token (they require only org membership):
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/governance" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "jit_list",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected:** HTTP 200 with the grants list. No 403.
+
+**Pass:** `jit_approve` and `jit_deny` return HTTP 403 for non-admin tokens. `jit_request` and `jit_list` return HTTP 200 for any org member.
+
+**Fail / Common issues:**
+- Member token can approve -- `isOrgAdmin()` is not being called, or the role check is returning the wrong result for this user. Verify the user's role in `org_members` is `'member'` not `'admin'`.
+- 401 instead of 403 -- the token itself is invalid or expired. Use a fresh token.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | `jit_request` inserts a pending grant (HTTP 201) visible in `jit_list` and `get_pending_count` |
+| ST2 | `duration_hours` is clamped 1--24; invalid `protocol` defaults to `"tcp"`; bad `ports` format returns `INVALID_INPUT` |
+| ST3 | `jit_approve` creates a temporary ACL rule linked via `jit_grant_id`; double-approve returns `INVALID_STATE` |
+| ST4 | `jit_deny` transitions to `"denied"` with `denial_reason`; no ACL rule is created |
+| ST5 | `jit_approve` and `jit_deny` return HTTP 403 for non-admin tokens; `jit_request` and `jit_list` are open to all members |

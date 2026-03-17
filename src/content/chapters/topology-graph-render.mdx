@@ -1,0 +1,202 @@
+---
+title: "Topology Graph Renders with All 3 Machines"
+topic: "Topology Visualization"
+order: 86
+machines: ["Win-A"]
+summary: "Verify that the Machines page correctly renders all registered machines with their tailnet IPs, statuses, OS types, and network role badges — confirming the complete network inventory view."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA does not have a dedicated graph canvas topology page. The `/topology` route is a legacy redirect to `/machines` (see `src/App.tsx` line 159). The authoritative topology view is the **Machines page** (`/machines`), which renders the complete network inventory as a structured table.
+
+The `MachinesPage` component (`src/pages/MachinesPage.tsx`) fetches machine data via the `useMachinesData` hook, which calls:
+
+```
+GET /api/db/machines?org_id=ORG_ID
+```
+
+Each machine row (`MachineRow` component) renders:
+- Machine name and MagicDNS hostname (`name.orgslug.zt.net`)
+- Tailnet IP (`tailnet_ip`) and public endpoint IP (from `public_endpoint`)
+- OS icon and label (`os` field)
+- Status indicator dot (green = `online`, yellow = `pending`, grey = `offline`, red = `quarantined`)
+- Approval state badge
+- Network role badges: "Exit Node" (when `exit_node_approved = true`), "Router" (when `approved_routes` is non-empty), "Quarantined"
+- Key expiry badge (within 30 days: orange; expired: red)
+- Last-seen timestamp with colour-coded staleness
+
+The page also tracks machine limits via `useBillingData` and shows a warning alert when usage exceeds 80 percent of the plan limit.
+
+An **AI Security Review** quick-action button invokes the `query_network_topology` AI tool on the backend, which aggregates machines, segmentation groups, and group memberships in a single response.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser — dashboard access, API testing |
+
+**Prerequisite:** All three test machines (Win-A, Win-B, Linux-C) are registered and approved. At least Win-A must be `online`.
+
+---
+
+## ST1 -- Machines Page Loads with Correct Machine Count
+
+**What it verifies:** The Machines page fetches and renders all registered machines. The page header shows the correct count.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+2. Wait for the skeleton loading state to resolve.
+3. Check the subtitle under the "Machines" heading.
+
+**Expected:** The subtitle reads "N devices in your network" where N equals the number of registered machines (3 for a full test setup with Win-A, Win-B, Linux-C).
+
+4. Confirm the table shows one row per machine. Each row has:
+   - A name column with the machine name
+   - A tailnet IP column showing a `100.64.x.x` address
+   - An OS column with the correct platform label
+   - A status column with a coloured dot
+
+**Pass:** Page loads without error. Machine count in the subtitle matches the number of rows in the table.
+
+**Fail / Common issues:**
+- Page shows 0 machines -- check that the browser is logged in and the correct org is selected in the org switcher.
+- Some machines missing -- they may be in `pending` status and listed in a separate "Pending Approval" card above the main table.
+
+---
+
+## ST2 -- Each Machine Shows Correct Tailnet IP
+
+**What it verifies:** The `tailnet_ip` field stored in the database is correctly displayed in the machine table, and each machine has a unique IP within the `100.64.0.0/10` range.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, query the machines API directly:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,tailnet_ip,status,os" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": [
+    { "name": "Win-A", "tailnet_ip": "100.64.x.x", "status": "online", "os": "windows" },
+    { "name": "Win-B", "tailnet_ip": "100.64.x.y", "status": "online", "os": "windows" },
+    { "name": "Linux-C", "tailnet_ip": "100.64.x.z", "status": "online", "os": "linux" }
+  ]
+}
+```
+
+2. Cross-reference each IP shown in the browser table against the API response. They must match exactly.
+
+3. On <MachineRef name="Win-A" />, run:
+```bash
+ztna ip
+```
+The output must match the `tailnet_ip` shown for Win-A in both the API response and the browser table.
+
+**Pass:** All three machines have distinct `100.64.x.x` tailnet IPs. The IP shown in the browser matches the API and the CLI output.
+
+---
+
+## ST3 -- OS Type is Correctly Identified for Each Machine
+
+**What it verifies:** The `os` field is set correctly during machine registration and rendered with the correct label in the Machines page table.
+
+**Steps:**
+1. In the Machines page table, locate the OS column for each machine.
+
+**Expected:**
+- Win-A: OS label reads "windows"
+- Win-B: OS label reads "windows"
+- Linux-C: OS label reads "linux"
+
+2. Verify via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,os" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. Confirm the browser uses a `Monitor` icon (from lucide-react) for both Windows and Linux machines (the `osIcons` map in `MachinesPage.tsx` returns a `Monitor` icon for both `linux` and `windows` entries).
+
+**Pass:** All three machines show the correct OS label. No machine shows "unknown" or an empty OS column.
+
+---
+
+## ST4 -- Online Status Correctly Rendered for Active Machine
+
+**What it verifies:** The status column renders the correct visual indicator for an `online` machine. The "Last Seen" column shows "Connected" (not a timestamp) for online machines.
+
+**Steps:**
+1. Ensure at least <MachineRef name="Win-A" /> is running `ztna up` and has sent a recent heartbeat.
+
+2. In the Machines page table, locate the Win-A row.
+
+**Expected:**
+- Status column: green filled circle (`bg-green-500`) next to the text "online"
+- Last Seen column: shows "Connected" in green bold text (this is the `machine.status === "online"` branch in `MachineRow`)
+
+3. On a second machine that is currently offline (stop the VPN with `ztna down`), verify:
+- Status column: grey circle (`bg-muted-foreground/40`) next to "offline"
+- Last Seen column: relative time string such as "5m ago" or "2h ago" in colour-coded text (green under 5 min, yellow under 1 hour, orange under 24 hours, red beyond 24 hours)
+
+4. Confirm via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Pass:** Online machines show green dot and "Connected" text. Offline machines show grey dot and a relative timestamp with correct colour coding.
+
+---
+
+## ST5 -- Full Topology Snapshot via AI Network Query
+
+**What it verifies:** The backend `query_network_topology` function aggregates machines, segmentation groups, and group memberships into a single structured summary, providing a programmatic topology snapshot.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, invoke the AI endpoint with the topology query tool:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/ai-assist" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"message\": \"Give me the complete network topology overview including all machines, their IPs, and any segmentation groups.\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** The AI response includes a topology summary with:
+- Total machine count (should equal 3)
+- Each machine's name and tailnet IP
+- Any exit nodes (machines with `advertise_exit_node = true`)
+- Any subnet routers (machines with non-empty `approved_routes`)
+- Segmentation groups and their member machine names
+
+2. In the dashboard browser, click "AI Security Review" on the Machines page (the button calls the same topology tool internally).
+
+**Expected:** A slide panel opens with a human-readable network topology summary.
+
+**Pass:** The AI topology response correctly lists all 3 machines with their tailnet IPs and statuses. If segmentation groups exist, they are listed with their members.
+
+**Fail / Common issues:**
+- AI feature not available -- the `ai_chat` feature must be enabled for the org's plan. Check the plan on the Billing page.
+- Response lists only some machines -- the backend query uses `LIMIT 100`, so this will not be an issue for a 3-machine test environment.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Machines page loads full inventory | Page subtitle shows correct machine count; one row per machine |
+| ST2 | Tailnet IPs rendered correctly | Each machine has a unique `100.64.x.x` IP matching CLI and API |
+| ST3 | OS type identified correctly | Windows machines show "windows"; Linux machine shows "linux" |
+| ST4 | Online/offline status visual indicators | Online: green dot + "Connected"; Offline: grey dot + relative timestamp |
+| ST5 | AI topology snapshot aggregation | All 3 machines listed with IPs; segmentation groups included if present |

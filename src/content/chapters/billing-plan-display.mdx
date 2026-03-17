@@ -1,0 +1,191 @@
+---
+title: "Billing Page Plan Display"
+topic: "Billing & Plans"
+order: 91
+machines: ["Win-A"]
+summary: "Verify that the Billing page loads the correct plan name, usage counters, progress bars, and subscription details from the billing_subscriptions table and feature-check endpoint."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Billing page at `/billing` is served by `BillingPage.tsx`. It fetches data from two sources simultaneously:
+
+- **`useBillingData` hook** — queries three CRUD endpoints in parallel:
+  - `GET /api/db/billing_subscriptions?org_id=X` — reads `plan`, `status`, `razorpay_subscription_id`, `machine_limit`, `user_limit`, `current_period_start`, `current_period_end`
+  - `GET /api/db/machines?org_id=X` (count only) — current machine count
+  - `GET /api/db/org_members?org_id=X` (count only) — current user count
+- **`useFeatureCheck` hook** — calls `POST /api/feature-check` (`handleFeatureCheck` in `platform-admin.ts`), which reads the `billing_subscriptions` and `plan_features` tables, returning `{ plan, features[], is_superadmin }`. This result is cached in Valkey for 600 seconds under the key `features:{org_id}`.
+
+The `currentPlan` rendered on screen is resolved as: DB plan from `feature-check` takes precedence over `billing_subscriptions.plan`, falling back to `"free"`.
+
+Plan display constants (from `BillingPage.tsx`):
+- **Free:** `$0`, 100 machines, 3 users
+- **Business:** `$10/user/mo`, 100 machines/user, unlimited users
+- **Workforce:** `$15/user/mo`, 100 machines/user, unlimited users
+
+Progress bars show `machineCount / machine_limit` and `userCount / user_limit`. For per-user plans (Business, Workforce) the user progress bar is hidden — only the machine bar shows.
+
+The monthly estimate row appears only on paid plans: `userCount x planPrice /mo`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser — open Billing page as org admin |
+
+---
+
+## ST1 — Billing Page Loads for a Free-Plan Org
+
+**What it verifies:** A new or free-tier org renders "Free", `$0`, machine and user progress bars with correct limits (100 machines / 3 users), and no "Cancel Subscription" button.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, log in at `https://login.quickztna.com` as an org **owner** or **admin**.
+2. Navigate to **Billing** in the sidebar (route: `/billing`).
+3. Observe the **Current Plan** card at the top.
+
+**Expected:**
+- Badge reads **Free**.
+- Price shown as `$0`.
+- Machines progress bar reads `N / 100` where N is your current machine count.
+- Users progress bar reads `N / 3`.
+- No "Monthly estimate" row (Free plan is flat-rate, not per-user).
+- No "Cancel Subscription" button (no active Razorpay subscription).
+- The plan selector grid shows three cards: Free (highlighted with `Current` badge), Business, Workforce.
+
+**Pass:** All labels match the Free plan constants. No error alerts. Page finishes loading within 3 seconds.
+
+**Fail / Common issues:**
+- Page shows a skeleton loader indefinitely — check browser DevTools Network tab for a failed request to `/api/db/billing_subscriptions` or `/api/feature-check`.
+- Plan shows as something other than Free — a stale row may exist in `billing_subscriptions`. Verify via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/billing_subscriptions?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## ST2 — Current Plan Badge Reflects DB State
+
+**What it verifies:** The `feature-check` endpoint returns the correct plan and the UI badge updates immediately when the DB changes.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open browser DevTools → **Network** tab. Filter by `feature-check`.
+2. Navigate to `/billing`. Wait for the request to complete.
+3. Click the `feature-check` request and inspect the response body.
+
+**Expected response body:**
+```json
+{
+  "success": true,
+  "data": {
+    "plan": "free",
+    "features": ["security_digest", "policy_drift", "access_heatmap", "risk_engine"],
+    "is_superadmin": false
+  }
+}
+```
+
+4. Confirm the badge on the page reads **Free** — matching `data.plan`.
+
+**Pass:** `data.plan` in the network response matches the badge shown on the billing page. The `features` array contains at least the four free-tier features listed above.
+
+**Fail / Common issues:**
+- `UNAUTHORIZED` (401) — JWT expired. Refresh the page to get a new token.
+- `FORBIDDEN` (403) — the logged-in user is not a member of the org whose `org_id` was sent.
+- `data.plan` is `"workforce"` unexpectedly — the org may be the superadmin org (`db1743d7-2cbe-4732-8b96-7c12bee360d9`), which is always on the workforce plan.
+
+---
+
+## ST3 — Machine and User Counts Match Actual Inventory
+
+**What it verifies:** The progress bar numbers reflect real machine and member counts from the database.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, navigate to `/machines` and count active machines.
+2. Navigate to `/users` and count org members.
+3. Navigate back to `/billing`.
+4. Read the counters in the **Current Plan** card.
+
+**Expected:** The machine counter on the Billing page matches the count seen on the Machines page. The user counter matches the count on the Users page (within ±1 for timing differences).
+
+**Alternative verification via API:**
+```bash
+# Machine count
+curl -s "https://login.quickztna.com/api/db/machines?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print('machines:', len(d['data']))"
+
+# User count
+curl -s "https://login.quickztna.com/api/db/org_members?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print('members:', len(d['data']))"
+```
+
+**Pass:** Billing page counters match the raw counts from the API within ±1.
+
+**Fail / Common issues:**
+- Counters show 0 for both machines and users — likely a failed CRUD query. Check DevTools for 4xx responses on `/api/db/machines`.
+- Count mismatch greater than 1 — a machine may have been recently deleted or a member invite is pending. Reload the page to refresh the React Query cache.
+
+---
+
+## ST4 — Non-Admin Member Cannot See Plan Selector
+
+**What it verifies:** The plan selector grid (the three plan cards with Upgrade/Downgrade buttons) is only rendered for admins and owners. Regular members see the Current Plan card and feature matrix but not the selector.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, log out and log back in as a **member** (not admin, not owner) of the same org.
+2. Navigate to `/billing`.
+
+**Expected:** The **Current Plan** card is visible and shows the correct plan. The three-column plan selector grid (Free / Business / Workforce) is **not visible**. The feature comparison table at the bottom is still visible.
+
+**Pass:** Plan selector is hidden for non-admin users.
+
+**Fail / Common issues:**
+- Plan selector visible for a member — the `orgRole` check in `BillingPage.tsx` (`isAdmin = orgRole === "owner" || orgRole === "admin"`) may not be reflecting the correct role. Verify the user's role:
+```bash
+curl -s "https://login.quickztna.com/api/db/org_members?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## ST5 — Billing Tab and Usage Tab Navigation
+
+**What it verifies:** The page has two tabs — **Billing** and **Usage** — and switching between them persists via URL query parameter (`?tab=usage`).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, navigate to `/billing`. The **Billing** tab is active by default.
+2. Note the URL — it should be `/billing` with no tab parameter.
+3. Click the **Usage** tab.
+4. Observe the URL and page content.
+
+**Expected:**
+- URL changes to `/billing?tab=usage`.
+- The Usage content panel loads (lazy-loaded from `UsagePage`).
+- A loading spinner may appear briefly while the lazy chunk loads.
+
+5. Click the **Billing** tab again.
+
+**Expected:**
+- URL returns to `/billing` (tab param removed).
+- The Current Plan card is visible again.
+
+**Pass:** Tab switching updates the URL correctly. Both tabs render without errors. Back/forward browser navigation restores the correct tab.
+
+**Fail / Common issues:**
+- Usage tab shows a blank panel — the lazy-loaded `UsagePage` may have a render error. Check DevTools Console for errors.
+- URL does not update — React Router's `setSearchParams` may not be working if the page is not within the router context. Verify you are on `/billing` (not a nested path).
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Free plan renders correctly | Badge "Free", limits 100 machines / 3 users, no cancel button |
+| ST2 | Plan badge matches feature-check API | `data.plan` in network response equals badge on page |
+| ST3 | Usage counters match inventory | Machine and user counts consistent with Machines and Users pages |
+| ST4 | Non-admin hides plan selector | Plan selector grid absent for member-role users |
+| ST5 | Tab navigation with URL persistence | Billing/Usage tabs update URL, lazy load works |
