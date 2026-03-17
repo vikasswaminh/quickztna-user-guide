@@ -1,0 +1,289 @@
+---
+title: "Machine Heartbeat & Online Status"
+topic: "Machine Registration & Lifecycle"
+order: 19
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify the heartbeat mechanism — online/offline status transitions, connectivity telemetry, peer list delivery, key expiry enforcement, and update detection."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+After registration, machines send periodic heartbeats to `POST /api/machine-heartbeat`. This is the primary lifecycle mechanism — it keeps the machine `online`, delivers peer lists and policy updates, and detects connectivity changes.
+
+Key facts from source code (`machine-heartbeat.ts` and `pkg/ztna/client.go`):
+- **Endpoint:** `POST /api/machine-heartbeat`
+- **Auth:** Node key hash (not JWT) — the `node_key` field in the request body is hashed and looked up in `machines.node_key_hash`
+- **Heartbeat payload:** `node_key`, `status` (`online`/`offline`), `wg_public_key`, `connectivity` (NAT telemetry), `derp_latencies`, `endpoints`, `version`
+- **Response includes:** peer list, fresh machine JWT (24h TTL), ACL rules, firewall rules, DNS blocklist, policy signature, pending agent commands, `update_available` flag
+- **`ztna down`** sends a final heartbeat with `status: "offline"` before stopping
+- **Key expiry:** Checked on every heartbeat — if `(NOW() - created_at) > key_expiry_days` and `key_expiry_disabled=FALSE`, returns `KEY_EXPIRED` (403)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard monitoring + API testing |
+| <MachineRef name="Linux-C" /> | Primary heartbeat target |
+| <MachineRef name="Win-B" /> | Secondary peer — verify peer delivery |
+
+---
+
+## ST1 — Verify Online Status via Heartbeat
+
+**What it verifies:** A running machine sends heartbeats and maintains `online` status with a recent `last_seen` timestamp.
+
+**Steps:**
+1. Ensure <MachineRef name="Linux-C" /> is running:
+```bash
+ztna up
+```
+
+2. On <MachineRef name="Win-A" />, check the machine's status and last_seen via API:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.Linux-C&select=name,status,last_seen,version" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "Linux-C",
+      "status": "online",
+      "last_seen": "2026-03-17T10:30:45.123Z",
+      "version": "3.2.8"
+    }
+  ]
+}
+```
+
+3. Wait 90 seconds and query again. The `last_seen` timestamp should have advanced.
+
+**Pass:** Status is `online`. `last_seen` updates regularly (within the last 60-90 seconds). Version field matches the installed client version.
+
+**Fail / Common issues:**
+- `last_seen` is stale (more than 5 minutes old) — heartbeat may be failing. Check `ztna status` on Linux-C for errors.
+- Status shows `offline` — the machine may have crashed. Check `ztna log` for errors.
+
+---
+
+## ST2 — Graceful Offline Transition via `ztna down`
+
+**What it verifies:** `ztna down` sends a final `offline` heartbeat, cleanly transitioning the machine to `offline` status.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, with VPN running, stop it:
+```bash
+ztna down
+```
+
+**Expected output:**
+```
+Stopped VPN daemon (PID 12345)
+VPN stopped.
+```
+
+Or if running in foreground (Ctrl+C):
+```
+Shutting down VPN...
+VPN stopped.
+```
+
+2. On <MachineRef name="Win-A" />, check status:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.Linux-C&select=name,status,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "Linux-C",
+      "status": "offline",
+      "last_seen": "2026-03-17T10:35:12.456Z"
+    }
+  ]
+}
+```
+
+3. On <MachineRef name="Win-A" />, the dashboard should show Linux-C with an `offline` badge.
+
+4. On <MachineRef name="Win-B" />, check peer list:
+```powershell
+ztna peers
+```
+
+**Expected:** Linux-C either shows as `offline` in the peer list or is excluded from the active peers.
+
+**Pass:** Machine transitions to `offline` immediately after `ztna down`. Dashboard confirms. `last_seen` reflects the disconnect time.
+
+**Fail / Common issues:**
+- Status still `online` — the offline heartbeat may have failed (network issue at shutdown). The backend will eventually mark it offline when heartbeats stop arriving, but this depends on server-side stale detection.
+- `Warning: offline heartbeat failed` — printed to stderr on `ztna down`. Network was already down when the client tried to send the final heartbeat. Status will remain `online` until stale detection kicks in.
+
+---
+
+## ST3 — Connectivity Telemetry in Heartbeat
+
+**What it verifies:** The heartbeat sends NAT/connectivity telemetry that is stored on the machine record.
+
+**Steps:**
+1. Ensure <MachineRef name="Linux-C" /> is running (`ztna up`).
+
+2. On <MachineRef name="Win-A" />, query the machine's connectivity data:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.Linux-C&select=name,client_connectivity,derp_latencies,endpoints" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response (example):**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "Linux-C",
+      "client_connectivity": {
+        "ipv6": false,
+        "udp": true,
+        "upnp": false,
+        "pmp": false,
+        "pcp": false,
+        "hairpinning": false,
+        "mapping_varies": false,
+        "preferred_derp": "blr1",
+        "firewall_mode": "none"
+      },
+      "derp_latencies": {
+        "blr": 12.5,
+        "lon": 145.2,
+        "nyc": 210.8,
+        "sfo": 245.1
+      },
+      "endpoints": ["178.62.x.x:41641"]
+    }
+  ]
+}
+```
+
+**Pass:** `client_connectivity` contains NAT traversal flags. `derp_latencies` shows latencies to DERP regions. `endpoints` contains the machine's public IP:port.
+
+**Fail / Common issues:**
+- Fields are empty objects `{}` — the client may not have completed the initial network check. Wait for a second heartbeat cycle (60 seconds).
+- `preferred_derp` is wrong — the client selects the lowest-latency DERP. Verify with `ztna netcheck`.
+
+---
+
+## ST4 — Machine List via CLI
+
+**What it verifies:** `ztna machines list` displays all machines in the org with their current status.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ensure you are connected (`ztna up`).
+
+2. List machines:
+```powershell
+ztna machines list
+```
+
+**Expected output:**
+```
+NAME                           TAILNET IP       OS       STATUS     LAST SEEN
+──────────────────────────────────────────────────────────────────────────────────────
+Win-A                          100.64.0.1       windows  online     2026-03-17T10:30:4
+Win-B                          100.64.0.2       windows  online     2026-03-17T10:28:1
+Linux-C                        100.64.0.3       linux    online     2026-03-17T10:31:2
+
+Total: 3 machines
+```
+
+Note: `LAST SEEN` timestamps are truncated to 19 characters in the table output.
+
+3. For JSON output:
+```powershell
+ztna machines list --json
+```
+
+**Expected:** Full JSON array with complete machine metadata including `id`, `name`, `tailnet_ip`, `os`, `status`, `last_seen`.
+
+**Pass:** All registered machines appear. Status values are accurate (`online` for running machines, `offline` for stopped ones). Total count matches.
+
+**Fail / Common issues:**
+- `not connected to an organization. Run 'ztna up' first` — the CLI needs an active connection to know which org to query. Run `ztna up` first.
+- `No machines registered.` — you may be in a different org. Check `ztna status` for the current org ID.
+
+---
+
+## ST5 — Key Expiry Enforcement
+
+**What it verifies:** When a machine's key has expired (based on `org_settings.key_expiry_days`), the heartbeat is rejected with `KEY_EXPIRED`.
+
+**Steps:**
+1. This test requires either waiting for the key expiry period or modifying org settings. Check the org's key expiry setting:
+
+```bash
+curl -s "https://login.quickztna.com/api/db/org_settings?org_id=eq.$ORG_ID&select=key_expiry_days" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `key_expiry_days` is typically 180 (default).
+
+2. To test, you can temporarily set a very short expiry (if you have API access to update org settings) or check a machine that was registered long ago.
+
+3. When key expiry triggers, the heartbeat response is:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "KEY_EXPIRED",
+    "message": "Machine key has expired. Re-authenticate to continue."
+  }
+}
+```
+
+4. To disable key expiry for a specific machine:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"set_key_expiry\",\"machine_id\":\"$MACHINE_ID\",\"disabled\":true}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "key_expiry_disabled": true
+  }
+}
+```
+
+**Pass:** Key expiry is enforced based on `org_settings.key_expiry_days`. Machines past the expiry window receive `KEY_EXPIRED`. Per-machine override via `set_key_expiry` works.
+
+**Fail / Common issues:**
+- Key expiry never triggers — the default is 180 days, so fresh machines won't hit this. Verify the setting is correctly configured.
+- `FORBIDDEN` — only admins or machine owners can modify key expiry settings.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Online heartbeat | `status: online`, `last_seen` updates regularly |
+| ST2 | Graceful offline | `ztna down` sends offline heartbeat, status transitions to `offline` |
+| ST3 | Connectivity telemetry | NAT flags, DERP latencies, and endpoints stored on machine record |
+| ST4 | CLI machine list | `ztna machines list` shows all machines with correct status |
+| ST5 | Key expiry | Expired keys rejected with `KEY_EXPIRED`, per-machine override works |

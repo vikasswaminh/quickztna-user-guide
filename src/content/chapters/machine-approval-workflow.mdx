@@ -1,0 +1,277 @@
+---
+title: "Machine Approval Workflow"
+topic: "Machine Registration & Lifecycle"
+order: 18
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify admin approval of pending machines — approve, enable, disable, quarantine actions and their effect on heartbeat and connectivity."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Machines can enter `pending` status when the org has posture policies enabled or when manual approval is configured. A pending machine cannot heartbeat successfully — the backend returns `PENDING_APPROVAL` (403) until an admin approves it.
+
+The admin actions are handled by `POST /api/machine-admin` with these relevant actions:
+- **`approve`** — transitions `pending` to `online` (requires admin, sets `approved_by` and `approved_at`)
+- **`enable`** — sets status to `online`, clears `admin_disabled` flag (admin or machine owner)
+- **`disable`** — sets status to `offline`, sets `admin_disabled=TRUE` (admin or machine owner)
+- **`quarantine`** — sets status to `quarantined` (requires admin)
+
+Machine status state machine:
+```
+pending ──[approve]──→ online ←──[enable]──→ offline
+                         │                      ↑
+                         └──[disable]───────────┘
+                         │
+                         └──[quarantine]──→ quarantined
+```
+
+A quarantined or admin-disabled machine's heartbeat is rejected — the status is preserved server-side regardless of what the client sends.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin dashboard — perform approve/disable/enable actions |
+| <MachineRef name="Linux-C" /> | Target machine — observe status transitions |
+
+---
+
+## ST1 — Approve a Pending Machine
+
+**What it verifies:** An admin can approve a pending machine, transitioning it to `online` status.
+
+**Steps:**
+1. Register <MachineRef name="Linux-C" /> so it enters `pending` status. If your org has posture policies enabled, a fresh registration via `ztna up` will land in `pending`. If not, you can simulate this via the API:
+
+```bash
+# On Win-A, using admin token:
+TOKEN="YOUR_ADMIN_TOKEN"
+MACHINE_ID="LINUX_C_MACHINE_ID"
+
+# First, check current status
+curl -s "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID&select=id,name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. On <MachineRef name="Win-A" />, open the dashboard → **Machines** page.
+3. Look for a **Pending Approval** tab or filter. Find Linux-C in the pending list.
+4. Click **Approve**.
+
+**Alternative via API:**
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"approve\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "status": "online"
+  }
+}
+```
+
+5. On <MachineRef name="Linux-C" />, check status:
+```bash
+ztna status
+```
+
+**Expected:** Within 60 seconds (next heartbeat cycle), the machine should show as connected.
+
+**Pass:** Machine transitions from `pending` to `online`. Dashboard shows green status indicator. CLI connects successfully.
+
+**Fail / Common issues:**
+- `INVALID_STATE` (400) — the machine is not in `pending` status. It may already be approved.
+- `FORBIDDEN` (403) — you must be an org admin to approve machines. Check your role on the dashboard.
+- `NOT_FOUND` (404) — wrong machine ID. List machines to get the correct ID.
+
+---
+
+## ST2 — Disable a Machine (Admin Action)
+
+**What it verifies:** An admin can disable a machine, forcing it offline and preventing it from heartbeating back to online.
+
+**Steps:**
+1. Ensure <MachineRef name="Linux-C" /> is `online` and running.
+
+2. On <MachineRef name="Win-A" />, disable it via API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"disable\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "status": "offline"
+  }
+}
+```
+
+3. On <MachineRef name="Linux-C" />, check status after the next heartbeat (up to 60 seconds):
+```bash
+ztna status
+```
+
+4. Check the dashboard — the machine should show `offline`.
+
+5. Even though `ztna up` is still running on Linux-C, the backend will reject its heartbeat and keep it offline. The machine's heartbeat response will have `admin_disabled: true`.
+
+**Pass:** Machine forced to `offline`. Dashboard confirms offline. The `admin_disabled` flag prevents the machine from returning to online via heartbeat.
+
+**Fail / Common issues:**
+- Machine comes back online — the `admin_disabled` flag may not be set. Verify via API: `GET /api/db/machines?id=eq.MACHINE_ID&select=admin_disabled`.
+
+---
+
+## ST3 — Re-enable a Disabled Machine
+
+**What it verifies:** The `enable` action restores a disabled machine to `online` status and clears the `admin_disabled` flag.
+
+**Steps:**
+1. With <MachineRef name="Linux-C" /> still disabled from ST2:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"enable\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "status": "online"
+  }
+}
+```
+
+2. On <MachineRef name="Linux-C" />, verify:
+```bash
+ztna status
+```
+
+**Expected:** Machine shows as connected. The next heartbeat succeeds normally.
+
+3. On <MachineRef name="Win-A" />, verify on dashboard: machine shows `online` with a green indicator.
+
+**Pass:** Machine returns to `online` after enable. Heartbeat resumes normally.
+
+---
+
+## ST4 — Quarantine a Machine
+
+**What it verifies:** The `quarantine` action locks a machine out — it cannot heartbeat back to online until an admin intervenes.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, quarantine Linux-C:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"quarantine\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "uuid",
+    "status": "quarantined"
+  }
+}
+```
+
+2. On <MachineRef name="Linux-C" />, the VPN is still running but the backend will return `quarantined` status on the heartbeat response. The machine is effectively isolated from the tailnet.
+
+3. Try pinging from <MachineRef name="Win-A" /> to Linux-C:
+```powershell
+ztna ping 100.64.0.3 --count 3
+```
+
+**Expected:** Pings may fail or the machine may not appear in the peer list (quarantined machines are excluded from peer distribution).
+
+4. Restore the machine:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"enable\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Pass:** Machine enters `quarantined` status. Cannot connect to other peers. Admin `enable` action restores it.
+
+**Fail / Common issues:**
+- `FORBIDDEN` — only org admins can quarantine machines.
+- Machine still reachable — peer lists may be cached for up to 60 seconds. Wait for the next heartbeat cycle.
+
+---
+
+## ST5 — Pending Machine Heartbeat Rejection
+
+**What it verifies:** A machine in `pending` status receives a `PENDING_APPROVAL` error on heartbeat, blocking it from joining the network.
+
+**Steps:**
+1. This test requires a machine in `pending` status. If your org has posture policies:
+   - On <MachineRef name="Linux-C" />, logout and re-register:
+   ```bash
+   ztna down
+   ztna logout
+   ztna login --interactive
+   ztna up
+   ```
+   The machine should register as `pending`.
+
+2. On <MachineRef name="Linux-C" />, the CLI output will show:
+```
+Machine registered but requires admin approval.
+Ask your org admin to approve this machine in the dashboard:
+  Machines page → Pending Approval tab → Approve
+
+Run 'ztna up' again after approval.
+```
+
+3. On <MachineRef name="Win-A" />, verify the machine is pending:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=YOUR_ORG_ID&status=eq.pending&select=id,name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Linux-C appears with `"status": "pending"`.
+
+4. The backend returns HTTP 403 with error code `PENDING_APPROVAL` on every heartbeat attempt from this machine.
+
+**Pass:** Machine stuck in `pending`. CLI shows the approval message. Heartbeat returns `PENDING_APPROVAL`. Machine does not appear in peer lists of other machines.
+
+**Fail / Common issues:**
+- Machine goes directly to `online` — your org may not have posture policies enabled. Auth-key registrations always go to `online` regardless of posture policies.
+- No pending approval tab in dashboard — the UI may show pending machines inline with a different status badge.
+
+**Cleanup:** Approve the machine from the dashboard to restore normal operation.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Admin approval | `pending` to `online` via approve action |
+| ST2 | Admin disable | Machine forced offline, `admin_disabled=TRUE` |
+| ST3 | Admin re-enable | Machine restored to `online`, heartbeat resumes |
+| ST4 | Quarantine | Machine isolated, excluded from peer lists |
+| ST5 | Pending heartbeat rejection | `PENDING_APPROVAL` (403) until approved |

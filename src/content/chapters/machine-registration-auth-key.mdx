@@ -1,0 +1,238 @@
+---
+title: "Machine Registration via Auth Key (Headless)"
+topic: "Machine Registration & Lifecycle"
+order: 16
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Register machines non-interactively using pre-authenticated keys — verify auth key creation, headless registration, re-registration, and key restrictions."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Auth key registration lets you enroll machines without browser interaction. The CLI calls `POST /api/register-machine` with the auth key and machine name. The backend validates the key (hash lookup, expiry, revocation, reuse limit), checks the org's machine quota, and creates or re-activates a machine record.
+
+Key facts from source code:
+- **CLI flag:** `ztna up --auth-key tskey-auth-xxx` (or `ZTNA_AUTH_KEY` env var — preferred, avoids exposing the key in process listing)
+- **API endpoint:** `POST /api/register-machine` (no JWT required — the auth key IS the credential)
+- **Machine status on registration:** `online` (auth-key machines go directly to online, bypassing pending approval)
+- **Re-registration:** If a machine with the same name+org already exists, the backend replaces keys but preserves the machine ID and tailnet IP
+
+Auth key format: `tskey-auth-xxxxxxxx` — the backend strips the `tskey-auth-` prefix, SHA256-hashes the remainder, and looks it up in the `auth_keys` table.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard — create auth keys |
+| <MachineRef name="Linux-C" /> | Target — headless registration via auth key |
+
+---
+
+## ST1 — Create an Auth Key from Dashboard
+
+**What it verifies:** An admin can generate a reusable auth key with an expiry date.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/dashboard`.
+2. Navigate to **Settings** → **Auth Keys** (or the Auth Keys section).
+3. Click **Generate Auth Key**.
+4. Set:
+   - **Name:** `test-headless-key`
+   - **Reusable:** Yes
+   - **Ephemeral:** No
+   - **Expiry:** 7 days from now
+5. Click **Create**.
+6. Copy the displayed key (format: `tskey-auth-xxxxxxxx`). It is shown only once.
+
+**Expected:** A key is generated and displayed. The key list shows `test-headless-key` with `Used: 0`, `Reusable: Yes`, and the expiry date.
+
+**Pass:** Key created successfully. Key starts with `tskey-auth-`. Key appears in the list with correct metadata.
+
+**Fail / Common issues:**
+- Key not displayed — it is shown only once on creation. If you missed it, revoke and create a new one.
+- `FORBIDDEN` error — you must be an org admin to create auth keys.
+
+---
+
+## ST2 — Register Machine via Auth Key (CLI)
+
+**What it verifies:** `ztna up --auth-key` registers the machine without browser interaction and goes directly to `online` status.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, ensure no existing session:
+```bash
+ztna down
+ztna logout
+```
+
+2. Register using the auth key:
+```bash
+export ZTNA_AUTH_KEY="tskey-auth-YOUR_KEY_HERE"
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+**Expected output:**
+```
+Starting QuickZTNA...
+Registered: Linux-C (100.64.0.3)
+Connected as Linux-C (100.64.0.3) [tun]
+VPN started!
+Node key: a1b2c3d4e5f6g7h8...
+Press Ctrl+C to stop...
+```
+
+3. Verify registration:
+```bash
+ztna status
+```
+
+**Expected status output:**
+```
+QuickZTNA Status
+================
+Version:       3.2.8
+Node Key:      a1b2c3d4e5f6g7h8...
+Authenticated: true
+Machine ID:    <uuid>
+Machine Name:  Linux-C
+Tailnet IP:    100.64.0.3
+Mode:          TUN (kernel)
+DERP Region:   blr1
+```
+
+**Pass:** Machine registered and connected. Status shows `Authenticated: true` and `Mode: TUN (kernel)`. Tailnet IP assigned.
+
+**Fail / Common issues:**
+- `INVALID_KEY` (401) — the key may be expired, revoked, or mistyped. Check the key in the dashboard.
+- `not authenticated. Run 'ztna login' first or use --auth-key` — the `--auth-key` flag was not passed, or the env var is empty.
+- `WARNING: passing auth-key via CLI flag exposes it in process listing and shell history. Use ZTNA_AUTH_KEY env var instead.` — This is a warning, not an error. Use the env var approach shown above to avoid it.
+
+---
+
+## ST3 — Verify Auth Key Usage Count
+
+**What it verifies:** After registration, the auth key's `used_count` increments.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open the dashboard → **Auth Keys** page.
+2. Find `test-headless-key` in the list.
+
+**Expected:** `Used: 1` (incremented from 0 after ST2's registration).
+
+**Alternative verification via API:**
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Look for the key entry with `"used_count": 1`.
+
+**Pass:** Usage count is 1 after one registration.
+
+**Fail / Common issues:**
+- Usage count still 0 — the registration may have failed silently. Check `ztna status` on Linux-C.
+- Usage count higher than expected — the key may have been used in a previous test.
+
+---
+
+## ST4 — Re-registration Preserves Machine Identity
+
+**What it verifies:** Running `ztna up --auth-key` again with the same machine name re-activates the existing machine (preserves ID and tailnet IP, replaces keys).
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, note the current machine ID and tailnet IP:
+```bash
+ztna status --json | python3 -c "import sys,json; d=json.load(sys.stdin); print('ID:', d['machine']['id']); print('IP:', d['machine']['tailnet_ip'])"
+```
+
+2. Stop the VPN:
+```bash
+ztna down
+```
+
+3. Re-register with the same auth key:
+```bash
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+**Expected output:**
+```
+Starting QuickZTNA...
+Already registered: Linux-C (IP: 100.64.0.3)
+Connected as Linux-C (100.64.0.3) [tun]
+VPN started!
+```
+
+4. Check the machine ID and IP again:
+```bash
+ztna status --json | python3 -c "import sys,json; d=json.load(sys.stdin); print('ID:', d['machine']['id']); print('IP:', d['machine']['tailnet_ip'])"
+```
+
+**Pass:** Machine ID and tailnet IP are identical to the values from step 1. The backend re-activated the existing record instead of creating a duplicate.
+
+**Fail / Common issues:**
+- Different machine ID — the machine name may have changed (hostname drift). Use `--hostname` flag to pin the name.
+- `REGISTRATION_CONFLICT` (409) — race condition if multiple registrations happen simultaneously. Retry.
+
+---
+
+## ST5 — Non-Reusable Key Rejected After First Use
+
+**What it verifies:** A non-reusable auth key works once and is rejected on the second attempt.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a **non-reusable** auth key:
+   - Name: `single-use-key`
+   - Reusable: **No**
+   - Expiry: 1 day
+
+2. On <MachineRef name="Linux-C" />, stop and logout:
+```bash
+ztna down
+ztna logout
+```
+
+3. Register with the single-use key:
+```bash
+ztna up --auth-key "tskey-auth-SINGLE_USE_KEY"
+```
+
+**Expected:** Registration succeeds. Machine connects.
+
+4. Stop the VPN:
+```bash
+ztna down
+ztna logout
+```
+
+5. Try to register again with the **same** key:
+```bash
+ztna up --auth-key "tskey-auth-SINGLE_USE_KEY"
+```
+
+**Expected error:**
+```
+KEY_USED: Auth key has already been used
+```
+
+**Pass:** First registration succeeds. Second registration fails with `KEY_USED`. Dashboard shows `Used: 1` for the key.
+
+**Fail / Common issues:**
+- Second registration succeeds — the key may have been created as reusable. Check the key settings in the dashboard.
+- Different error code — the backend may return `INVALID_KEY` instead of `KEY_USED` in some versions. Either rejection is acceptable.
+
+**Cleanup:** Revoke both test keys from the dashboard when done.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Auth key creation | Key generated with `tskey-auth-` prefix, shown in list |
+| ST2 | Headless registration | `ztna up --auth-key` registers and connects, status shows authenticated |
+| ST3 | Usage tracking | `used_count` increments after registration |
+| ST4 | Re-registration | Same machine ID and IP preserved on re-register |
+| ST5 | Non-reusable enforcement | Key rejected with `KEY_USED` after first use |

@@ -1,0 +1,287 @@
+---
+title: "Machine Delete & Cleanup"
+topic: "Machine Registration & Lifecycle"
+order: 20
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify machine deletion — dashboard and API deletion, cascade cleanup of related records, audit data preservation, and client-side cleanup via ztna logout."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Machine deletion is handled by `POST /api/machine-admin` with `action: "delete"`. It requires admin privileges and performs a cascade cleanup:
+
+**Records DELETED (ephemeral data):**
+- `relay_sessions` — active relay connections
+- `posture_reports` — device posture data
+- `key_exchanges` — WireGuard key exchange records (both requester and responder)
+- `segmentation_group_members` — department/group memberships
+- `node_key_signatures` — node key verification records
+- `remote_desktop_sessions` — active remote desktop sessions
+- `dns_records` — MagicDNS A record for the machine (best-effort)
+
+**Records SET NULL (audit/compliance data preserved):**
+- `session_recordings` — remote shell/desktop recordings (expensive R2 assets)
+- `access_review_decisions` — governance review records
+- `jit_access_grants` — just-in-time access grants
+
+On the client side, `ztna logout` clears local tokens and state files but preserves the org ID for future re-login.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin — perform deletion from dashboard/API |
+| <MachineRef name="Linux-C" /> | Target machine to delete (use a test machine, not your primary!) |
+
+**WARNING:** Deletion is irreversible. For this test, consider registering a temporary test machine rather than deleting a production one.
+
+---
+
+## ST1 — Delete Machine via Dashboard
+
+**What it verifies:** An admin can delete a machine from the dashboard, removing it from the org.
+
+**Steps:**
+1. First, register a temporary test machine. On <MachineRef name="Linux-C" />:
+```bash
+# Create a disposable registration
+ztna logout
+export ZTNA_AUTH_KEY="tskey-auth-YOUR_REUSABLE_KEY"
+ztna up --auth-key "$ZTNA_AUTH_KEY" --hostname test-delete-me
+```
+
+2. Verify it appears on the dashboard:
+   - On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`
+   - Find `test-delete-me` in the list
+
+3. Click on `test-delete-me` to open the detail page.
+4. Click **Delete** (or the trash icon). Confirm the deletion.
+
+5. Verify:
+   - The machine disappears from the list
+   - Refresh the page to confirm
+
+**Pass:** Machine removed from the list. No error on deletion. Page refreshes cleanly without the deleted machine.
+
+**Fail / Common issues:**
+- `FORBIDDEN` (403) — only org admins can delete machines. Check your role.
+- Machine still appears after refresh — browser cache. Hard refresh with Ctrl+F5.
+
+---
+
+## ST2 — Delete Machine via API
+
+**What it verifies:** The `delete` action in `/api/machine-admin` removes the machine and cascades cleanup.
+
+**Steps:**
+1. Register another temporary machine (or reuse the flow from ST1):
+```bash
+ztna up --auth-key "$ZTNA_AUTH_KEY" --hostname test-api-delete
+```
+
+2. Get the machine ID:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+MACHINE_ID=$(curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&name=eq.test-api-delete&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])")
+
+echo "Machine ID: $MACHINE_ID"
+```
+
+3. Delete via API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/machine-admin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"delete\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "deleted": "machine-id-here"
+  }
+}
+```
+
+4. Verify the machine is gone:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID&select=id,name" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Empty data array:
+```json
+{
+  "success": true,
+  "data": []
+}
+```
+
+**Pass:** Delete returns the machine ID in `deleted` field. Subsequent lookup returns empty results.
+
+**Fail / Common issues:**
+- `NOT_FOUND` (404) — the machine ID is wrong or already deleted.
+- `FORBIDDEN` (403) — admin privileges required.
+
+---
+
+## ST3 — Client-Side Cleanup via `ztna logout`
+
+**What it verifies:** `ztna logout` clears local tokens and state files, leaving the machine in a clean state for re-registration.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, with VPN running:
+```bash
+ztna down
+```
+
+**Expected:**
+```
+Stopped VPN daemon (PID 12345)
+VPN stopped.
+```
+
+2. Clear local state:
+```bash
+ztna logout
+```
+
+**Expected output:**
+```
+Logged out. Tokens and state cleared. (org_id preserved for re-login)
+```
+
+3. Verify state is cleared:
+```bash
+ztna status
+```
+
+**Expected:**
+```
+QuickZTNA Status
+================
+Authenticated: false
+               (run 'ztna login' to authenticate)
+Machine:       Not registered (run 'ztna up')
+```
+
+4. Check that tokens file is removed:
+```bash
+ls -la ~/.config/ztna/tokens.json 2>&1
+```
+
+**Expected:** `No such file or directory` — the tokens file was deleted.
+
+5. Check that state file is removed:
+```bash
+ls -la ~/.config/ztna/state.json 2>&1
+```
+
+**Expected:** `No such file or directory` — the state file was deleted.
+
+**Pass:** `ztna logout` outputs the confirmation message. `Authenticated: false`. Both `tokens.json` and `state.json` are removed. Org ID is preserved in the config for convenient re-login.
+
+**Fail / Common issues:**
+- `Authenticated: true` after logout — the tokens file may not have been cleared. Delete manually: `rm ~/.config/ztna/tokens.json ~/.config/ztna/state.json`
+- Encrypted files (.enc suffix) may remain — `ztna logout` removes both the plaintext and encrypted variants.
+
+---
+
+## ST4 — Verify Cascade Cleanup
+
+**What it verifies:** Related records (relay sessions, posture reports, group memberships) are cleaned up when a machine is deleted.
+
+**Steps:**
+1. Before deleting the machine, check if related records exist. On <MachineRef name="Win-A" />:
+```bash
+# Check posture reports for the machine
+curl -s "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$MACHINE_ID&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+
+# Check group memberships
+curl -s "https://login.quickztna.com/api/db/segmentation_group_members?machine_id=eq.$MACHINE_ID&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Delete the machine (as in ST2).
+
+3. After deletion, verify cascade:
+```bash
+# Posture reports should be gone
+curl -s "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$MACHINE_ID&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+
+# Group memberships should be gone
+curl -s "https://login.quickztna.com/api/db/segmentation_group_members?machine_id=eq.$MACHINE_ID&select=id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** All queries return empty `data: []` after deletion.
+
+**Pass:** Related records are cleaned up. No orphaned data in posture_reports, segmentation_group_members, relay_sessions, or key_exchanges.
+
+**Fail / Common issues:**
+- Posture reports still exist — the cascade DELETE may have failed. Check the backend logs.
+- If session recordings existed for this machine, they should still exist but with `machine_id: null` (SET NULL behavior for compliance data preservation).
+
+---
+
+## ST5 — Deleted Machine Cannot Heartbeat
+
+**What it verifies:** After server-side deletion, the client's heartbeat is rejected because the node key no longer exists in the database.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, start the VPN (if tokens are still valid from a previous session):
+```bash
+ztna up
+```
+
+The machine will attempt to heartbeat. Since the machine record was deleted from the server, the heartbeat will fail.
+
+2. The expected behavior is:
+
+   **If the machine was deleted server-side while the client is running:**
+   - The next heartbeat returns `INVALID_NODE_KEY` (401)
+   - The client may show connection errors or disconnect
+
+   **If the client was stopped, machine deleted, then client restarted:**
+   - `ztna up` will attempt to re-register (creating a new machine record with a new ID and IP)
+
+3. Check the status:
+```bash
+ztna status
+```
+
+**Expected (if heartbeat rejected):** The machine may show as disconnected or display an authentication error.
+
+**Pass:** Deleted machine's node key is rejected by the backend. The client cannot masquerade as a machine that no longer exists.
+
+**Fail / Common issues:**
+- Client re-registers automatically — this is expected behavior with auth-key or cached tokens. The backend creates a new machine record. The old machine ID is gone.
+- No error visible — the client may silently reconnect. Check that the machine ID is different from the deleted one.
+
+**Cleanup:** Re-register Linux-C properly for future tests:
+```bash
+ztna logout
+ztna login --github  # or --auth-key
+ztna up
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Dashboard deletion | Machine removed from list after delete |
+| ST2 | API deletion | `delete` action returns machine ID, lookup returns empty |
+| ST3 | Client-side cleanup | `ztna logout` clears tokens and state, `Authenticated: false` |
+| ST4 | Cascade cleanup | Related records (posture, groups, relays) deleted; audit data preserved |
+| ST5 | Post-deletion heartbeat | Deleted machine's heartbeat rejected with `INVALID_NODE_KEY` |

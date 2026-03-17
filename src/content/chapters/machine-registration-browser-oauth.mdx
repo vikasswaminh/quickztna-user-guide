@@ -1,0 +1,257 @@
+---
+title: "Machine Registration via Browser OAuth"
+topic: "Machine Registration & Lifecycle"
+order: 17
+machines: ["Win-A", "Win-B"]
+summary: "Register machines interactively via browser-based OAuth login — verify the CLI-to-browser flow, client-setup endpoint, and WireGuard config generation."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Browser-based registration is the interactive alternative to auth keys. The user runs `ztna login` (with `--github`, `--google`, or `--interactive`), then `ztna up`. The flow:
+
+1. **`ztna login`** — CLI starts a localhost callback server, opens the browser to the auth page, user authenticates, CLI receives JWT tokens
+2. **`ztna up`** — CLI calls `POST /api/client-setup` (JWT-authenticated) with `org_id`, `name`, and `os`. Backend creates/re-activates the machine and returns the tailnet IP, node key, and WireGuard config
+
+Key differences from auth-key registration:
+- **Endpoint:** `POST /api/client-setup` (not `/register-machine`)
+- **Auth:** JWT Bearer token (not auth key)
+- **Status:** Goes to `online` directly (unless org has posture policies enabled, then `pending`)
+- **Owner:** Machine is owned by the authenticated user (tracked via `owner_id`)
+- **Re-activation:** Matches on `owner_id + name + org_id` (not just `name + org_id`)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Primary test machine — register via browser |
+| <MachineRef name="Win-B" /> | Secondary — verify peer visibility after registration |
+
+---
+
+## ST1 — Login via Browser (GitHub OAuth)
+
+**What it verifies:** `ztna login --github` opens a browser, completes OAuth, and saves tokens locally.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ensure clean state:
+```powershell
+ztna down
+ztna logout
+```
+
+2. Start GitHub OAuth login:
+```powershell
+ztna login --github
+```
+
+**Expected output:**
+```
+To authenticate, visit:
+  https://github.com/login/oauth/authorize?client_id=Ov23liPKggYcvMx6cHic&...
+
+Login successful!
+```
+
+3. A browser opens to GitHub. Authorize the "QuickZTNA" app.
+4. The CLI shows `Login successful!`.
+
+5. Verify tokens saved:
+```powershell
+ztna status
+```
+
+**Expected:**
+```
+QuickZTNA Status
+================
+Authenticated: true
+Machine:       Not registered (run 'ztna up')
+```
+
+**Pass:** `Authenticated: true` but `Machine: Not registered` — tokens are saved, but the machine is not yet registered (that happens on `ztna up`).
+
+**Fail / Common issues:**
+- `authentication timed out` — the default timeout is 5 minutes. Retry or extend: `ztna login --github --timeout 10m`.
+- `github callback failed` — state mismatch. Close all browser windows and retry with a single window.
+- Browser doesn't open — manually copy the URL from the terminal into your browser.
+
+---
+
+## ST2 — Register Machine via `ztna up`
+
+**What it verifies:** After login, `ztna up` registers the machine via `/api/client-setup` and connects to the tailnet.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, after successful login (ST1):
+```powershell
+ztna up
+```
+
+**Expected output:**
+```
+Starting QuickZTNA...
+Registered: Win-A (100.64.0.1)
+Connected as Win-A (100.64.0.1) [tun]
+VPN started!
+Node key: a1b2c3d4e5f6g7h8...
+Press Ctrl+C to stop...
+```
+
+2. In a separate terminal, check status:
+```powershell
+ztna status
+```
+
+**Expected:**
+```
+QuickZTNA Status
+================
+Version:       3.2.8
+Node Key:      a1b2c3d4e5f6g7h8...
+Authenticated: true
+Machine ID:    <uuid>
+Machine Name:  Win-A
+Tailnet IP:    100.64.0.1
+Mode:          TUN (kernel)
+DERP Region:   blr1
+```
+
+**Pass:** Machine registered with a tailnet IP. Status shows `Authenticated: true`, `Mode: TUN (kernel)`, and `Machine Name: Win-A`.
+
+**Fail / Common issues:**
+- `not authenticated. Run 'ztna login' first or use --auth-key` — the login from ST1 didn't save tokens. Re-run `ztna login --github`.
+- `FORBIDDEN` (403) — user is not a member of the organization. Check org membership on the dashboard.
+- `Not running as admin — using userspace networking (no TUN device)` — this is not an error, just a mode fallback. Run the terminal as Administrator for TUN mode.
+
+---
+
+## ST3 — Verify Machine Appears in Dashboard
+
+**What it verifies:** The newly registered machine is visible in the dashboard machine list.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+2. Find `Win-A` in the machine list.
+
+**Expected:** Machine entry shows:
+- **Name:** Win-A
+- **Tailnet IP:** 100.64.0.x
+- **OS:** windows
+- **Status:** online (green indicator)
+
+3. Click on `Win-A` to open the machine detail page.
+
+**Expected detail page fields:**
+- Name, Tailnet IP, OS, Status
+- Public Key (WireGuard)
+- Node Key (first 16 chars + `...`)
+- Created timestamp
+- Last Seen (recent timestamp)
+- Tags (empty array `[]` by default)
+
+**Pass:** Machine visible in list with `online` status. Detail page shows correct metadata.
+
+**Fail / Common issues:**
+- Machine shows `pending` — the org may have posture policies enabled. See Chapter 18 for the approval workflow.
+- Machine not in list — check you're viewing the correct organization. Use the org switcher if you belong to multiple orgs.
+
+---
+
+## ST4 — Verify Peer Visibility from Another Machine
+
+**What it verifies:** After Win-A registers, it appears as a peer on Win-B (and vice versa).
+
+**Steps:**
+1. Ensure <MachineRef name="Win-B" /> is also registered and running (`ztna up`).
+
+2. On <MachineRef name="Win-B" />, list peers:
+```powershell
+ztna peers
+```
+
+**Expected output:**
+```
+Machine: Win-B (100.64.0.2)
+Connection strategy: stun -> direct -> relay
+
+NAME                 TAILNET IP       DERP REGION  DIRECT?  ROUTES                   ENDPOINT
+Win-A                100.64.0.1       blr1         relay    —                        [DERP]
+Linux-C              100.64.0.3       blr1         direct   —                        178.62.x.x:41641
+```
+
+3. On <MachineRef name="Win-A" />, verify Win-B is visible:
+```powershell
+ztna peers
+```
+
+**Expected:** Win-B appears in the peer list with its tailnet IP.
+
+4. Ping from Win-B to Win-A:
+```powershell
+ztna ping 100.64.0.1 --count 3
+```
+
+**Expected:**
+```
+PING 100.64.0.1
+  probe 1: 145ms (relayed)
+  probe 2: 142ms (relayed)
+  probe 3: 143ms (relayed)
+3/3 probes succeeded, avg latency: 143ms (via tunnel)
+```
+
+**Pass:** Both machines see each other as peers. Pings succeed (via relay or direct).
+
+**Fail / Common issues:**
+- Win-A not in peer list — heartbeat may not have propagated yet. Wait 60 seconds and retry `ztna peers`.
+- `0/3 probes succeeded` — both machines must be `online` status. Check `ztna status` on both.
+
+---
+
+## ST5 — Login via Interactive Email/Password
+
+**What it verifies:** `ztna login --interactive` prompts for email/password in the terminal without opening a browser.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna down
+ztna logout
+ztna login --interactive
+```
+
+2. Enter credentials at the prompts:
+```
+Email: your@email.com
+Password: ********
+Login successful!
+```
+
+3. Register:
+```powershell
+ztna up
+```
+
+**Expected:** Same registration flow as ST2 — machine reconnects with the same tailnet IP (re-activation).
+
+**Pass:** Interactive login works without browser. `ztna up` registers successfully.
+
+**Fail / Common issues:**
+- `MFA_REQUIRED` — if your account has MFA enabled, interactive login requires a TOTP code. The CLI may not prompt for it yet — use `--github` or `--google` instead.
+- `email and password are required` — one of the prompts was left blank. Retry.
+- `ACCOUNT_LOCKED` — too many failed attempts (10 failures = 15-minute lockout). Wait and retry.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Browser OAuth login | `Authenticated: true`, tokens saved, machine not yet registered |
+| ST2 | Machine registration via `ztna up` | Registered with tailnet IP, `Mode: TUN (kernel)` |
+| ST3 | Dashboard visibility | Machine in list with `online` status and correct metadata |
+| ST4 | Peer discovery | Both machines see each other, pings succeed |
+| ST5 | Interactive login | Email/password prompts work, registration succeeds |
