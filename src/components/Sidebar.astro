@@ -1,0 +1,38 @@
+---
+import type { CollectionEntry } from 'astro:content';
+
+interface Props {
+  groups: Record<string, CollectionEntry<'chapters'>[]>;
+  currentTitle: string;
+}
+
+const { groups, currentTitle } = Astro.props;
+---
+
+<nav class="py-6 px-4">
+  {Object.entries(groups).map(([topic, chapters]) => (
+    <div class="mb-6">
+      <div class="text-xs font-semibold uppercase tracking-widest text-slate-500 px-2 mb-2">{topic}</div>
+      <ul class="space-y-1">
+        {chapters.map((ch) => {
+          const isActive = ch.data.title === currentTitle;
+          return (
+            <li>
+              <a
+                href={`/chapters/${ch.id}`}
+                class={`flex items-center gap-2 px-2 py-1.5 rounded-md text-sm transition-colors ${
+                  isActive
+                    ? 'bg-sky-900/40 text-sky-300 font-medium border-l-2 border-sky-400'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                }`}
+              >
+                <span class="text-xs text-slate-600 w-4 text-right shrink-0">{ch.data.order}</span>
+                {ch.data.title}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  ))}
+</nav>

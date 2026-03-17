@@ -1,0 +1,242 @@
+---
+title: "WireGuard Tunnel Functioning"
+topic: "WireGuard"
+order: 2
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify tunnel establishment, peer visibility, DERP relay selection, and end-to-end ping across the mesh."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Once machines are enrolled, they should automatically form WireGuard tunnels. This chapter verifies the full lifecycle:
+
+1. **Registration** — Machine registers with the control plane and gets a tailnet IP
+2. **Tunnel establishment** — WireGuard session starts between peers
+3. **Peer visibility** — Each machine can see the others via `ztna peers`
+4. **DERP relay selection** — Which DERP node is chosen for relay, and why
+5. **End-to-end connectivity** — Traffic flows from Win-A → Win-B via the mesh
+
+## Your Test Setup
+
+All three machines enrolled and online. Dashboard → Machines shows all three with status `online`.
+
+---
+
+## ST1 — Machine Registration and Tailnet IP Assignment
+
+**What it verifies:** After enrollment, each machine has a unique tailnet IP in the `100.64.0.0/10` range.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, check the assigned tailnet IP:
+```powershell
+ztna ip
+```
+
+2. On <MachineRef name="Win-B" />:
+```powershell
+ztna ip
+```
+
+3. On <MachineRef name="Linux-C" />:
+```bash
+ztna ip
+```
+
+4. Confirm in the dashboard: Machines page → each machine row shows IP column.
+
+**Expected output:**
+```
+Win-A:   100.64.0.1   (example — your actual IPs will differ)
+Win-B:   100.64.0.2
+Linux-C: 100.64.0.3
+```
+
+All IPs must be:
+- In the `100.64.0.0/10` range (CGNAT block)
+- Unique — no two machines share the same IP
+- Persistent across restarts
+
+**Pass:** All three machines have distinct IPs in `100.64.0.0/10`, matching the dashboard.
+
+**Fail / Common issues:**
+- `ztna ip` shows nothing → machine may not be connected; run `ztna up`
+- IP not in `100.64.0.0/10` → unusual configuration; check org settings in dashboard
+
+---
+
+## ST2 — Peer Visibility (All Machines See Each Other)
+
+**What it verifies:** Each machine's peer table contains the other two machines.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, list peers:
+```powershell
+ztna peers
+```
+
+2. On <MachineRef name="Linux-C" />:
+```bash
+ztna peers
+```
+
+**Expected output on Win-A:**
+```
+Peer             IP            Status    Relay           Direct
+Win-B            100.64.0.2    online    blr1.derp...    false
+Linux-C          100.64.0.3    online    blr1.derp...    false
+```
+
+**Expected output on Linux-C:**
+```
+Peer             IP            Status    Relay           Direct
+Win-A            100.64.0.1    online    blr1.derp...    false
+Win-B            100.64.0.2    online    blr1.derp...    false
+```
+
+**Pass:** Both machines' peer tables show all other enrolled machines as `online`.
+
+**Fail / Common issues:**
+- A peer shows as `offline` → check if that machine has `ztna up` running
+- A peer is missing entirely → check if it's enrolled in the same org; run `ztna orgs` to confirm
+- Peer count is 0 → org may have only 1 machine; verify all 3 are enrolled
+
+---
+
+## ST3 — DERP Relay Selection
+
+**What it verifies:** When direct P2P isn't possible (both machines behind NAT), traffic routes through the nearest DERP node. QuickZTNA has 4 DERP nodes: `blr1` (Bangalore), `nyc1` (New York), `lon1` (London), `sfo3` (San Francisco).
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" /> (India), check which DERP is selected for the Win-B peer:
+```powershell
+ztna peers
+# Note the "Relay" column for Win-B
+```
+
+2. On <MachineRef name="Win-B" /> (Europe), check which DERP is selected for Win-A:
+```powershell
+ztna peers
+# Note the "Relay" column for Win-A
+```
+
+3. Check DERP health (from any machine):
+```bash
+curl -s https://login.quickztna.com/api/derp-health | python3 -m json.tool
+```
+
+**Expected output:**
+```
+Win-A (India) peer table:
+  Win-B via relay: blr1.derp.quickztna.com   ← nearest DERP to Win-A
+
+Win-B (Europe) peer table:
+  Win-A via relay: lon1.derp.quickztna.com   ← nearest DERP to Win-B
+```
+
+Note: Each side may pick a different DERP — this is normal. Traffic flows: Win-A → blr1 → lon1 → Win-B (relay-to-relay forwarding).
+
+**Pass:** A DERP node appears in the Relay column. The node name roughly matches the geography of the machine (blr1 for India, lon1 for Europe, etc.).
+
+**Fail / Common issues:**
+- Relay column is empty and Direct is false → tunnel may be establishing; wait 30s and check again
+- DERP health returns 500 → DERP nodes may be down; check `login.quickztna.com/api/health`
+
+---
+
+## ST4 — End-to-End Ping Through the Mesh
+
+**What it verifies:** Win-A can actually send traffic to Win-B through the WireGuard mesh, via DERP or direct.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, get Win-B's tailnet IP (from ST1 or `ztna peers`).
+
+2. Ping Win-B:
+```powershell
+ztna ping 100.64.0.2 --count 5
+```
+
+3. Ping Linux-C:
+```powershell
+ztna ping 100.64.0.3 --count 5
+```
+
+4. From <MachineRef name="Linux-C" />, ping both Windows machines:
+```bash
+ztna ping 100.64.0.1 --count 5
+ztna ping 100.64.0.2 --count 5
+```
+
+**Expected output:**
+```
+PING 100.64.0.2 via WireGuard
+5 packets transmitted, 5 received, 0% packet loss
+rtt min/avg/max = 45.2/52.1/58.4 ms
+
+PING 100.64.0.3 via WireGuard
+5 packets transmitted, 5 received, 0% packet loss
+rtt min/avg/max = 12.1/14.8/17.2 ms
+```
+
+Latency will vary by distance and whether traffic is relayed or direct.
+
+**Pass:** 0% packet loss to all peers. Response times are reasonable (< 300ms for relay, < 50ms for same-region).
+
+**Fail / Common issues:**
+- 100% packet loss → check `ztna up` is running on the target machine
+- High latency (> 500ms) → check which DERP is selected; may be routing suboptimally
+- `ztna ping: command not found` → update ztna to v3.0+
+
+---
+
+## ST5 — Direct P2P vs DERP Relay
+
+**What it verifies:** Linux-C has a public IP. When Win-A connects to Linux-C, WireGuard may be able to form a direct P2P tunnel (bypassing DERP) since one side has a public IP.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, check the peer entry for Linux-C:
+```powershell
+ztna peers
+# Look at Direct column for Linux-C
+```
+
+2. Wait 30–60 seconds after initial connection (direct connection may take a moment to establish):
+```powershell
+# Ping to generate traffic (helps NAT hole-punch)
+ztna ping 100.64.0.3 --count 10
+ztna peers
+# Check Direct column again
+```
+
+**Expected output:**
+```
+# Initial state (DERP relay):
+Linux-C   100.64.0.3   online   blr1.derp...   direct=false
+
+# After NAT hole-punch succeeds:
+Linux-C   100.64.0.3   online                  direct=true
+```
+
+**Pass:** `direct=true` for Linux-C (which has a public IP). Win-A ↔ Linux-C is direct P2P, Win-A ↔ Win-B is via DERP (both behind NAT).
+
+**Fail / Common issues:**
+- Direct never establishes → some NAT types block incoming UDP even when the other side has a public IP; DERP relay is the correct fallback
+- Both peers show `direct=false` and relay → acceptable if NAT blocks direct; measure latency with `ztna ping` to verify relay is working
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Tailnet IPs assigned | Each machine has unique IP in 100.64.0.0/10 |
+| ST2 | Peer visibility | All peers appear in each machine's peer table |
+| ST3 | DERP relay selection | DERP node shown in Relay column, matches geography |
+| ST4 | End-to-end ping | 0% packet loss to all peers via mesh |
+| ST5 | Direct P2P vs DERP | Linux-C (public IP) shows direct=true from Win-A |

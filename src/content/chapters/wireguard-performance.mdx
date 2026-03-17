@@ -1,0 +1,251 @@
+---
+title: "WireGuard Performance"
+topic: "WireGuard"
+order: 3
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Measure baseline latency, throughput via DERP vs direct, reconnect time, and verify no performance regressions."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Performance is observable, not just theoretical. This chapter gives you a baseline you can return to after any infrastructure change to confirm you haven't regressed. We measure:
+
+1. **Latency** — round-trip time via DERP relay vs direct P2P
+2. **Throughput** — data transfer rate through the WireGuard tunnel
+3. **Reconnect time** — how quickly the tunnel re-establishes after being dropped
+4. **DERP vs P2P upgrade** — how long before a direct tunnel forms after relay
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Client / sender |
+| <MachineRef name="Linux-C" /> | Server / receiver (public IP) |
+| <MachineRef name="Win-B" /> | Second peer for DERP relay test |
+
+Install `iperf3` on Linux-C before starting:
+```bash
+# Ubuntu/Debian
+sudo apt install iperf3 -y
+
+# Verify
+iperf3 --version
+```
+
+On Windows (Win-A), download iperf3 from the official site or use the bundled version:
+```powershell
+# Check if available
+iperf3.exe --version
+```
+
+---
+
+## ST1 — Baseline Latency: DERP Relay
+
+**What it verifies:** Establishes a latency baseline for traffic going through the DERP relay (Win-A → Win-B, both behind NAT).
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, confirm Win-B is using DERP relay (not direct):
+```powershell
+ztna peers
+# Win-B should show Direct=false, Relay=blr1 or lon1
+```
+
+2. Run a ping test to Win-B:
+```powershell
+ztna ping 100.64.0.2 --count 20
+```
+
+3. Record the average RTT.
+
+**Expected output:**
+```
+PING 100.64.0.2 (Win-B) via WireGuard
+20 packets transmitted, 20 received, 0% packet loss
+rtt min/avg/max = 120.4/138.2/162.1 ms
+```
+
+Typical DERP relay latency for India → Europe via BLR1: **100–200ms** (adds ~20-40ms on top of raw internet latency).
+
+**Pass:** 0% packet loss. RTT is consistent (stddev < 30ms). Record the average as your baseline.
+
+**Fail / Common issues:**
+- RTT > 400ms consistently → check which DERP node is selected; may be routing through a distant DERP
+- Packet loss > 5% → network instability between the machine and DERP node
+
+---
+
+## ST2 — Baseline Latency: Direct P2P (Linux-C)
+
+**What it verifies:** Latency for direct WireGuard P2P tunnel (Win-A → Linux-C, where Linux-C has a public IP).
+
+**Steps:**
+
+1. Confirm Win-A ↔ Linux-C is direct (from Chapter 2, ST5):
+```powershell
+ztna peers
+# Linux-C should show Direct=true
+```
+
+2. Run latency test:
+```powershell
+ztna ping 100.64.0.3 --count 20
+```
+
+3. Compare with ST1 result.
+
+**Expected output:**
+```
+PING 100.64.0.3 (Linux-C) via WireGuard (direct)
+20 packets transmitted, 20 received, 0% packet loss
+rtt min/avg/max = 18.2/21.4/26.8 ms
+```
+
+Direct P2P is typically **5–15x faster** than DERP relay for same-region connections.
+
+**Pass:** RTT is significantly lower than DERP relay baseline (ST1). 0% packet loss.
+
+**Fail / Common issues:**
+- RTT similar to DERP → direct connection may not have established; check `direct=true` in peers
+- Connection uses DERP despite Linux-C having public IP → try `ztna up` restart on Win-A
+
+---
+
+## ST3 — Throughput Test via Direct Tunnel
+
+**What it verifies:** Actual data throughput through a WireGuard direct P2P tunnel.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, start iperf3 server:
+```bash
+iperf3 -s -p 5201
+```
+
+2. On <MachineRef name="Win-A" />, run throughput test to Linux-C's tailnet IP:
+```powershell
+iperf3.exe -c 100.64.0.3 -p 5201 -t 10 -P 4
+```
+(`-P 4` = 4 parallel streams, better saturates the tunnel)
+
+3. Note the total bandwidth.
+
+**Expected output:**
+```
+[SUM]   0.00-10.00 sec  125 MBytes   105 Mbits/sec   sender
+[SUM]   0.00-10.00 sec  124 MBytes   104 Mbits/sec   receiver
+```
+
+Typical throughput varies heavily by internet connection quality. QuickZTNA adds minimal overhead — WireGuard's overhead is ~60 bytes per packet (compared to OpenVPN's ~100+ bytes).
+
+**Pass:** Throughput is > 50% of your raw internet bandwidth. No connection drops during the 10-second test.
+
+**Fail / Common issues:**
+- iperf3 connection refused → check Linux-C firewall: `ufw allow 5201/tcp` or `firewall-cmd --add-port=5201/tcp --permanent`
+- Very low throughput (< 1 Mbps) → CPU bottleneck on the machine; check CPU usage during test
+
+---
+
+## ST4 — Reconnect Time After Tunnel Drop
+
+**What it verifies:** How quickly the WireGuard tunnel re-establishes after being intentionally dropped.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, start a continuous ping to Linux-C:
+```powershell
+# Run in one terminal — keep this running
+ztna ping 100.64.0.3 --count 200 --interval 1
+```
+
+2. In a second terminal, drop the tunnel:
+```powershell
+ztna down
+```
+
+3. Note how many ping packets are lost.
+
+4. Bring tunnel back up immediately:
+```powershell
+ztna up
+```
+
+5. Note when pings resume in the first terminal.
+
+**Expected output:**
+```
+# Before ztna down:
+64 bytes from 100.64.0.3: time=21.4 ms
+64 bytes from 100.64.0.3: time=20.8 ms
+
+# After ztna down (packets lost):
+Request timeout for icmp_seq 8
+Request timeout for icmp_seq 9
+
+# After ztna up (tunnel restored):
+64 bytes from 100.64.0.3: time=25.1 ms  ← resumes after ~3-5 seconds
+64 bytes from 100.64.0.3: time=22.4 ms
+```
+
+**Pass:** Tunnel re-establishes within 10 seconds of `ztna up`. Lost packets during downtime only.
+
+**Fail / Common issues:**
+- Tunnel doesn't come back → check `ztna status` after `ztna up`, look for errors
+- Reconnect takes > 30 seconds → WireGuard handshake may be timing out; check firewall rules on both ends
+
+---
+
+## ST5 — DERP to Direct P2P Upgrade Timing
+
+**What it verifies:** After initial connection (which starts via DERP), WireGuard attempts to upgrade to direct P2P. Measures how long this upgrade takes for Win-A → Linux-C.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, disconnect and reconnect:
+```powershell
+ztna down
+Start-Sleep -Seconds 2
+ztna up
+```
+
+2. Immediately start monitoring the peer status every 5 seconds:
+```powershell
+for ($i = 0; $i -lt 12; $i++) {
+    $ts = Get-Date -Format "HH:mm:ss"
+    $peers = ztna peers
+    Write-Host "$ts --- $peers"
+    Start-Sleep -Seconds 5
+}
+```
+
+3. Note when the `Direct` column changes from `false` to `true` for Linux-C.
+
+**Expected output:**
+```
+12:01:00 --- Linux-C  100.64.0.3  online  blr1.derp...  direct=false
+12:01:05 --- Linux-C  100.64.0.3  online  blr1.derp...  direct=false
+12:01:10 --- Linux-C  100.64.0.3  online                direct=true   ← upgrade happened at ~10s
+```
+
+**Pass:** Direct P2P established within 60 seconds. After upgrade, latency should drop (verify with `ztna ping`).
+
+**Fail / Common issues:**
+- `direct=true` never appears → NAT traversal failed; DERP relay is the fallback and this is acceptable
+- Upgrade happens then reverts → NAT mapping expired; some NATs have short UDP timeouts
+
+---
+
+## Summary
+
+| Sub-test | Baseline to record | Pass condition |
+|----------|-------------------|----------------|
+| ST1 | DERP relay RTT (Win-A → Win-B) | 0% loss, consistent RTT |
+| ST2 | Direct P2P RTT (Win-A → Linux-C) | RTT lower than DERP baseline |
+| ST3 | Throughput via direct tunnel | > 50% of raw internet bandwidth |
+| ST4 | Reconnect time after drop | Tunnel back within 10 seconds |
+| ST5 | DERP → P2P upgrade timing | Direct established within 60 seconds |
+
+**Record these numbers now.** After any infra change (server upgrade, new DERP node, migration), re-run this chapter and compare.

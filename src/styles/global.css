@@ -1,0 +1,41 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Custom scrollbar for sidebar */
+.sidebar-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.sidebar-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 2px;
+}
+
+/* Code block overrides */
+pre {
+  border-radius: 0.5rem;
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.7;
+}
+
+/* Inline code */
+:not(pre) > code {
+  background: #1e293b;
+  color: #7dd3fc;
+  padding: 0.15em 0.4em;
+  border-radius: 0.25rem;
+  font-size: 0.875em;
+}
+
+/* Pagefind UI overrides */
+.pagefind-ui {
+  --pagefind-ui-primary: #38bdf8;
+  --pagefind-ui-background: #0f172a;
+  --pagefind-ui-border: #1e293b;
+  --pagefind-ui-text: #cbd5e1;
+  --pagefind-ui-font: inherit;
+}

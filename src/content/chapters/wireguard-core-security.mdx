@@ -1,0 +1,205 @@
+---
+title: "WireGuard Core Security"
+topic: "WireGuard"
+order: 1
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify key generation, ChaCha20-Poly1305 encryption, and that private keys never leave the machine."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+WireGuard's security model is built on three guarantees:
+
+1. **Keys never in transit** — Only public keys are exchanged. Private keys are generated locally and stay local.
+2. **Modern AEAD encryption** — ChaCha20-Poly1305 for all traffic, with no negotiation or downgrade possible.
+3. **Perfect Forward Secrecy** — Ephemeral session keys mean past sessions can't be decrypted even if long-term keys leak.
+
+These aren't just claims — every one of them can be verified with tools already on your machines.
+
+## Your Test Setup
+
+| Machine | Role | What you'll run |
+|---------|------|----------------|
+| <MachineRef name="Win-A" /> | Primary test machine | `ztna` CLI + PowerShell |
+| <MachineRef name="Linux-C" /> | Packet capture + peer verification | `tcpdump`, `ztna` CLI |
+| <MachineRef name="Win-B" /> | Second peer | `ztna` CLI |
+
+All three machines must be enrolled and online in your QuickZTNA org before starting.
+
+**Pre-check:** Open a terminal on each machine and confirm:
+```bash
+ztna status
+```
+Expected: `Connected` status on all three.
+
+---
+
+## ST1 — Verify Private Key Never Leaves the Machine
+
+**What it verifies:** The WireGuard private key is generated locally and is not transmitted to the QuickZTNA control plane or any peer.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, start a packet capture on the interface used for outbound traffic:
+```bash
+# Find your primary interface
+ip route get 8.8.8.8 | awk '{print $5; exit}'
+
+# Start capture (replace eth0 with your interface)
+tcpdump -i eth0 -w /tmp/ztna-reg.pcap -n host login.quickztna.com &
+```
+
+2. On <MachineRef name="Win-A" />, force a re-registration:
+```powershell
+ztna logout
+ztna login --auth-key=YOUR_AUTH_KEY
+```
+
+3. On <MachineRef name="Linux-C" />, stop capture and inspect:
+```bash
+kill %1
+# Look for any 44-char base64 string (WireGuard key format)
+tcpdump -r /tmp/ztna-reg.pcap -A | grep -E '[A-Za-z0-9+/]{43}='
+```
+
+**Expected output:**
+```
+# Zero lines returned, OR only lines matching your PUBLIC key (visible in dashboard).
+# Private key is never sent over the wire.
+```
+
+**Pass:** No 44-char base64 strings in capture, or only the known public key appears.
+
+**Fail / Common issues:**
+- `tcpdump: Permission denied` → run with `sudo`
+- To distinguish public vs private key: compare captured key with dashboard → Machines → Win-A → Public Key
+
+---
+
+## ST2 — Confirm ChaCha20-Poly1305 Encryption
+
+**What it verifies:** All WireGuard tunnel traffic is encrypted with ChaCha20-Poly1305. Payload is opaque ciphertext.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, get Linux-C's tailnet IP:
+```powershell
+ztna peers
+# Note the IP column for Linux-C
+```
+
+2. On <MachineRef name="Linux-C" />, capture tunnel traffic from Win-A:
+```bash
+# Replace 100.64.x.x with Win-A tailnet IP
+tcpdump -i any udp and host 100.64.x.x -w /tmp/wg-traffic.pcap &
+```
+
+3. On <MachineRef name="Win-A" />, send traffic:
+```powershell
+ztna ping 100.64.x.x --count 20
+```
+
+4. On <MachineRef name="Linux-C" />, stop capture and verify ciphertext:
+```bash
+kill %1
+tcpdump -r /tmp/wg-traffic.pcap -A | head -60
+```
+
+**Expected output:**
+```
+# All payload bytes look like random binary — no readable strings
+# No HTTP headers, no hostnames, no IP addresses in payload
+# Protocol is UDP
+```
+
+**Pass:** Payload is opaque. No plaintext strings visible in the captured bytes.
+
+**Fail / Common issues:**
+- Packets are TCP not UDP → traffic may be going to control plane, not through WireGuard tunnel
+- `ztna ping` shows "no route" → run `ztna up` first, then retry
+
+---
+
+## ST3 — Verify Perfect Forward Secrecy (Session Key Rotation)
+
+**What it verifies:** WireGuard rotates ephemeral session keys every ~180 seconds. Past sessions cannot be decrypted after rotation.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, note the current handshake time:
+```powershell
+ztna status
+# Look for: "Latest handshake: X minutes ago"
+```
+
+2. Keep the tunnel active for 3+ minutes:
+```powershell
+ztna ping 100.64.x.x --count 200 --interval 1
+```
+
+3. Check again after 3 minutes:
+```powershell
+ztna status
+# "Latest handshake" should show a recent timestamp
+```
+
+**Expected output:**
+```
+# Before:
+Latest handshake: 2 minutes, 45 seconds ago
+
+# After waiting 3 minutes:
+Latest handshake: 8 seconds ago   ← new ephemeral keys negotiated
+```
+
+**Pass:** The handshake timestamp resets — new ephemeral keys were generated.
+
+**Fail / Common issues:**
+- Handshake never updates → send traffic to force it: `ztna ping 100.64.x.x`
+- Handshake too old (> 3 minutes) with no new one → check if tunnel is still up with `ztna status`
+
+---
+
+## ST4 — Key Format Verification (Curve25519)
+
+**What it verifies:** WireGuard public keys are Curve25519 (32-byte), base64-encoded as 44 characters.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, display the public key:
+```powershell
+ztna status
+# Note the public key field
+```
+
+2. Verify it in the dashboard:
+   - Go to `login.quickztna.com` → Machines → click Win-A
+   - Copy the public key shown in machine details
+
+3. Compare: CLI key should exactly match dashboard.
+
+**Expected output:**
+```
+Public key: bpkM2YWJEhXfP3Kj8L9oR1sNwH4DqTmZ6eAcXvByI0=
+Length: 44 characters
+Curve: Curve25519 (X25519)
+```
+
+**Pass:** 44-character base64 key, identical in CLI and dashboard.
+
+**Fail / Common issues:**
+- Key mismatch → wait 30s for heartbeat sync, then check again
+- Key not shown in `ztna status` → try `ztna status --verbose`
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Private key stays local | No private key bytes in network capture |
+| ST2 | ChaCha20-Poly1305 encryption | Payload is opaque ciphertext |
+| ST3 | Perfect Forward Secrecy | Handshake resets every ~3 minutes |
+| ST4 | Curve25519 key format | 44-char base64, matches dashboard |

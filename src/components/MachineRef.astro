@@ -1,0 +1,27 @@
+---
+interface Props {
+  name: string;
+}
+
+const { name } = Astro.props;
+
+const colors: Record<string, string> = {
+  'Win-A': 'bg-blue-900/50 text-blue-300 border-blue-700',
+  'Win-B': 'bg-purple-900/50 text-purple-300 border-purple-700',
+  'Linux-C': 'bg-emerald-900/50 text-emerald-300 border-emerald-700',
+};
+
+const icons: Record<string, string> = {
+  'Win-A': '⊞',
+  'Win-B': '⊞',
+  'Linux-C': '🐧',
+};
+
+const cls = colors[name] ?? 'bg-slate-800 text-slate-300 border-slate-600';
+const icon = icons[name] ?? '🖥';
+---
+
+<span class={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-xs font-mono font-medium ${cls}`}>
+  <span>{icon}</span>
+  {name}
+</span>
