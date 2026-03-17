@@ -1,0 +1,318 @@
+---
+title: "ACL Rule Creation (Allow)"
+topic: "Access Control Lists (ACLs)"
+order: 26
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Create allow rules via dashboard and API, verify they permit traffic between specified machines."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+ACL rules control which machines can communicate with each other across your QuickZTNA mesh network. By default, the system follows a **zero-trust model** -- all traffic is denied unless an explicit allow rule matches (see `acl-evaluate.ts`, line 92: `let decision: 'allow' | 'deny' = 'deny'`).
+
+Rules are stored in the `acl_rules` table with these key columns:
+
+- **name** (TEXT, required) -- human-readable label
+- **source** (TEXT, required) -- machine ID, tailnet IP, `tag:name`, `user:id`, `group:name`, CIDR, or `*` (any)
+- **destination** (TEXT, required) -- same selector format as source
+- **ports** (TEXT, default `*`) -- comma-separated ports or ranges (e.g., `80,443`, `8000-9000`), or `*` for all ports
+- **protocol** (TEXT, default `tcp`) -- `tcp`, `udp`, `icmp`, or `*` for any protocol
+- **action** (TEXT, default `allow`) -- `allow` or `deny`
+- **priority** (INTEGER, default 100) -- lower number = higher priority; first match wins
+- **enabled** (BOOLEAN, default true) -- disabled rules are skipped during evaluation
+
+ACL rules are created via:
+1. The **dashboard** at `https://login.quickztna.com/acls` -- uses `POST /api/db/acl_rules` (generic CRUD)
+2. The **REST API** directly -- same CRUD endpoint
+3. The **CLI** -- `ztna acl list` reads rules; creation is dashboard/API only
+
+The evaluation engine (`POST /api/acl-evaluate`) iterates rules in priority order (ASC) and returns the first match. If no rule matches, traffic is denied.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard tests + curl for API tests |
+| <MachineRef name="Win-B" /> | Target machine (destination for allow rules) |
+| <MachineRef name="Linux-C" /> | Source machine for `ztna ping` verification |
+
+Ensure all three machines are online (`ztna status` shows connected) and belong to the same organization.
+
+---
+
+## ST1 -- Create an Allow Rule via Dashboard
+
+**What it verifies:** An admin can create an allow rule from the ACLs page, and it appears in the rule list with the correct fields.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/acls` in a browser. Log in as an admin user.
+2. Click the **+ Add Rule** button (the Plus icon button).
+3. Fill in the rule form:
+   - Name: `Allow-ST1-Test`
+   - Source: `*`
+   - Destination: `*`
+   - Protocol: `tcp`
+   - Ports: `443`
+   - Action: `allow` (should be the default)
+4. Click **Save**.
+
+**Expected behavior:**
+- A success toast: "Rule added"
+- The rule appears in the list with:
+  - Name: `Allow-ST1-Test`
+  - Source: `*`, Destination: `*`
+  - Protocol: TCP, Ports: `443`
+  - Action badge shows "allow" (default/blue badge)
+  - Priority: 100 (default)
+  - Enabled toggle is ON
+
+**Pass:** Rule created successfully and visible in the list with all fields matching the input.
+
+**Fail / Common issues:**
+- "Failed" toast -- check browser console for the API error. Most likely missing org admin permissions.
+- Rule not appearing -- click the refresh button or reload the page. Check that `fetchRules()` is being called after save.
+
+---
+
+## ST2 -- Create an Allow Rule via API
+
+**What it verifies:** An allow rule can be created via the CRUD API endpoint, and the response contains the new rule ID.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, get your JWT token from the browser (Dev Tools, Application, Local Storage, `access_token` key).
+2. Get your org ID from the URL bar (visible in dashboard requests) or from `ztna status`.
+3. Run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Allow-SSH-LinuxC",
+    "source": "*",
+    "destination": "tag:server",
+    "ports": "22",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 50
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "data": {
+      "id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    }
+  },
+  "error": null
+}
+```
+
+Note: the insert response has a double-nested structure (`data.data.id`).
+
+4. Verify the rule exists by fetching the list:
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" | python -m json.tool
+```
+
+**Pass:** Response returns `success: true` with a UUID for the new rule. The GET request shows the rule with all fields matching.
+
+**Fail / Common issues:**
+- 403 Forbidden -- you must be an admin or owner of the organization. ACL rules are in `ADMIN_WRITE_TABLES`.
+- 400 Bad Request -- missing `org_id` in the body. All org-scoped tables require it.
+
+---
+
+## ST3 -- Verify Allow Rule Permits Traffic (ztna ping)
+
+**What it verifies:** After creating an allow rule, traffic between the matched source and destination is permitted.
+
+**Prerequisites:** An allow rule from ST1 or ST2 must exist with source `*` and destination `*` (or matching the specific machines).
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, confirm the VPN tunnel is up:
+```bash
+ztna status
+```
+Should show `Connected` or `Authenticated: true`.
+
+2. Get the peer list to find <MachineRef name="Win-B" />'s name:
+```bash
+ztna peers
+```
+
+3. Ping <MachineRef name="Win-B" /> through the mesh:
+```bash
+ztna ping Win-B
+```
+
+**Expected output:**
+```
+Pong from Win-B (100.x.x.x): time=Xms
+Pong from Win-B (100.x.x.x): time=Xms
+```
+
+4. You can also test the evaluation API directly:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 443,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected response includes:**
+```json
+{
+  "success": true,
+  "data": {
+    "allowed": true,
+    "decision": "allow",
+    "matched_rule": {
+      "id": "...",
+      "name": "Allow-ST1-Test",
+      "action": "allow",
+      "priority": 100
+    }
+  }
+}
+```
+
+**Pass:** `ztna ping` succeeds. The evaluation API returns `allowed: true` with the correct matched rule.
+
+**Fail / Common issues:**
+- `ztna ping` times out -- check that both machines are online and the VPN tunnel is up on both sides.
+- Evaluation returns `allowed: false` -- check that the rule is enabled and the source/destination selectors match. Verify no higher-priority deny rule exists.
+
+---
+
+## ST4 -- List Rules via CLI (ztna acl list)
+
+**What it verifies:** The `ztna acl list` command fetches and displays all ACL rules for the current organization.
+
+**Steps:**
+1. On <MachineRef name="Win-A" /> (or any authenticated machine), run:
+```powershell
+ztna acl list
+```
+
+**Expected output:**
+```
+ACL Rules (N):
+
+  [1] {
+    "id": "...",
+    "name": "Allow-SSH-LinuxC",
+    "source": "*",
+    "destination": "tag:server",
+    "ports": "22",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 50,
+    "enabled": true
+  }
+  [2] {
+    "id": "...",
+    "name": "Allow-ST1-Test",
+    ...
+  }
+```
+
+Rules are displayed as indented JSON, numbered sequentially. The count in the header (`ACL Rules (N)`) matches the number of rules listed.
+
+2. If no rules exist, the output is:
+```
+No ACL rules configured.
+Add rules from the dashboard at https://login.quickztna.com/acls
+```
+
+**Pass:** All rules created in ST1 and ST2 appear in the list with correct fields. Rules are numbered and formatted as JSON.
+
+**Fail / Common issues:**
+- "not authenticated. Run 'ztna login' first" -- the CLI session has expired. Run `ztna login` again.
+- "error fetching ACLs" -- network connectivity issue or the API is unreachable. Check `ztna status`.
+
+---
+
+## ST5 -- Verify Rule Fields (Source Selectors)
+
+**What it verifies:** The various source/destination selector formats work correctly in allow rules -- wildcard, tag, machine ID, tailnet IP, CIDR, user, and group selectors.
+
+**Steps:**
+1. Create rules with different selector types via the API. For each, call `POST /api/acl-evaluate` to verify the match logic.
+
+**Test selector: `tag:webserver`**
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Allow-Tag-Test",
+    "source": "tag:webserver",
+    "destination": "*",
+    "ports": "80,443",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 60
+  }'
+```
+
+2. Evaluate with a source machine that has the `webserver` tag:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "TAGGED_MACHINE_ID",
+    "destination_machine_id": "ANY_MACHINE_ID",
+    "port": 80,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** `allowed: true`, `matched_rule.name` is `"Allow-Tag-Test"`.
+
+3. Evaluate with a source machine that does NOT have the `webserver` tag:
+
+**Expected:** `allowed: false` (falls through to default deny, assuming no other allow rules match).
+
+4. Other selectors to test (same pattern -- create rule, then evaluate):
+   - `*` -- matches any machine
+   - Direct machine UUID -- matches only that specific machine
+   - Tailnet IP (e.g., `100.64.0.5`) -- matches by IP
+   - CIDR (e.g., `100.64.0.0/24`) -- matches machines in that subnet
+   - `user:USER_UUID` -- matches machines owned by that user
+   - `group:Engineering` -- matches machines in the named segmentation group
+
+**Pass:** Each selector type correctly matches (or does not match) the expected machines. The evaluation API returns `allowed: true` only when the selector matches the source/destination machine.
+
+**Fail / Common issues:**
+- Tag selectors require the machine to have tags set (via `ztna set --tags webserver` or the dashboard). Verify tags are actually stored on the machine record.
+- CIDR match uses IPv4 only. Ensure the machine's `tailnet_ip` falls within the specified CIDR range.
+- `group:` selectors require the machine to be a member of a segmentation group (configured under the Segmentation page).
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Allow rules can be created from the dashboard UI |
+| ST2 | Allow rules can be created via the REST API with all fields |
+| ST3 | Allow rules permit traffic -- verified via `ztna ping` and the evaluation API |
+| ST4 | `ztna acl list` displays all rules with correct formatting |
+| ST5 | All selector types (wildcard, tag, machine ID, IP, CIDR, user, group) work in allow rules |

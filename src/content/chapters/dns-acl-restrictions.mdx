@@ -1,0 +1,260 @@
+---
+title: "MagicDNS with ACL Restrictions"
+topic: "DNS & MagicDNS"
+order: 40
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify that DNS resolution works but ACL rules still block actual traffic — DNS and ACLs are independent layers."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+DNS resolution and ACL enforcement are independent layers in QuickZTNA. A machine can resolve another machine's tailnet IP via MagicDNS, but the actual network traffic is still subject to ACL rules. This chapter verifies that resolving a hostname does not imply permission to communicate. The ACL check happens at the WireGuard data plane level, not at the DNS level.
+
+Key facts from source code:
+
+- **DNS resolution** (`dns-management.ts` `resolve` action, `resolver.go`): Resolves hostnames to tailnet IPs. The only permission check is org membership -- any org member can resolve any machine in the same org. There is no ACL check at the DNS layer.
+- **ACL enforcement** (`acl-evaluate.ts`): Evaluates rules using `org_id`, `source_machine_id`, and `destination_machine_id`. The evaluation is separate from DNS -- it checks the `acl_rules` table for matching source/destination/port/protocol combinations.
+- **Local resolver** (`resolver.go`): The in-memory records map contains all peers the machine knows about. There is no ACL filtering of DNS records -- all peer hostnames are resolvable regardless of ACL rules.
+- **Traffic flow:** DNS query succeeds (hostname to IP) then WireGuard packet is built then ACL evaluation determines if the packet is allowed or dropped.
+- **DNS blocklist** (`resolver.go` lines 332-341): This is the threat feed blocklist (malware/phishing domains), NOT ACL-based blocking. It returns NXDOMAIN for domains in the blocklist. This is unrelated to machine-to-machine ACLs.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Source machine -- will attempt to reach Win-B |
+| <MachineRef name="Win-B" /> | Destination machine -- ACL will deny traffic from Win-A |
+| <MachineRef name="Linux-C" /> | Dashboard admin -- configures ACL rules |
+
+All three machines must be connected (`ztna up`) with MagicDNS enabled.
+
+---
+
+## ST1 -- Baseline: DNS Resolution and Connectivity Work
+
+**What it verifies:** Before adding restrictive ACL rules, both DNS resolution and actual connectivity work between Win-A and Win-B.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, resolve <MachineRef name="Win-B" />:
+```bash
+ztna dns query Win-B
+```
+
+**Expected output:**
+```
+Win-B.yourorg.zt.net -> 100.64.0.2
+```
+
+2. Ping Win-B to confirm connectivity:
+```bash
+ztna ping Win-B
+```
+
+or by tailnet IP:
+```bash
+ztna ping 100.64.0.2
+```
+
+**Expected:** Ping succeeds with round-trip times displayed.
+
+3. Note Win-B's tailnet IP for later comparison.
+
+**Pass:** DNS resolves Win-B. Ping succeeds. This establishes the baseline before ACL changes.
+
+**Fail / Common issues:**
+- Ping fails even without ACL restrictions -- check that both machines are connected and the default ACL policy allows traffic. Verify with `ztna peers`.
+
+---
+
+## ST2 -- Create a Deny ACL Rule
+
+**What it verifies:** An admin can create an ACL rule that blocks traffic between specific machines.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" /> (or via the dashboard on any machine), create an ACL rule that denies all traffic from Win-A to Win-B. First, get the machine IDs:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+curl -s "https://login.quickztna.com/api/db/machines?org_id=eq.YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "
+import sys, json
+machines = json.load(sys.stdin)['data']
+for m in machines:
+    print(f\"{m['name']}: {m['id']} ({m['tailnet_ip']})\")
+"
+```
+
+2. Create the deny rule via the CRUD API:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "src": "WIN_A_MACHINE_ID",
+    "dst": "WIN_B_MACHINE_ID",
+    "ports": "*",
+    "protocol": "*",
+    "action": "deny",
+    "description": "Test: block Win-A to Win-B"
+  }' | python3 -m json.tool
+```
+
+3. Save the returned rule `id` for cleanup.
+
+**Pass:** ACL rule created. The response includes the new rule's UUID.
+
+**Fail / Common issues:**
+- `FORBIDDEN` -- only org admins can create ACL rules.
+- `MISSING_FIELDS` -- ensure `org_id`, `src`, `dst`, `action` are all provided.
+
+---
+
+## ST3 -- DNS Resolution Still Works After ACL Deny
+
+**What it verifies:** The ACL deny rule does NOT affect DNS resolution. Win-A can still resolve Win-B's hostname.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, resolve <MachineRef name="Win-B" /> again:
+```bash
+ztna dns query Win-B
+```
+
+**Expected output:**
+```
+Win-B.yourorg.zt.net -> 100.64.0.2
+```
+
+The exact same result as ST1. The `resolve` action in `dns-management.ts` performs a machine name lookup -- it does not consult ACL rules at all.
+
+2. Also verify via the local resolver (if running):
+```bash
+nslookup Win-B 127.0.0.53
+```
+
+**Expected:** Resolves to Win-B's tailnet IP. The local resolver's records map (`resolver.go`) contains all peers regardless of ACL state.
+
+3. Verify via the full `get_settings` response:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -c "
+import sys, json
+records = json.load(sys.stdin)['data']['dns_records']
+for r in records:
+    print(f\"{r['name']} -> {r['value']}\")
+"
+```
+
+**Expected:** Win-B appears in the DNS records list. ACL rules do not filter the DNS records.
+
+**Pass:** DNS resolution returns Win-B's IP. The ACL deny rule has no effect on name resolution.
+
+**Fail / Common issues:**
+- If DNS stops resolving Win-B, that would be a bug -- DNS and ACLs should be independent. Check that Win-B is still connected and MagicDNS is enabled.
+
+---
+
+## ST4 -- ACL Blocks Actual Traffic Despite DNS Success
+
+**What it verifies:** Although DNS resolves Win-B, the actual network traffic is blocked by the ACL deny rule.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, try to ping <MachineRef name="Win-B" /> by tailnet IP:
+```bash
+ztna ping 100.64.0.2
+```
+
+**Expected:** Ping fails or times out. The WireGuard data plane evaluates the ACL rules and drops packets from Win-A to Win-B.
+
+2. Try to connect to a TCP port on Win-B (e.g., SSH or HTTP):
+```bash
+curl --connect-timeout 5 http://100.64.0.2:80
+```
+
+**Expected:** Connection times out or is refused (depending on how ACL enforcement drops the traffic).
+
+3. Verify the ACL evaluation explicitly via the API:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "WIN_A_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID"
+  }' | python3 -m json.tool
+```
+
+**Expected:** The response indicates the traffic is denied by the ACL rule created in ST2.
+
+**Pass:** DNS resolution succeeds (ST3) but actual traffic is blocked. This proves DNS and ACLs are independent layers.
+
+**Fail / Common issues:**
+- Ping still succeeds -- the ACL rule may not match the source/destination correctly. Verify the machine IDs in the rule. Also check if there is an allow-all rule with higher priority that overrides the deny.
+- The ACL evaluation endpoint requires `org_id`, `source_machine_id`, and `destination_machine_id` (not node_key or IP).
+
+---
+
+## ST5 -- Remove ACL Rule and Verify Connectivity Restores
+
+**What it verifies:** Removing the deny rule restores both DNS resolution (unchanged) and actual connectivity.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, delete the ACL rule created in ST2:
+```bash
+curl -s -X DELETE "https://login.quickztna.com/api/db/acl_rules?id=eq.RULE_UUID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+Note: DELETE via CRUD API requires a JSON body `{}` (even though it is empty).
+
+2. On <MachineRef name="Win-A" />, verify DNS still works (it should have worked throughout):
+```bash
+ztna dns query Win-B
+```
+
+**Expected:** Same result as before -- Win-B resolves to its tailnet IP.
+
+3. Verify connectivity is restored:
+```bash
+ztna ping 100.64.0.2
+```
+
+**Expected:** Ping succeeds again. With the deny rule removed, the default ACL policy (typically allow-all within the org) permits the traffic.
+
+4. Confirm ACL evaluation now allows traffic:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "WIN_A_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID"
+  }' | python3 -m json.tool
+```
+
+**Expected:** Traffic is allowed.
+
+**Pass:** After removing the deny rule, both DNS resolution and actual connectivity work. DNS was never affected by the ACL rule at any point.
+
+**Fail / Common issues:**
+- Connectivity not restored -- there may be other deny rules in effect. List all ACL rules: `GET /api/db/acl_rules?org_id=eq.YOUR_ORG_ID`.
+- DELETE returns no error but rule persists -- ensure the query parameter uses `id=eq.RULE_UUID` format (Supabase-style filter).
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Baseline connectivity | DNS resolves and ping succeeds before ACL changes |
+| ST2 | ACL deny rule creation | Deny rule created for Win-A to Win-B traffic |
+| ST3 | DNS independent of ACLs | DNS resolution unaffected by the deny rule |
+| ST4 | ACL blocks traffic | Ping fails despite successful DNS resolution |
+| ST5 | ACL removal restores traffic | After removing the deny rule, connectivity and DNS both work |

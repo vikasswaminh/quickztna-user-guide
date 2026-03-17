@@ -1,0 +1,328 @@
+---
+title: "Download & Install Certificate on Test Machine"
+topic: "Certificate Authority"
+order: 60
+machines: ["Win-A", "Linux-C"]
+summary: "Download issued certificates and install them on test machines -- verify TLS connections work with the CA certificate."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+After issuing X.509 certificates via the QuickZTNA CA, you need to download and install them on machines to enable TLS. This chapter covers:
+
+1. Downloading the certificate and private key from the API response (they are returned only once at issuance)
+2. Using the `ztna cert` CLI command which automates the download and file-writing
+3. Installing the CA certificate into the system trust store so clients recognize QuickZTNA-issued certificates
+4. Verifying a TLS connection using the issued certificate and key
+
+Key facts from the source code:
+- The private key is **never stored on the server**. It is returned once in the `issue` response and cannot be retrieved again. If lost, you must issue a new certificate.
+- The `ztna cert` CLI command writes files to disk automatically: `{domain}.crt` for the certificate and `{domain}.key` for the private key (customizable via `--cert-file` and `--key-file` flags).
+- The CLI's `--serve-demo` flag starts a temporary HTTPS server on port 443 using the issued certificate, useful for quick verification.
+- Certificates use ECDSA P-256 (secp256r1), so the private key is in PKCS#8 format (`-----BEGIN PRIVATE KEY-----`).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | CLI certificate download, PowerShell for curl/OpenSSL verification |
+| <MachineRef name="Linux-C" /> | Install CA trust, run test HTTPS server, verify TLS connections |
+
+**Prerequisites:** CA initialized and functional (Chapter 56 ST1). Both machines authenticated and registered with `ztna up`.
+
+---
+
+## ST1 -- Download Certificate via CLI
+
+**What it verifies:** The `ztna cert` command issues a certificate and writes the cert and key files to disk with correct permissions and content.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ensure you are authenticated:
+```powershell
+ztna status
+```
+
+2. Request a certificate for a test domain:
+```powershell
+ztna cert test-app.myorg.ztna
+```
+
+**Expected output:**
+```
+Requesting certificate for test-app.myorg.ztna...
+Certificate written to test-app.myorg.ztna.crt
+Private key written to test-app.myorg.ztna.key
+Expires: 2026-04-16T...
+```
+
+3. Verify the files exist and contain PEM data:
+```powershell
+Get-Content test-app.myorg.ztna.crt | Select-Object -First 1
+# Expected: -----BEGIN CERTIFICATE-----
+
+Get-Content test-app.myorg.ztna.key | Select-Object -First 1
+# Expected: -----BEGIN PRIVATE KEY-----
+```
+
+4. Test with custom output paths:
+```powershell
+mkdir C:\certs -Force
+ztna cert test-app.myorg.ztna --cert-file=C:\certs\app.crt --key-file=C:\certs\app.key
+```
+
+**Expected:** Files written to `C:\certs\app.crt` and `C:\certs\app.key`.
+
+5. Test without a domain argument (uses machine name):
+```powershell
+ztna cert
+```
+
+**Expected:** Uses the registered machine name as the domain. Output shows `Requesting certificate for {machine-name}...`.
+
+**Pass:** CLI writes both files. Certificate file contains PEM certificate. Key file contains PEM private key. Custom paths work.
+
+**Fail / Common issues:**
+- "not authenticated. Run 'ztna login' first" -- CLI session has expired. Re-authenticate with `ztna login`.
+- "not registered. Run 'ztna up' first" -- the machine has no registration state. Run `ztna up`.
+- "no domain specified and machine name is empty" -- the machine's name was not set during registration and no argument was provided. Specify the domain explicitly: `ztna cert my-domain.ztna`.
+
+---
+
+## ST2 -- Download Certificate via API and Save Manually
+
+**What it verifies:** Certificates issued via the API can be manually saved to files for use on any machine.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, issue a certificate via API:
+```powershell
+$response = curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "subject_cn": "api-download-test.internal"
+  }'
+$response | python -m json.tool
+```
+
+2. Extract and save the certificate:
+```powershell
+$response | python -c "import sys,json; print(json.load(sys.stdin)['data']['certificate'])" > api-cert.pem
+```
+
+3. Extract and save the private key:
+```powershell
+$response | python -c "import sys,json; print(json.load(sys.stdin)['data']['private_key'])" > api-key.pem
+```
+
+4. Extract and save the CA certificate (needed for trust):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "initialize_ca", "org_id": "YOUR_ORG_ID"}' `
+  | python -c "import sys,json; print(json.load(sys.stdin)['data']['ca_certificate'])" > ca.pem
+```
+
+**Warning:** Calling `initialize_ca` again rotates the CA key pair. If you already have a CA, retrieve its certificate from a previous response or from the certificate list. Only call `initialize_ca` if you intend to reset the CA.
+
+5. Verify all three files:
+```powershell
+Get-Content api-cert.pem | Select-Object -First 1
+# -----BEGIN CERTIFICATE-----
+
+Get-Content api-key.pem | Select-Object -First 1
+# -----BEGIN PRIVATE KEY-----
+
+Get-Content ca.pem | Select-Object -First 1
+# -----BEGIN CERTIFICATE-----
+```
+
+**Pass:** All three PEM files are saved correctly and contain valid PEM headers.
+
+**Fail / Common issues:**
+- JSON parsing errors -- the `python -c` command failed. Ensure Python is in your PATH and the API response was valid JSON.
+- Private key is `null` -- this should never happen for a successful issuance. Check that `success` is `true` in the response.
+
+---
+
+## ST3 -- Install CA Certificate on Linux
+
+**What it verifies:** After adding the QuickZTNA CA certificate to the system trust store on Linux, TLS clients (curl, wget) recognize certificates issued by the CA.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, copy the CA certificate to the system trust store:
+
+For **Ubuntu/Debian**:
+```bash
+sudo cp ca.pem /usr/local/share/ca-certificates/quickztna-ca.crt
+sudo update-ca-certificates
+```
+
+**Expected output:**
+```
+Updating certificates in /etc/ssl/certs...
+1 added, 0 removed; done.
+```
+
+For **RHEL/CentOS/Fedora**:
+```bash
+sudo cp ca.pem /etc/pki/ca-trust/source/anchors/quickztna-ca.crt
+sudo update-ca-trust
+```
+
+2. Verify the CA is now trusted:
+```bash
+openssl verify -CApath /etc/ssl/certs api-cert.pem
+```
+
+Or check that the system trust store includes the QuickZTNA CA:
+```bash
+awk -v cmd='openssl x509 -noout -subject' '/BEGIN/{close(cmd)};{print | cmd}' < /etc/ssl/certs/ca-certificates.crt | grep QuickZTNA
+```
+
+**Expected:** A line containing `subject=O = QuickZTNA, CN = QuickZTNA CA`.
+
+3. To **remove** the CA from the trust store later:
+```bash
+# Ubuntu/Debian
+sudo rm /usr/local/share/ca-certificates/quickztna-ca.crt
+sudo update-ca-certificates --fresh
+
+# RHEL/CentOS/Fedora
+sudo rm /etc/pki/ca-trust/source/anchors/quickztna-ca.crt
+sudo update-ca-trust
+```
+
+**Pass:** `update-ca-certificates` reports 1 certificate added. The CA subject appears in the system trust bundle.
+
+**Fail / Common issues:**
+- "0 added" -- the file extension must be `.crt` (not `.pem`) for Debian-based systems. Rename if needed.
+- Permission denied -- use `sudo` for trust store operations.
+
+---
+
+## ST4 -- Verify TLS Connection with Issued Certificate
+
+**What it verifies:** A TLS server using the QuickZTNA-issued certificate and key can serve HTTPS traffic, and clients with the CA trust can connect without certificate warnings.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, start a test HTTPS server using OpenSSL:
+```bash
+# Using OpenSSL s_server (quick test)
+openssl s_server -cert api-cert.pem -key api-key.pem -accept 8443 -www &
+SERVER_PID=$!
+```
+
+2. Test the connection from the same machine:
+```bash
+# With explicit CA file (should succeed)
+curl -s --cacert ca.pem https://localhost:8443/ -o /dev/null -w "%{http_code}\n"
+```
+
+**Expected:** HTTP status `200`.
+
+3. Test without the CA file (depends on whether the CA was installed system-wide in ST3):
+```bash
+# If CA is in system trust store
+curl -s https://localhost:8443/ -o /dev/null -w "%{http_code}\n"
+```
+
+**Expected:** `200` if CA was installed in ST3. Otherwise, curl returns an error about an untrusted certificate.
+
+4. Test with OpenSSL s_client for detailed TLS info:
+```bash
+echo | openssl s_client -connect localhost:8443 -CAfile ca.pem 2>/dev/null | grep "Verify return code"
+```
+
+**Expected:**
+```
+Verify return code: 0 (ok)
+```
+
+5. Stop the test server:
+```bash
+kill $SERVER_PID 2>/dev/null
+```
+
+6. Alternatively, use the CLI's built-in demo server on <MachineRef name="Win-A" />:
+```powershell
+# This starts a demo HTTPS server on port 443
+ztna cert demo-server.myorg.ztna --serve-demo
+```
+
+In another terminal, test the connection:
+```powershell
+curl -k https://demo-server.myorg.ztna/
+```
+
+**Expected output:**
+```
+Hello from demo-server.myorg.ztna! TLS is working.
+```
+
+Note: `-k` skips certificate verification. To verify properly, you would need the CA certificate in the trust store or pass `--cacert ca.pem`.
+
+**Pass:** TLS connections succeed with the CA trust. `openssl s_client` reports `Verify return code: 0 (ok)`. The CLI `--serve-demo` flag serves HTTPS traffic.
+
+**Fail / Common issues:**
+- "certificate verify failed" -- the CA certificate was not provided or not installed. Use `--cacert ca.pem` with curl.
+- "unable to load certificate" -- the PEM files are corrupted. Re-download from the API.
+- Port 443 requires root/admin -- use a higher port like 8443 for testing, or run with elevated privileges.
+
+---
+
+## ST5 -- Verify Private Key Non-Retrieval
+
+**What it verifies:** The private key cannot be retrieved from the server after initial issuance. The `list` action returns certificate metadata but not the private key.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, list all certificates:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list",
+    "org_id": "YOUR_ORG_ID"
+  }' | python -m json.tool
+```
+
+2. Examine the response for any certificate entry. The fields returned are:
+   - `id`, `org_id`, `machine_id`, `serial_number`, `subject_cn`
+   - `fingerprint`, `certificate_pem`, `issued_at`, `expires_at`
+   - `revoked`, `revoked_at`, `revoke_reason`
+
+3. Confirm that `private_key` is **not** present in any list entry. The `certificate_pem` is included (the public certificate), but the private key is never stored in the database.
+
+4. Also verify via the CRUD endpoint:
+```powershell
+curl -s "https://login.quickztna.com/api/db/issued_certificates?org_id=YOUR_ORG_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" | python -m json.tool
+```
+
+The `issued_certificates` table schema does not include a `private_key` column. The columns are:
+`id`, `org_id`, `machine_id`, `serial_number`, `subject_cn`, `fingerprint`, `certificate_pem`, `issued_at`, `expires_at`, `revoked`, `revoked_at`, `revoke_reason`.
+
+5. This means: if you lose the private key file, the only option is to **issue a new certificate** and revoke the old one.
+
+**Pass:** The `list` action and CRUD endpoint do not return any private key data. The `issued_certificates` table has no private key column.
+
+**Fail / Common issues:**
+- Private key appears in the list response -- this would be a critical security vulnerability. Private keys should only be returned once at issuance time.
+- The `certificate_pem` contains the private key -- verify that the stored PEM starts with `-----BEGIN CERTIFICATE-----`, not `-----BEGIN PRIVATE KEY-----`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | `ztna cert` CLI downloads and writes certificate + key files with correct PEM content |
+| ST2 | Certificates can be manually extracted from the API response and saved to files |
+| ST3 | CA certificate can be installed into the Linux system trust store |
+| ST4 | TLS connections succeed using issued certificates; `openssl s_client` verifies the chain |
+| ST5 | Private keys are never stored on the server and cannot be retrieved after issuance |

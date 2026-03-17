@@ -1,0 +1,301 @@
+---
+title: "Certificate Verification via OpenSSL"
+topic: "Certificate Authority"
+order: 58
+machines: ["Win-A", "Linux-C"]
+summary: "Verify issued certificates using OpenSSL -- check subject, issuer, validity dates, key usage, and chain of trust."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA issues real X.509v3 certificates using ASN.1 DER encoding with ECDSA P-256 (secp256r1) signatures. These certificates are standard-compliant and can be verified with OpenSSL. This chapter confirms that issued certificates have:
+
+- Correct **subject CN** matching the requested `subject_cn`
+- Correct **issuer** (CN=`QuickZTNA CA`, O=`QuickZTNA`)
+- Valid **date range** (Not Before / Not After matching the requested TTL)
+- Proper **X.509v3 extensions**: Basic Constraints (CA:FALSE for end-entity), Key Usage (Digital Signature, Key Encipherment)
+- A valid **ECDSA signature** verifiable against the CA certificate
+- Standard **PEM encoding** that OpenSSL can parse
+
+The CA certificate itself should show: issuer = subject (self-signed), Basic Constraints CA:TRUE, Key Usage keyCertSign + cRLSign.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | PowerShell for API calls; OpenSSL if installed (Git Bash includes it) |
+| <MachineRef name="Linux-C" /> | OpenSSL verification commands |
+
+**Prerequisites:**
+- CA initialized and at least one certificate issued (complete Chapter 56 ST1 and ST2 first)
+- CA certificate saved as `ca.pem`
+- Issued certificate saved as `cert.pem`
+- Issued private key saved as `key.pem`
+
+---
+
+## ST1 -- Inspect the CA Certificate
+
+**What it verifies:** The CA certificate is a valid self-signed X.509v3 certificate with CA:TRUE and the expected subject/issuer fields.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, save the CA certificate from the `initialize_ca` response (or re-fetch it):
+```bash
+# If you have it from a previous test, use that file.
+# Otherwise, re-initialize (this rotates the CA key):
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "initialize_ca", "org_id": "YOUR_ORG_ID"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['ca_certificate'])" > ca.pem
+```
+
+2. Inspect the CA certificate:
+```bash
+openssl x509 -in ca.pem -text -noout
+```
+
+**Expected output (key fields):**
+```
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx
+        Signature Algorithm: ecdsa-with-SHA256
+        Issuer: O = QuickZTNA, CN = QuickZTNA CA
+        Validity
+            Not Before: Mar 17 ... 2026 GMT
+            Not After : Mar 15 ... 2036 GMT
+        Subject: O = QuickZTNA, CN = QuickZTNA CA
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+        X509v3 extensions:
+            X509v3 Basic Constraints: critical
+                CA:TRUE
+            X509v3 Key Usage: critical
+                Certificate Sign, CRL Sign
+    Signature Algorithm: ecdsa-with-SHA256
+```
+
+3. Verify:
+   - Version is **3** (X.509v3)
+   - Signature Algorithm is **ecdsa-with-SHA256**
+   - Issuer and Subject are both **O = QuickZTNA, CN = QuickZTNA CA** (self-signed)
+   - Not After is approximately **10 years** after Not Before
+   - Public Key Algorithm is **id-ecPublicKey** with **P-256**
+   - Basic Constraints is **CA:TRUE** and marked **critical**
+   - Key Usage includes **Certificate Sign** and **CRL Sign**
+
+**Pass:** OpenSSL parses the CA certificate without errors. All fields match the expected values for a self-signed ECDSA P-256 CA.
+
+**Fail / Common issues:**
+- "unable to load certificate" -- the PEM content was corrupted during copy. Ensure the file starts with `-----BEGIN CERTIFICATE-----` and ends with `-----END CERTIFICATE-----` with no extra whitespace.
+- Issuer/Subject mismatch -- the certificate is not self-signed. This would indicate a bug in the CA initialization code.
+
+---
+
+## ST2 -- Inspect an End-Entity Certificate
+
+**What it verifies:** An issued certificate has the correct subject CN, is signed by the CA, and has end-entity extensions (CA:FALSE).
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, save the issued certificate from the `issue` response:
+```bash
+# Issue a fresh certificate
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "issue", "org_id": "YOUR_ORG_ID", "subject_cn": "test-server.internal"}' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; open('cert.pem','w').write(d['certificate']); open('key.pem','w').write(d['private_key'])"
+```
+
+2. Inspect the certificate:
+```bash
+openssl x509 -in cert.pem -text -noout
+```
+
+**Expected output (key fields):**
+```
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx
+        Signature Algorithm: ecdsa-with-SHA256
+        Issuer: O = QuickZTNA, CN = QuickZTNA CA
+        Validity
+            Not Before: Mar 17 ... 2026 GMT
+            Not After : Apr 16 ... 2026 GMT
+        Subject: CN = test-server.internal
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+        X509v3 extensions:
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+            X509v3 Key Usage: critical
+                Digital Signature, Key Encipherment
+    Signature Algorithm: ecdsa-with-SHA256
+```
+
+3. Verify:
+   - **Issuer** is `O = QuickZTNA, CN = QuickZTNA CA` (signed by the CA, not self-signed)
+   - **Subject** CN matches what you requested (`test-server.internal`)
+   - **Not After** minus **Not Before** matches the TTL (default 720 hours = 30 days, or capped by `max_cert_ttl_hours`)
+   - Basic Constraints is **CA:FALSE** (end-entity, not a CA)
+   - Key Usage includes **Digital Signature** and **Key Encipherment** (not Certificate Sign)
+
+**Pass:** Certificate subject CN matches the request. Issuer is the QuickZTNA CA. Extensions show CA:FALSE with end-entity key usage.
+
+**Fail / Common issues:**
+- Subject says "unknown" instead of the requested CN -- the `subject_cn` field was not provided in the API request. The handler defaults to `machine_id` or `"unknown"`.
+- CA:TRUE on an end-entity cert -- this is a critical security bug. End-entity certificates must never have CA:TRUE.
+
+---
+
+## ST3 -- Verify Chain of Trust with OpenSSL
+
+**What it verifies:** The issued certificate's signature can be cryptographically verified against the CA certificate using `openssl verify`.
+
+**Prerequisites:** Both `ca.pem` (CA certificate) and `cert.pem` (issued certificate) from ST1 and ST2.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, verify the chain:
+```bash
+openssl verify -CAfile ca.pem cert.pem
+```
+
+**Expected output:**
+```
+cert.pem: OK
+```
+
+2. Verify with a wrong CA certificate (negative test). Create a dummy CA:
+```bash
+openssl ecparam -genkey -name prime256v1 -out fake-ca-key.pem 2>/dev/null
+openssl req -new -x509 -key fake-ca-key.pem -out fake-ca.pem -days 365 -subj "/CN=Fake CA" 2>/dev/null
+openssl verify -CAfile fake-ca.pem cert.pem
+```
+
+**Expected output:**
+```
+cert.pem: ... error ... unable to get local issuer certificate
+```
+The verification should fail because the certificate was not signed by the fake CA.
+
+3. Verify the signature algorithm explicitly:
+```bash
+openssl x509 -in cert.pem -text -noout | grep "Signature Algorithm"
+```
+
+**Expected:** Both lines show `ecdsa-with-SHA256` (the TBS signature algorithm and the outer signature algorithm must match).
+
+**Pass:** `openssl verify -CAfile ca.pem cert.pem` returns `OK`. Verification against a different CA fails.
+
+**Fail / Common issues:**
+- "unable to get local issuer certificate" with the real CA -- the CA was re-initialized between issuing the certificate and this test. Re-initializing rotates the CA key, so old certificates will not verify against the new CA.
+- "certificate signature failure" -- the DER encoding or ECDSA signature is malformed. This would indicate a bug in the ASN.1 encoder.
+
+---
+
+## ST4 -- Verify Private Key Matches Certificate
+
+**What it verifies:** The private key returned at issuance corresponds to the public key embedded in the certificate.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, extract the public key from the certificate:
+```bash
+openssl x509 -in cert.pem -pubkey -noout > cert-pubkey.pem
+```
+
+2. Extract the public key from the private key:
+```bash
+openssl ec -in key.pem -pubout -out key-pubkey.pem 2>/dev/null
+```
+
+Note: the private key is in PKCS#8 format (`-----BEGIN PRIVATE KEY-----`). OpenSSL's `ec` command can read PKCS#8 and extract the EC public key.
+
+3. Compare the two public keys:
+```bash
+diff cert-pubkey.pem key-pubkey.pem
+```
+
+**Expected:** No output (files are identical). The public key in the certificate matches the public key derived from the private key.
+
+4. Alternative verification -- use the key pair to sign and verify:
+```bash
+echo "test data" > /tmp/testdata.txt
+openssl dgst -sha256 -sign key.pem -out /tmp/sig.bin /tmp/testdata.txt
+openssl dgst -sha256 -verify cert-pubkey.pem -signature /tmp/sig.bin /tmp/testdata.txt
+```
+
+**Expected output:**
+```
+Verified OK
+```
+
+**Pass:** The public keys match. A signature created with the private key verifies against the certificate's public key.
+
+**Fail / Common issues:**
+- `diff` shows differences -- the private key does not match the certificate. This would be a critical bug where different key pairs were generated for the certificate and the returned private key.
+- "unable to load key" -- the private key PEM was corrupted during copy. Verify the file starts with `-----BEGIN PRIVATE KEY-----`.
+
+---
+
+## ST5 -- Verify Fingerprint Matches
+
+**What it verifies:** The SHA-256 fingerprint returned by the API matches the fingerprint computed locally from the certificate DER.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, compute the SHA-256 fingerprint of the certificate:
+```bash
+openssl x509 -in cert.pem -outform DER -out cert.der
+sha256sum cert.der
+```
+
+Or use OpenSSL's built-in fingerprint command:
+```bash
+openssl x509 -in cert.pem -fingerprint -sha256 -noout
+```
+
+**Expected output (example):**
+```
+sha256 Fingerprint=EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD
+```
+
+2. Compare with the `fingerprint` field from the API response (ST2).
+
+The API computes the fingerprint as: `SHA-256(certificate DER bytes)` formatted as colon-separated uppercase hex. OpenSSL's `-fingerprint -sha256` output uses the same format.
+
+3. Also verify the CA certificate fingerprint:
+```bash
+openssl x509 -in ca.pem -fingerprint -sha256 -noout
+```
+
+Compare with the `fingerprint` from the `initialize_ca` response (Chapter 56 ST1).
+
+**Pass:** The locally computed SHA-256 fingerprint matches the `fingerprint` field returned by the API, character for character.
+
+**Fail / Common issues:**
+- Fingerprints do not match -- the API may be computing the fingerprint from a different encoding (e.g., PEM instead of DER). The handler uses `crypto.subtle.digest('SHA-256', certDer)` on the raw DER bytes, which should match OpenSSL's DER fingerprint.
+- Case mismatch -- the API returns uppercase hex; ensure your local tool also outputs uppercase (OpenSSL's `-fingerprint` does this by default).
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | CA certificate is a valid self-signed X.509v3 with CA:TRUE, ECDSA P-256, 10-year validity |
+| ST2 | End-entity certificates have correct subject CN, issuer from CA, CA:FALSE, and end-entity key usage |
+| ST3 | Chain-of-trust verification passes with `openssl verify`; fails against an unrelated CA |
+| ST4 | The private key returned at issuance matches the public key in the certificate |
+| ST5 | API-reported SHA-256 fingerprints match locally computed fingerprints from the DER encoding |

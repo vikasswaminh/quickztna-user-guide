@@ -1,0 +1,256 @@
+---
+title: "Used Count & Key Tracking"
+topic: "Auth Keys"
+order: 43
+machines: ["Win-A", "Linux-C"]
+summary: "Verify auth key usage tracking — used count increments, reusable vs single-use enforcement."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Every time a machine registers with an auth key, the backend increments `used_count` on the `auth_keys` record (`UPDATE auth_keys SET used_count = used_count + 1 WHERE id = ?`). For non-reusable keys, the backend rejects registration when `used_count` is greater than 0 with error code `KEY_USED`.
+
+Key facts from source code (`backend/src/handlers/register-machine.ts`):
+- **Usage increment:** Happens on both new registrations (line 226) and re-registrations of existing machines (line 160)
+- **Non-reusable guard:** `if (!authKeyRecord.reusable && authKeyRecord.used_count > 0)` returns `{ code: 'KEY_USED', message: 'Auth key already used' }` (HTTP 401)
+- **CLI list command:** `ztna auth-keys list` shows key prefix, name, reusable flag, ephemeral flag, used count, and expiry date
+- **CLI list requires:** Admin or owner role in the org
+- **Dashboard path:** Settings page shows auth keys with usage counts
+
+Database schema (`auth_keys` table):
+- `used_count INTEGER NOT NULL DEFAULT 0` -- incremented on every registration (including re-registrations)
+- `reusable BOOLEAN NOT NULL DEFAULT FALSE` -- when false, only one registration is allowed
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + CLI -- create keys, verify counts |
+| <MachineRef name="Linux-C" /> | Target -- register machines to increment counts |
+
+---
+
+## ST1 — Verify Used Count Starts at Zero
+
+**What it verifies:** A freshly created auth key has `used_count: 0`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a new reusable auth key:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"usage-tracking-key\",
+    \"reusable\": true,
+    \"expiry_days\": 30
+  }" | python3 -m json.tool
+```
+Save the returned `id` and `key`.
+
+2. Verify the used count is 0:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&id=eq.KEY_ID_HERE" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** The auth key record has `"used_count": 0`.
+
+**Pass:** `used_count` is 0 for a brand-new key.
+
+**Fail / Common issues:**
+- `used_count` is non-zero -- the key ID may be wrong. Double-check the `id` from the creation response.
+
+---
+
+## ST2 — Used Count Increments After Registration
+
+**What it verifies:** Registering a machine increments the auth key's `used_count` by 1.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, register using the key from ST1:
+```bash
+ztna down
+ztna logout
+export ZTNA_AUTH_KEY="tskey-auth-YOUR_KEY_HERE"
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+2. On <MachineRef name="Win-A" />, check the used count:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&id=eq.KEY_ID_HERE" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"used_count": 1`.
+
+3. Alternatively, use the CLI to check:
+```bash
+ztna auth-keys list
+```
+
+**Expected output:**
+```
+KEY PREFIX     NAME                 REUSABLE   EPHEMERAL  USES   EXPIRES
+──────────────────────────────────────────────────────────────────────────────────
+tskey-auth-xx  usage-tracking-key   true       false      1      2026-04-16
+```
+
+**Pass:** `used_count` is 1 after one registration. CLI shows `USES: 1`.
+
+**Fail / Common issues:**
+- `used_count` still 0 -- registration may have failed. Check `ztna status` on Linux-C.
+- CLI shows `No auth keys found.` -- you may not be an admin/owner, or the org context is missing. Run `ztna up` first to establish org context.
+- CLI shows error `not connected to an organization. Run 'ztna up' first` -- the CLI needs an active org context to list keys.
+
+---
+
+## ST3 — Re-registration Also Increments Count
+
+**What it verifies:** Re-registering the same machine (same name+org) also increments `used_count`.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, stop and re-register:
+```bash
+ztna down
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+2. On <MachineRef name="Win-A" />, check the used count again:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&id=eq.KEY_ID_HERE&select=name,used_count" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"used_count": 2` (incremented from 1).
+
+**Pass:** Count increments on every registration, including re-registrations of existing machines.
+
+**Fail / Common issues:**
+- Count is still 1 -- the re-registration may have been skipped because the machine was already registered and the state file was still present. The CLI skips registration if it detects an existing `machine_id` in the state. Use `ztna logout` to clear state before re-registering.
+
+---
+
+## ST4 — Non-Reusable Key Rejected After First Use
+
+**What it verifies:** A non-reusable key (default `reusable: false`) allows exactly one registration and rejects subsequent attempts with `KEY_USED`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a non-reusable key:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"single-use-key\",
+    \"reusable\": false,
+    \"expiry_days\": 7
+  }" | python3 -m json.tool
+```
+Save the returned key.
+
+2. On <MachineRef name="Linux-C" />, register with the single-use key:
+```bash
+ztna down
+ztna logout
+ztna up --auth-key "tskey-auth-SINGLE_USE_KEY"
+```
+
+**Expected:** Registration succeeds. Machine connects.
+
+3. Stop and clear state, then try again:
+```bash
+ztna down
+ztna logout
+ztna up --auth-key "tskey-auth-SINGLE_USE_KEY"
+```
+
+**Expected error:**
+```
+auth key registration failed: KEY_USED: Auth key already used
+```
+
+4. Verify the key's used count:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&name=eq.single-use-key&select=name,used_count,reusable" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"used_count": 1, "reusable": false`.
+
+**Pass:** First registration succeeds, second fails with `KEY_USED`. Dashboard shows `used_count: 1`.
+
+**Fail / Common issues:**
+- Second registration succeeds -- the key may have been created with `reusable: true`. Check the key's `reusable` field.
+- Error is `INVALID_KEY` instead of `KEY_USED` -- the key may have also expired. Non-reusable keys with `used_count` greater than 0 return `KEY_USED` specifically.
+
+---
+
+## ST5 — CLI Auth Keys List Command
+
+**What it verifies:** `ztna auth-keys list` displays all auth keys with correct metadata, including usage counts.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, ensure you are connected as an admin:
+```bash
+ztna status
+```
+
+2. List all auth keys:
+```bash
+ztna auth-keys list
+```
+
+**Expected output:**
+```
+KEY PREFIX     NAME                 REUSABLE   EPHEMERAL  USES   EXPIRES
+──────────────────────────────────────────────────────────────────────────────────
+tskey-auth-xx  usage-tracking-key   true       false      2      2026-04-16
+tskey-auth-yy  single-use-key       false      false      1      2026-03-24
+```
+
+3. Test JSON output:
+```bash
+ztna auth-keys list --json
+```
+
+**Expected:** A JSON array of auth key objects with fields: `id`, `name`, `key_prefix`, `reusable`, `ephemeral`, `used_count`, `expires_at`, `revoked`, `created_at`.
+
+4. Test with a non-admin user (if available):
+```bash
+# After logging in as a member (non-admin) user:
+ztna auth-keys list
+```
+
+**Expected error:**
+```
+auth key listing requires admin role (your role: member)
+```
+
+**Pass:** Admin can list keys with correct counts. JSON flag outputs structured data. Non-admin is rejected with a role error.
+
+**Fail / Common issues:**
+- `not connected to an organization` -- run `ztna up` first to establish the org context.
+- `error checking permissions` -- network or auth issue. Check that `ztna status` shows authenticated.
+- Empty list despite keys existing -- the CLI fetches from `GET /api/db/auth_keys?org_id=X`. Ensure the org_id matches.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Initial count is zero | New key has `used_count: 0` |
+| ST2 | Count increments on registration | `used_count` becomes 1 after one registration |
+| ST3 | Re-registration also increments | `used_count` becomes 2 after re-registration |
+| ST4 | Non-reusable enforcement | Second use returns `KEY_USED` (401), count stays at 1 |
+| ST5 | CLI list command | `ztna auth-keys list` shows correct counts, `--json` works, non-admin rejected |

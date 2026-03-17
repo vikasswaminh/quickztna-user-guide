@@ -1,0 +1,261 @@
+---
+title: "ACL Rules Referencing Groups"
+topic: "Network Segmentation (Departments)"
+order: 34
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Create ACL rules that use segmentation groups as source/destination and verify traffic control."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+ACL rules support a `group:` selector in the `source` and `destination` fields. When the ACL evaluator encounters a selector like `group:engineering`, it performs a database lookup:
+
+```sql
+SELECT sgm.id FROM segmentation_group_members sgm
+JOIN segmentation_groups sg ON sg.id = sgm.group_id
+WHERE sg.org_id = ? AND sg.name = ? AND sgm.machine_id = ?
+```
+
+If a row is returned, the machine matches that group selector. This is implemented in the `matchesTarget()` function in `acl-evaluate.ts`, which handles these selector types in order:
+- `*` (wildcard -- matches everything)
+- Exact machine UUID
+- Exact tailnet IP
+- `tag:` prefix (tag match)
+- `user:` prefix (owner match)
+- `group:` prefix (segmentation group match)
+- CIDR notation (IP range match)
+
+The ACL evaluation endpoint is `POST /api/acl-evaluate` with body fields: `org_id`, `source_machine_id`, `destination_machine_id`.
+
+The Segmentation page also tracks ACL dependencies: it scans all ACL rules for `group:` references and displays a badge showing how many rules reference each group.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin dashboard + API testing |
+| <MachineRef name="Win-B" /> | Member of `engineering` group -- acts as source |
+| <MachineRef name="Linux-C" /> | Member of `engineering` and `finance` groups -- acts as destination |
+
+**Prerequisite:** Groups `engineering` and `finance` exist with appropriate machine memberships from Chapters 31-32.
+
+---
+
+## ST1 -- Create an ACL Rule Using a Group Selector
+
+**What it verifies:** An ACL rule with `group:engineering` in the source field can be created via the CRUD API.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"engineering-to-finance\",
+    \"source\": \"group:engineering\",
+    \"destination\": \"group:finance\",
+    \"ports\": \"443,8080\",
+    \"protocol\": \"tcp\",
+    \"action\": \"allow\",
+    \"priority\": 100,
+    \"enabled\": true
+  }" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid",
+    "org_id": "uuid",
+    "name": "engineering-to-finance",
+    "source": "group:engineering",
+    "destination": "group:finance",
+    "ports": "443,8080",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 100,
+    "enabled": true,
+    "created_by": "uuid",
+    "created_at": "...",
+    "updated_at": "..."
+  }
+}
+```
+
+2. Verify the rule appears on the ACLs page (`/acls`) on the dashboard.
+
+**Pass:** Rule created with `group:` selectors in both source and destination. No validation errors on the group syntax.
+
+---
+
+## ST2 -- Verify ACL Dependency Badge on Segmentation Page
+
+**What it verifies:** The Segmentation page detects that the `engineering` and `finance` groups are now referenced by an ACL rule and displays a dependency badge.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/segmentation`.
+2. On the `engineering` group card, look for a badge that says "1 ACL rule" (or the appropriate count).
+3. Click the badge to open the popover.
+
+**Expected:** The popover shows the rule details:
+- Source: `group:engineering`
+- Destination: `group:finance`
+- Action: `allow`
+
+4. Check the `finance` group card -- it should also show "1 ACL rule" since it is referenced in the destination.
+
+5. Check a group that is NOT referenced by any rule (e.g., `marketing-team`). It should have no ACL badge.
+
+**Pass:** Groups referenced by ACL rules show the correct badge count. Clicking the badge reveals rule details. Unreferenced groups have no badge.
+
+---
+
+## ST3 -- Evaluate ACL with Group Selectors (Allow Case)
+
+**What it verifies:** The ACL evaluator correctly resolves `group:engineering` and `group:finance` selectors against machine memberships.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, get the machine IDs for <MachineRef name="Win-B" /> (in `engineering`) and <MachineRef name="Linux-C" /> (in both `engineering` and `finance`):
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=id,name" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. Evaluate traffic from <MachineRef name="Win-B" /> (engineering) to <MachineRef name="Linux-C" /> (finance):
+```bash
+WIN_B_ID="WIN_B_MACHINE_ID"
+LINUX_C_ID="LINUX_C_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_B_ID\",
+    \"destination_machine_id\": \"$LINUX_C_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** The evaluation should return an `allow` result because:
+- <MachineRef name="Win-B" /> is a member of `engineering` (matches `group:engineering` source)
+- <MachineRef name="Linux-C" /> is a member of `finance` (matches `group:finance` destination)
+
+3. Verify the matched rule in the response references the `engineering-to-finance` rule.
+
+**Pass:** ACL evaluation returns `allow`. The matched rule is the one with `group:` selectors.
+
+---
+
+## ST4 -- Evaluate ACL with Group Selectors (Deny / No Match Case)
+
+**What it verifies:** A machine that is NOT in the required group does not match the `group:` selector.
+
+**Steps:**
+1. Create a deny rule for non-engineering sources:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"deny-non-eng-to-finance\",
+    \"source\": \"*\",
+    \"destination\": \"group:finance\",
+    \"ports\": \"*\",
+    \"protocol\": \"*\",
+    \"action\": \"deny\",
+    \"priority\": 200,
+    \"enabled\": true
+  }" | python3 -m json.tool
+```
+
+2. Now evaluate traffic from <MachineRef name="Win-A" /> (not in `engineering` group) to <MachineRef name="Linux-C" /> (in `finance`):
+```bash
+WIN_A_ID="WIN_A_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_A_ID\",
+    \"destination_machine_id\": \"$LINUX_C_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** The evaluation should process rules in priority order:
+- Priority 100 (`engineering-to-finance`): source `group:engineering` does NOT match <MachineRef name="Win-A" /> (not in engineering group) -- skipped
+- Priority 200 (`deny-non-eng-to-finance`): source `*` matches everything, destination `group:finance` matches <MachineRef name="Linux-C" /> -- matched, action: `deny`
+
+The result should be `deny`.
+
+**Pass:** Non-member of the source group correctly does not match the group selector. The deny rule catches the traffic instead.
+
+---
+
+## ST5 -- Group-Based ACL with Live Traffic Test
+
+**What it verifies:** The group-based ACL rules are enforced in practice when machines communicate over the mesh.
+
+**Steps:**
+1. Ensure all three machines are connected:
+```bash
+# On each machine
+ztna status
+```
+All should show "Connected" or "Running".
+
+2. From <MachineRef name="Win-B" /> (in `engineering`), ping <MachineRef name="Linux-C" /> (in `finance`):
+```bash
+ztna ping LINUX_C_TAILNET_IP
+```
+
+**Expected:** Ping succeeds because the `engineering-to-finance` allow rule (priority 100) matches.
+
+3. From <MachineRef name="Win-A" /> (NOT in `engineering`), attempt to reach <MachineRef name="Linux-C" />:
+```bash
+ztna ping LINUX_C_TAILNET_IP
+```
+
+**Expected:** Ping should be denied or dropped because:
+- The allow rule `engineering-to-finance` does not match (Win-A is not in `engineering`)
+- The deny rule `deny-non-eng-to-finance` matches (source `*`, destination `group:finance`)
+
+Note: ACL enforcement depends on the client receiving the updated ACL bundle via heartbeat. If the test does not show the expected behavior, wait for the next heartbeat cycle (approximately 30 seconds) or restart the connection with `ztna down && ztna up`.
+
+4. **Cleanup:** Delete the test deny rule to avoid blocking traffic in subsequent chapters:
+```bash
+DENY_RULE_ID="THE_DENY_RULE_ID"
+
+curl -s -X DELETE "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID&id=eq.$DENY_RULE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+**Pass:** Traffic from an `engineering` member to a `finance` member is allowed. Traffic from a non-member is denied. Cleanup removes the deny rule.
+
+**Fail / Common issues:**
+- Both pings succeed -- ACL bundle may not have propagated yet. Run `ztna down && ztna up` on both machines to force a fresh heartbeat.
+- Both pings fail -- check that the allow rule is enabled and has a lower priority number (higher precedence) than the deny rule. Rules are evaluated in ascending priority order.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | ACL rule creation with group selectors | Rule with `group:` source and destination created successfully |
+| ST2 | ACL dependency tracking | Segmentation page shows badge with referencing rule count |
+| ST3 | ACL evaluation (allow) | Group member matches `group:` selector, traffic allowed |
+| ST4 | ACL evaluation (deny/no match) | Non-member does not match `group:` selector |
+| ST5 | Live traffic enforcement | Group-based ACLs enforced on actual mesh traffic |

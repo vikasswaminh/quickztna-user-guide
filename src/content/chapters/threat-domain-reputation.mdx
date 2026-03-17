@@ -1,0 +1,253 @@
+---
+title: "Domain Reputation Check"
+topic: "Threat Intelligence"
+order: 62
+machines: ["Win-A", "Linux-C"]
+summary: "Check domain reputation — verify malicious domain detection, categorization, and blocking recommendations."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA checks domain reputation through the same threat intelligence pipeline used for IPs, with provider-specific domain lookup paths:
+
+- **CLI**: `ztna threat check <domain>` -- the `detectTargetType` function in `cmd_threat.go` classifies any input that is not a valid IP and not a hex hash as `domain`
+- **API**: `POST /api/threat-check` with the `domain` field set (instead of `ip_address`)
+- **VirusTotal**: queries `GET /api/v3/domains/{domain}` and reads `last_analysis_stats` (harmless, malicious, suspicious, undetected counts)
+- **CrowdStrike**: queries Falcon Intel indicators with `type:'domain'` filter
+- **AbuseIPDB**: only supports IP lookups, so it is skipped when only a domain is provided (no `ip_address` in the request)
+
+The handler (`handlers/threat-check.ts`) iterates all enabled `threat_intel_configs` rows. For each provider:
+- If the provider is `abuseipdb` and no `ip_address` is in the request, it is skipped (AbuseIPDB is IP-only)
+- If the provider is `virustotal`, it uses the `domain` field to query `/api/v3/domains/{domain}`
+- If the provider is `crowdstrike`, it queries with `indicator:'{domain}'+type:'domain'`
+
+Results are recorded in `threat_checks` with the `domain` column populated.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser dashboard + CLI |
+| <MachineRef name="Linux-C" /> | CLI testing from Linux |
+
+**Prerequisites:**
+- At least VirusTotal or CrowdStrike configured as a provider (AbuseIPDB cannot check domains)
+- The machine must be authenticated with `ztna up`
+
+---
+
+## ST1 -- CLI Domain Check (Known Safe Domain)
+
+**What it verifies:** A well-known legitimate domain returns a clean verdict.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />:
+```powershell
+ztna threat check google.com
+```
+
+**Expected output:**
+```
+Target:  google.com (domain)
+Verdict: CLEAN
+Score:   0/100
+
+Provider Results:
+──────────────────────────────────────────────────
+  virustotal           clean
+```
+
+Note: AbuseIPDB will not appear in the results because it only supports IP lookups.
+
+2. Verify with JSON output:
+```powershell
+ztna threat check google.com --json
+```
+
+Confirm `target_type` is `"domain"` and `verdict` is `"clean"`.
+
+**Pass:** Target type is `domain`, verdict is `CLEAN`, score is under 10.
+
+**Fail / Common issues:**
+- Only AbuseIPDB is configured -- AbuseIPDB skips domain lookups. Add VirusTotal or CrowdStrike.
+- Empty provider results -- all configured providers only support IPs. Verify at least VirusTotal is enabled.
+
+---
+
+## ST2 -- CLI Domain Check (Known Malicious Domain)
+
+**What it verifies:** A domain flagged by threat intelligence returns a high score.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, check a domain from a known malware test list. The EICAR test domain or known phishing domains can be used:
+```bash
+ztna threat check malware.testcategory.com
+```
+
+If that domain is not in the provider databases, try a domain from recent VirusTotal community reports. Alternatively, use:
+```bash
+ztna threat check --json malware.testcategory.com
+```
+
+2. For a more reliable test, query a domain that VirusTotal flags (check VirusTotal's website first for a currently-flagged domain, then use that in the CLI).
+
+**Expected output for a flagged domain:**
+```
+Target:  <flagged-domain> (domain)
+Verdict: MALICIOUS
+Score:   72/100
+
+Provider Results:
+──────────────────────────────────────────────────
+  virustotal           malicious  (5 malicious detections)
+```
+
+The VirusTotal scoring logic in the handler: if `malicious > 3` in `last_analysis_stats`, verdict is `malicious`; if `malicious > 0`, verdict is `suspicious`; otherwise `clean`. The score is `Math.round((malicious / total) * 100)`.
+
+**Pass:** Verdict is `SUSPICIOUS` or `MALICIOUS` for a known-bad domain.
+
+**Fail / Common issues:**
+- Score is 0 -- the domain has been cleaned or is not in the provider's database. Try a different domain.
+- "error checking threat" -- provider API key may be rate-limited or invalid.
+
+---
+
+## ST3 -- API Domain Check With Both IP and Domain
+
+**What it verifies:** When both `ip_address` and `domain` are provided, providers that support each type will query appropriately.
+
+**Steps:**
+
+1. Call the API with both fields:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/threat-check" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\": \"$ORG_ID\", \"ip_address\": \"8.8.8.8\", \"domain\": \"google.com\"}" | jq
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "checked": true,
+    "blocked": false,
+    "results": [
+      {
+        "provider": "abuseipdb",
+        "verdict": "clean",
+        "score": 0,
+        "action": "allowed"
+      },
+      {
+        "provider": "virustotal",
+        "verdict": "clean",
+        "score": 0,
+        "action": "allowed"
+      }
+    ]
+  }
+}
+```
+
+When both fields are present:
+- AbuseIPDB checks the `ip_address` (it ignores domain)
+- VirusTotal uses the `ip_address` field by preference (code: `const indicator = ip_address || domain`; endpoint becomes `ip-addresses/{ip}`)
+- CrowdStrike similarly prefers `ip_address` if present
+
+2. To verify domain-specific VirusTotal behaviour, omit `ip_address`:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/threat-check" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\": \"$ORG_ID\", \"domain\": \"google.com\"}" | jq '.data.results'
+```
+
+Now VirusTotal will query the domain endpoint. AbuseIPDB will be skipped (no `ip_address`).
+
+**Pass:** With both fields, at least two provider results appear. With domain only, AbuseIPDB is absent.
+
+**Fail / Common issues:**
+- Only one result when two providers are enabled -- check that both providers have valid API keys and are enabled.
+
+---
+
+## ST4 -- Domain Check Recorded in threat_checks Table
+
+**What it verifies:** Domain checks are persisted with the `domain` column populated, and the `ip_address` column is null when only a domain was provided.
+
+**Steps:**
+
+1. Run a domain-only check:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/threat-check" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\": \"$ORG_ID\", \"domain\": \"example.com\"}"
+```
+
+2. Query the recorded check:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/threat_checks?org_id=eq.$ORG_ID&domain=eq.example.com" | jq '.data[0]'
+```
+
+**Expected fields:**
+- `domain`: `"example.com"`
+- `ip_address`: `null`
+- `provider`: the provider name (e.g. `"virustotal"`)
+- `verdict`: `"clean"`, `"suspicious"`, or `"malicious"`
+- `confidence_score`: a number 0-100
+- `action_taken`: `"allowed"` or `"blocked"`
+- `raw_response`: a JSON object with the provider's raw data
+- `checked_at`: a recent timestamp
+
+**Pass:** The `domain` field is populated, `ip_address` is null, and all other fields are present.
+
+**Fail / Common issues:**
+- Both `domain` and `ip_address` are null -- the request body did not include a `domain` field. Check the request payload.
+
+---
+
+## ST5 -- Domain Check on Dashboard (UI)
+
+**What it verifies:** The Threat Intelligence page (`/threat-intel`) displays recent domain checks and allows manual IP/domain testing.
+
+**Steps:**
+
+1. Open `https://login.quickztna.com/threat-intel` on <MachineRef name="Win-A" />.
+
+2. In the test section, enter a domain (e.g., `example.com`) in the test IP/domain input field and click the test button.
+
+3. Observe the result displayed in the UI -- it should show the provider, verdict, score, and action.
+
+4. Scroll to the Recent Checks table. The domain check from ST4 and the test from step 2 should appear with:
+   - The `domain` column showing the queried domain
+   - The `verdict` column showing the provider verdict
+   - The `confidence_score` column showing the numeric score
+   - The `action_taken` column showing `allowed` or `blocked`
+
+5. The table loads data from the CRUD API: `GET /api/db/threat_checks?org_id=eq.{org_id}` ordered by `checked_at DESC`, limited to 50 rows.
+
+**Pass:** Domain checks appear in the recent checks table with correct verdict and score.
+
+**Fail / Common issues:**
+- Table is empty -- no checks have been performed yet for this org
+- "Feature not available" -- the org plan may not include threat intelligence; check the feature gate
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | CLI domain check (safe) | `target_type: domain`, verdict `CLEAN`, score under 10 |
+| ST2 | CLI domain check (malicious) | Verdict `SUSPICIOUS` or `MALICIOUS`, score over 25 |
+| ST3 | API with both IP and domain | AbuseIPDB checks IP only; VirusTotal prefers IP when both present; domain-only omits AbuseIPDB |
+| ST4 | Persistence in threat_checks | `domain` column populated, `ip_address` null for domain-only checks |
+| ST5 | Dashboard UI | Recent checks table shows domain, verdict, score, action |

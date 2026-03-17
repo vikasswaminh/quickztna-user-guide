@@ -1,0 +1,255 @@
+---
+title: "Custom Nameserver Configuration"
+topic: "DNS & MagicDNS"
+order: 38
+machines: ["Win-A"]
+summary: "Configure custom upstream nameservers for the organization and verify DNS forwarding."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA supports configuring custom upstream nameservers at the organization level. These are stored in the `dns_configs` table and managed via the `dns-management` handler. The backend supports two nameserver types: `global` (used for all non-tailnet queries) and split DNS (scoped to specific domains). The Go client's local resolver (`pkg/dns/resolver.go`) by default forwards non-tailnet queries via DNS-over-TLS to Quad9 (`9.9.9.9:853` and `149.112.112.112:853`), falling back to system DNS servers.
+
+Key facts from source code:
+
+- **Add nameserver:** `POST /api/dns-management` with `action: "add_nameserver"` -- requires `org_id`, `nameserver` (IP address), optional `type` (defaults to `"global"`), optional `domains` (array, for split DNS). Requires org admin. Returns `201` with the new nameserver ID (`dns-management.ts` lines 68-79).
+- **Remove nameserver:** `POST /api/dns-management` with `action: "remove_nameserver"` -- requires `org_id` and `nameserver_id`. Requires org admin (`dns-management.ts` lines 82-89).
+- **List nameservers:** Included in the `get_settings` response under the `nameservers` key, ordered by `created_at ASC` from the `dns_configs` table (`dns-management.ts` line 25).
+- **Local resolver upstream:** When no custom nameservers are configured, the resolver uses Quad9 DNS-over-TLS (`dotServers` in `resolver.go` lines 410-416). If DoT fails and `AllowPlaintextFallback` is false (default), queries get SERVFAIL instead of falling back to plaintext UDP (`resolver.go` lines 420-434).
+- **System DNS fallback:** `getSystemDNS()` returns system resolvers (platform-specific), or defaults to `["9.9.9.9:53", "149.112.112.112:53"]` (`resolver.go` lines 602-620).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard admin -- configure nameservers, verify DNS settings |
+
+---
+
+## ST1 -- Add a Global Custom Nameserver
+
+**What it verifies:** An org admin can add a custom upstream nameserver that applies to all DNS queries.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, add a custom nameserver via the API:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "add_nameserver",
+    "org_id": "YOUR_ORG_ID",
+    "nameserver": "8.8.8.8",
+    "type": "global"
+  }' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid-of-new-nameserver",
+    "nameserver": "8.8.8.8",
+    "type": "global"
+  }
+}
+```
+
+HTTP status: `201 Created`.
+
+2. Save the returned `id` -- you will need it for ST4 (removal).
+
+**Pass:** Nameserver created with a UUID. Response contains the nameserver IP and type `"global"`.
+
+**Fail / Common issues:**
+- `FORBIDDEN` -- you must be an org admin. Regular members can view settings but not modify them.
+- `MISSING_FIELDS` -- the `nameserver` field is required. The `type` and `domains` fields are optional.
+
+---
+
+## ST2 -- Add a Split DNS Nameserver
+
+**What it verifies:** A nameserver can be scoped to specific domains (split DNS), so only queries for those domains are forwarded to it.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, add a split DNS nameserver for an internal domain:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "add_nameserver",
+    "org_id": "YOUR_ORG_ID",
+    "nameserver": "10.0.0.53",
+    "type": "split",
+    "domains": ["internal.corp", "dev.corp"]
+  }' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid-of-split-nameserver",
+    "nameserver": "10.0.0.53",
+    "type": "split"
+  }
+}
+```
+
+2. Save this `id` for cleanup.
+
+**Pass:** Split nameserver created. The `domains` array is stored as JSON in the `dns_configs` table.
+
+**Fail / Common issues:**
+- The `domains` field is stored as a JSON-serialized string. If you pass a string instead of an array, it will be stored as `"[]"` (the default).
+
+---
+
+## ST3 -- Verify Nameservers Appear in Settings
+
+**What it verifies:** The `get_settings` response includes all configured nameservers for the org.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, fetch DNS settings:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -c "
+import sys, json
+data = json.load(sys.stdin)['data']
+print('Nameservers:')
+for ns in data['nameservers']:
+    print(f\"  {ns['nameserver']} (type: {ns['type']}, id: {ns['id']})\")
+    if ns.get('domains'):
+        print(f\"    domains: {ns['domains']}\")
+"
+```
+
+**Expected:** Two nameservers listed:
+- `8.8.8.8` with type `global`
+- `10.0.0.53` with type `split` and domains `["internal.corp", "dev.corp"]`
+
+They are ordered by `created_at ASC` (the global one first, since it was created in ST1).
+
+**Pass:** Both nameservers appear with correct IPs, types, and domain scoping.
+
+**Fail / Common issues:**
+- Empty `nameservers` array -- the nameservers may have been created under a different org. Verify the `org_id` matches.
+- `domains` is a JSON string instead of array -- the backend stores it as `JSON.stringify(domains || [])`. The frontend should parse it.
+
+---
+
+## ST4 -- Remove a Custom Nameserver
+
+**What it verifies:** An org admin can remove a previously configured nameserver.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, remove the global nameserver created in ST1:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "remove_nameserver",
+    "org_id": "YOUR_ORG_ID",
+    "nameserver_id": "UUID_FROM_ST1"
+  }' | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "deleted": "UUID_FROM_ST1"
+  }
+}
+```
+
+2. Verify it is gone:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -c "
+import sys, json
+ns = json.load(sys.stdin)['data']['nameservers']
+print(f'{len(ns)} nameserver(s) remaining')
+for n in ns:
+    print(f\"  {n['nameserver']} ({n['type']})\")
+"
+```
+
+**Expected:** Only 1 nameserver remaining (the split DNS one from ST2).
+
+**Pass:** The global nameserver is deleted. Only the split DNS nameserver remains.
+
+**Fail / Common issues:**
+- `MISSING_FIELDS` -- `nameserver_id` is required (not `nameserver`). This is the UUID returned when adding, not the IP address.
+- `FORBIDDEN` -- only org admins can remove nameservers.
+- Nameserver not deleted -- the `DELETE` query includes `AND org_id = ?`, so you cannot delete a nameserver belonging to a different org.
+
+---
+
+## ST5 -- Verify Local Resolver Upstream Behavior
+
+**What it verifies:** The local DNS resolver uses DNS-over-TLS (Quad9) for non-tailnet queries, and the plaintext fallback behavior is controlled by configuration.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, with the VPN connected and MagicDNS enabled, the local resolver should be running on `127.0.0.53`.
+
+2. Query a public domain through the local resolver:
+```bash
+nslookup google.com 127.0.0.53
+```
+
+**Expected:** The query resolves to Google's IP addresses. The resolver forwarded this non-tailnet query to Quad9 via DNS-over-TLS (`9.9.9.9:853` with TLS server name `dns.quad9.net`).
+
+3. The resolver's upstream forwarding logic (`resolver.go` lines 420-434):
+   - First tries DNS-over-TLS to Quad9 (both `9.9.9.9:853` and `149.112.112.112:853`)
+   - If DoT fails and `AllowPlaintextFallback` is `false` (the default), returns `nil` which results in no response (SERVFAIL from the client's perspective)
+   - If `AllowPlaintextFallback` is `true`, falls back to plaintext UDP to system DNS servers
+
+4. Query a Quad9-blocked malicious domain (Quad9 blocks known malware domains):
+```bash
+nslookup isitphishing.org 127.0.0.53
+```
+
+**Expected:** Quad9 may return NXDOMAIN for known phishing test domains. This demonstrates that using Quad9 as upstream provides built-in malware/phishing protection.
+
+**Pass:** Public domains resolve correctly through the local resolver. The resolver does not fall back to plaintext UDP by default.
+
+**Fail / Common issues:**
+- Timeout on all queries -- the local resolver may not be running. Check that `ztna up` is active and port 53 (or 15353) is bound.
+- SERVFAIL on everything -- DNS-over-TLS to Quad9 may be blocked by a corporate firewall (TCP port 853). In this case, the resolver cannot forward queries at all (plaintext fallback is disabled by default for security).
+
+**Cleanup:** Remove the remaining split DNS nameserver from ST2:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "remove_nameserver",
+    "org_id": "YOUR_ORG_ID",
+    "nameserver_id": "UUID_FROM_ST2"
+  }'
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Add global nameserver | Nameserver created with `201`, UUID returned |
+| ST2 | Add split DNS nameserver | Nameserver with domain scoping created |
+| ST3 | List nameservers in settings | Both nameservers appear in `get_settings` response, ordered by creation |
+| ST4 | Remove nameserver | Nameserver deleted by UUID, no longer in settings |
+| ST5 | Local resolver upstream | Non-tailnet queries forwarded via DNS-over-TLS to Quad9 |

@@ -1,0 +1,235 @@
+---
+title: "Group Membership Verification via CLI"
+topic: "Network Segmentation (Departments)"
+order: 33
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify that group membership is reflected in CLI peer listings and machine status."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The CLI itself does not have dedicated segmentation commands -- there is no `ztna groups` or `ztna segment` command. However, segmentation group data flows to clients through the **heartbeat ACL bundle**. When a machine sends a heartbeat (`POST /api/machine-heartbeat`), the backend:
+
+1. Queries `segmentation_groups` joined with `segmentation_group_members` for the entire org
+2. Builds a `machineMap` where each machine entry includes a `groups` array of group names
+3. Returns this as part of the `aclBundle` in the heartbeat response
+
+This means group membership is visible indirectly through:
+- The heartbeat response payload (inspectable via `ztna diag`)
+- ACL evaluation behavior (covered in Chapter 34)
+- The API CRUD endpoints for `segmentation_groups` and `segmentation_group_members`
+
+This chapter verifies that group membership data is consistent between the dashboard, API, and the data the CLI receives.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin dashboard + API testing |
+| <MachineRef name="Win-B" /> | Connected client -- member of `engineering` group |
+| <MachineRef name="Linux-C" /> | Connected client -- member of `engineering` and `finance` groups |
+
+**Prerequisite:** Groups `engineering` and `finance` exist. <MachineRef name="Win-B" /> is in `engineering`. <MachineRef name="Linux-C" /> is in both `engineering` and `finance` (from Chapter 32).
+
+---
+
+## ST1 -- Verify Group Membership via Dashboard
+
+**What it verifies:** The Segmentation page accurately reflects which machines belong to which groups.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/segmentation`.
+2. Check the `engineering` group card:
+   - Badge should show the correct machine count (e.g., "3 machines" if all three test machines were added).
+   - The member table should list each machine name and its "Added" date.
+3. Check the `finance` group card:
+   - Badge should show the correct count (e.g., "1 machines" if only <MachineRef name="Linux-C" /> was added).
+   - The member table should list <MachineRef name="Linux-C" />.
+
+**Pass:** Member counts and machine names match expectations from Chapter 32 setup.
+
+---
+
+## ST2 -- Verify Membership via API Cross-Reference
+
+**What it verifies:** The CRUD API for both tables returns consistent data that can be cross-referenced.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, list all groups and their members:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+# List all groups
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. For each group ID returned, list its members:
+```bash
+GROUP_ID="ENGINEERING_GROUP_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID&group_id=eq.$GROUP_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+3. Cross-reference `machine_id` values with the machines table:
+```bash
+MACHINE_ID="SOME_MACHINE_ID"
+
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&id=eq.$MACHINE_ID&select=id,name,status,os" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Each `machine_id` in the members table resolves to a valid machine in the org. Machine names match what the dashboard displays.
+
+**Pass:** All membership rows reference valid machines. Names are consistent across API and dashboard.
+
+---
+
+## ST3 -- Verify Heartbeat ACL Bundle Contains Group Data
+
+**What it verifies:** The heartbeat response includes group membership in the `aclBundle.machines` map, which is how the CLI client learns about segmentation.
+
+**Steps:**
+1. On <MachineRef name="Win-B" />, ensure the VPN is connected:
+```bash
+ztna status
+```
+Confirm status is "Connected" or "Running".
+
+2. Trigger a fresh heartbeat by restarting the connection:
+```bash
+ztna down
+ztna up
+```
+
+3. Run diagnostics to inspect the local state:
+```bash
+ztna diag
+```
+
+4. Separately, verify what the heartbeat returns by checking the ACL bundle via API. On <MachineRef name="Win-A" />:
+```bash
+# List ACL rules to confirm at least one exists (heartbeat only includes ACL bundle when rules exist)
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID&select=id,name,source,destination" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+If no ACL rules exist, the heartbeat skips the ACL bundle entirely (the backend only queries groups when `aclRules.length > 0`). Create a temporary rule if needed:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\",\"name\":\"temp-test-rule\",\"source\":\"*\",\"destination\":\"*\",\"ports\":\"*\",\"protocol\":\"*\",\"action\":\"allow\"}" | python3 -m json.tool
+```
+
+5. After the next heartbeat cycle (approximately 30 seconds), the ACL bundle sent to clients will include a `machines` map where each entry has a `groups` array. For <MachineRef name="Linux-C" />, this array should contain `["engineering", "finance"]`.
+
+**Pass:** When ACL rules exist, the heartbeat includes group membership data in the machine metadata map. Machines with no groups have an empty array.
+
+**Fail / Common issues:**
+- Groups array is empty even though machine is in a group -- ensure ACL rules exist. The backend only builds the group-augmented machine map when there are active ACL rules.
+- `ztna diag` does not explicitly display group names -- the group data is embedded in the ACL bundle, which the client uses internally for ACL evaluation.
+
+---
+
+## ST4 -- Verify Member Role Cannot Modify Groups
+
+**What it verifies:** Non-admin org members can read segmentation data but cannot create groups or modify membership.
+
+**Steps:**
+1. Obtain a JWT token for a user with the `member` role (not admin or owner) in the same organization.
+
+2. Attempt to read groups (should succeed):
+```bash
+MEMBER_TOKEN="MEMBER_JWT_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $MEMBER_TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `success: true` with the list of groups.
+
+3. Attempt to create a group (should fail):
+```bash
+curl -s -X POST "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\",\"name\":\"unauthorized-group\"}" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin required for writes to this table"
+  }
+}
+```
+
+4. Attempt to add a member (should also fail):
+```bash
+curl -s -X POST "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"group_id\":\"SOME_GROUP_ID\",\"machine_id\":\"SOME_MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected:** 403 Forbidden response.
+
+**Pass:** Members can read but not write. Both `segmentation_groups` and `segmentation_group_members` are protected by the `ADMIN_WRITE_TABLES` gate.
+
+---
+
+## ST5 -- Edit Group Name and Description via Dashboard
+
+**What it verifies:** The edit dialog updates the group name and description via a PATCH to `segmentation_groups`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, on the Segmentation page, find the `marketing` group card (created in Chapter 31).
+2. Click the pencil (edit) icon.
+3. In the edit dialog:
+   - Change **Group Name** to `marketing-team`
+   - Change **Description** to `Global marketing department`
+4. Click **Save Changes**.
+
+**Expected:** Toast "Group updated" appears. The card refreshes with the new name `marketing-team` and updated description.
+
+5. Verify via API:
+```bash
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&name=eq.marketing-team" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Returns one group with `name: "marketing-team"` and `description: "Global marketing department"`.
+
+6. Verify that the old name `marketing` no longer exists:
+```bash
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&name=eq.marketing" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Empty array `"data": []`.
+
+**Pass:** Name and description updated. Old name no longer resolves. Any ACL rules using `group:marketing` would need to be manually updated to `group:marketing-team`.
+
+**Fail / Common issues:**
+- Rename to an existing group name fails with a unique constraint error -- this is correct behavior; group names must be unique per org.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Dashboard membership display | Correct machine counts and names per group |
+| ST2 | API cross-reference | Membership rows resolve to valid machines, consistent with dashboard |
+| ST3 | Heartbeat ACL bundle | Group data included in heartbeat when ACL rules exist |
+| ST4 | Member role restrictions | Members can read but not write to segmentation tables |
+| ST5 | Group name/description edit | Edit dialog updates name and description, old name removed |

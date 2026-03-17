@@ -1,0 +1,210 @@
+---
+title: "Create Segmentation Group"
+topic: "Network Segmentation (Departments)"
+order: 31
+machines: ["Win-A"]
+summary: "Create network segmentation groups via dashboard and API — verify group creation, naming, and listing."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Segmentation groups let administrators organize machines into logical segments (e.g., "engineering", "finance") that can be referenced in ACL rules using the `group:` selector syntax. The groups are stored in the `segmentation_groups` table and managed through:
+
+1. **Dashboard:** Segmentation page (`/segmentation`) with a Create Group dialog
+2. **API:** Generic CRUD via `POST /api/db/segmentation_groups` (insert) and `GET /api/db/segmentation_groups` (list)
+
+Key facts from the schema:
+- Each group has `id`, `org_id`, `name`, `description`, `color` (default `#6366f1`), `created_by`, `created_at`, `updated_at`
+- A `UNIQUE(org_id, name)` constraint prevents duplicate group names within the same organization
+- Writing to `segmentation_groups` requires admin or owner role (`ADMIN_WRITE_TABLES` set in `db-crud.ts`)
+- Reading is available to all org members (`MEMBER_READ_TABLES` set)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin dashboard + API testing |
+
+---
+
+## ST1 -- Create a Segmentation Group via Dashboard
+
+**What it verifies:** The Create Group dialog on the Segmentation page inserts a new group into `segmentation_groups` with the correct `org_id` and `created_by`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/segmentation`.
+2. Click the **Create Group** button (top right).
+3. In the dialog:
+   - **Group Name:** `engineering`
+   - **Description:** `Engineering team machines`
+4. Click **Create Group**.
+
+**Expected:** A toast message "Group created" appears. The page refreshes to show a card for `engineering` with "0 machines" badge and the description text below the name.
+
+5. Verify the card displays:
+   - Group name: `engineering`
+   - Badge: `0 machines`
+   - Description: `Engineering team machines`
+
+**Pass:** Group card appears with correct name, zero-member count, and description.
+
+**Fail / Common issues:**
+- Toast says "Failed" -- check that you are logged in as an admin or owner. Members cannot create groups.
+- Dialog does not close -- check browser console for API errors (e.g., 403 Forbidden if role is "member").
+
+---
+
+## ST2 -- Create a Second Group and Verify Ordering
+
+**What it verifies:** Multiple groups can coexist and the list is sorted alphabetically by name (the frontend issues `.order("name", { ascending: true })`).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, on the Segmentation page, click **Create Group** again.
+2. Enter:
+   - **Group Name:** `finance`
+   - **Description:** `Finance department`
+3. Click **Create Group**.
+4. Verify the page now shows two group cards in this order:
+   - `engineering` (first, alphabetically)
+   - `finance` (second)
+
+**Pass:** Both groups appear. `engineering` is listed before `finance`.
+
+---
+
+## ST3 -- Duplicate Name Rejection
+
+**What it verifies:** The `UNIQUE(org_id, name)` constraint prevents creating two groups with the same name in the same organization.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, click **Create Group**.
+2. Enter:
+   - **Group Name:** `engineering`
+   - **Description:** `Duplicate test`
+3. Click **Create Group**.
+
+**Expected:** A toast error "Failed" appears. The database rejects the duplicate name. The existing `engineering` group is unchanged.
+
+4. Verify via API that only one `engineering` group exists:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&name=eq.engineering" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "uuid",
+      "org_id": "uuid",
+      "name": "engineering",
+      "description": "Engineering team machines",
+      "color": "#6366f1",
+      "created_by": "uuid",
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ]
+}
+```
+
+**Pass:** Only one `engineering` group exists. The duplicate insert was rejected.
+
+---
+
+## ST4 -- Create Group via API
+
+**What it verifies:** Groups can be created programmatically via the generic CRUD endpoint. The `org_id` and `created_by` fields are set correctly.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+USER_ID="YOUR_USER_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\",\"name\":\"marketing\",\"description\":\"Marketing department\",\"created_by\":\"$USER_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid",
+    "org_id": "uuid",
+    "name": "marketing",
+    "description": "Marketing department",
+    "color": "#6366f1",
+    "created_by": "uuid",
+    "created_at": "...",
+    "updated_at": "..."
+  }
+}
+```
+
+2. Verify it appears on the dashboard by refreshing `/segmentation`.
+
+**Pass:** The API returns `success: true` with the created group. The new group appears on the dashboard sorted alphabetically among existing groups.
+
+---
+
+## ST5 -- List All Groups via API
+
+**What it verifies:** The `GET` CRUD endpoint returns all segmentation groups for the organization, correctly scoped by `org_id`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response:** An array containing all groups created so far (`engineering`, `finance`, `marketing`):
+```json
+{
+  "success": true,
+  "data": [
+    { "id": "...", "name": "engineering", "description": "Engineering team machines", "color": "#6366f1", "..." : "..." },
+    { "id": "...", "name": "finance", "description": "Finance department", "color": "#6366f1", "..." : "..." },
+    { "id": "...", "name": "marketing", "description": "Marketing department", "color": "#6366f1", "..." : "..." }
+  ]
+}
+```
+
+2. Test org isolation -- use a different org_id (or a token from a different org) and verify no groups from the first org leak:
+```bash
+OTHER_ORG_ID="SOME_OTHER_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$OTHER_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Either an empty array `"data": []` (if no groups exist in that org) or a 403 error if the user is not a member of that org.
+
+**Pass:** All three groups returned for the correct org. No cross-org data leakage.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Dashboard group creation | Create Group dialog inserts group, toast confirms, card appears |
+| ST2 | Multiple groups + ordering | Groups listed alphabetically by name |
+| ST3 | Duplicate name rejection | UNIQUE constraint prevents same-name groups in one org |
+| ST4 | API group creation | POST to CRUD endpoint creates group with correct fields |
+| ST5 | API listing + org isolation | GET returns all org groups, no cross-org leakage |

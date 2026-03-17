@@ -1,0 +1,288 @@
+---
+title: "Disable/Delete Posture Policy"
+topic: "Posture Policies"
+order: 55
+machines: ["Win-A"]
+summary: "Disable and delete posture policies — verify that machines are no longer evaluated against removed policies."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Posture policies can be disabled or deleted in two ways:
+
+1. **Disable** -- set `enabled = false` on the policy. The posture-report handler only queries enabled policies: `SELECT * FROM posture_policies WHERE org_id = ? AND enabled = true LIMIT 1`. A disabled policy is ignored during evaluation.
+
+2. **Delete** -- remove the policy row from `posture_policies`. The CRUD handler supports `DELETE /api/db/posture_policies?id=eq.<uuid>`.
+
+After disabling or deleting all policies:
+- New posture reports will find no matching policy, so `violations` will be empty and `compliant` will be `true`
+- In `enforce` mode, previously quarantined machines will be auto-unquarantined on their next posture report (because evaluation returns compliant)
+- The `posture_reports` row for each machine is updated on the next report cycle
+
+Additionally, the org-level `posture_enforcement` mode can be set to `disabled` to completely skip posture evaluation:
+- When enforcement is `disabled`, the posture-report handler stores the report with `compliant: true` and empty violations without checking any policy
+- This is different from having no enabled policies -- when enforcement is `monitor` or `enforce` with no policies, evaluation still runs but finds nothing to check (result: compliant)
+
+**Important:** The three system template policies (Basic Security, Enterprise Standard, Healthcare / HIPAA) belong to org `00000000-0000-0000-0000-000000000000`. They cannot be deleted by regular org admins because the CRUD handler's org-scoped DELETE filter ensures only rows matching your org_id are affected.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard tests + curl/PowerShell for API tests |
+
+Ensure you have at least one posture policy created in your org (from Chapter 51). Ensure posture enforcement is set to `enforce` or `monitor`.
+
+---
+
+## ST1 -- Disable a Posture Policy via Dashboard
+
+**What it verifies:** An admin can disable a posture policy from the dashboard, and disabled policies are no longer evaluated.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/posture-policies` in a browser.
+2. Find the policy created in Chapter 51 (e.g., `Test-Posture-ST1` or `API-Posture-ST2`).
+3. Toggle the **Enabled** switch to OFF (or click a disable button if the UI uses one).
+4. Confirm the change.
+
+**Expected behavior:**
+- The policy's `enabled` field is set to `false`
+- The policy remains in the list but is visually marked as disabled
+- On the next posture report from any machine, this policy will not be included in evaluation
+
+**Pass:** Policy is disabled and visible as disabled in the UI.
+
+**Fail / Common issues:**
+- Toggle does not save -- the UI may use a PATCH request to `POST /api/db/posture_policies`. Check the browser network tab for errors.
+- 403 -- only org admins can write to `posture_policies`.
+
+---
+
+## ST2 -- Disable a Posture Policy via API
+
+**What it verifies:** The CRUD PATCH endpoint can disable a policy by setting `enabled = false`.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$policyId = "YOUR_POLICY_ID"
+
+$body = @{
+    _filters = @{ id = $policyId }
+    enabled  = $false
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies" `
+    -Method PATCH `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+**Note:** The CRUD PATCH handler ignores URL query params for the WHERE clause -- filters must be passed in the request body via the `_filters` key (this is a known CRUD pattern documented in MEMORY.md).
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": { "changes": 1 }
+}
+```
+
+Verify by fetching the policy:
+
+```powershell
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies?id=eq.$policyId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected:** The policy's `enabled` field is `false`.
+
+**Pass:** PATCH returns `changes: 1` and the policy is now disabled.
+
+**Fail / Common issues:**
+- `changes: 0` -- the `_filters` may not match any row. Ensure the policy ID is correct and belongs to your org.
+- Using URL params instead of `_filters` -- PATCH requires `_filters` in the body.
+
+---
+
+## ST3 -- Verify Disabled Policy Stops Quarantine
+
+**What it verifies:** After disabling all policies, a non-compliant machine is no longer quarantined on the next posture report.
+
+**Steps:**
+
+1. Ensure **all** posture policies for your org are disabled (repeat ST2 for each policy). System templates do not affect your org's evaluation because the handler queries `WHERE org_id = ? AND enabled = true LIMIT 1` using your org_id.
+
+2. If a machine is currently quarantined, trigger a new posture report. On <MachineRef name="Linux-C" /> (if available):
+
+```bash
+ztna posture status
+```
+
+Or wait for the automatic 60-second reporting cycle.
+
+3. On <MachineRef name="Win-A" />, check the posture report:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$machineId = "LINUX_C_MACHINE_ID"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected behavior:**
+- `compliant` is `true` (no enabled policy to evaluate against)
+- `violations` is an empty array `[]`
+- If the machine was quarantined and enforcement is `enforce`, the server sets its status back to `online` (auto-unquarantine)
+
+4. Verify the machine status:
+
+```powershell
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Pass:** With no enabled policies, the machine is evaluated as compliant and any quarantine is lifted.
+
+**Fail / Common issues:**
+- Machine stays quarantined -- there may be another enabled policy you missed. List all policies: `GET /api/db/posture_policies?org_id=eq.YOUR_ORG_ID&enabled=eq.true`.
+- Enforcement is `disabled` -- this also produces `compliant: true` but via a different code path (posture check is skipped entirely).
+
+---
+
+## ST4 -- Delete a Posture Policy via API
+
+**What it verifies:** A posture policy can be permanently deleted via the CRUD DELETE endpoint.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$policyId = "YOUR_POLICY_ID"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies?id=eq.$policyId" `
+    -Method DELETE `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body '{}'
+```
+
+**Important:** The DELETE request requires a JSON body `{}` (even though it is empty). The CRUD handler parses the body for non-GET requests.
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": { "changes": 1 }
+}
+```
+
+Verify the policy is gone:
+
+```powershell
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies?id=eq.$policyId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected:** The `data` array does not contain the deleted policy. System templates still appear (they have a different org_id).
+
+**Pass:** Policy is permanently deleted. `changes: 1` confirms one row was removed.
+
+**Fail / Common issues:**
+- `changes: 0` -- wrong policy ID or the policy belongs to a different org. The CRUD handler applies org-scoped filtering on DELETE.
+- Missing `Content-Type` or empty body -- the DELETE handler expects `Content-Type: application/json` and a parseable body (at minimum `{}`).
+
+---
+
+## ST5 -- Set Enforcement to Disabled and Verify
+
+**What it verifies:** Setting `posture_enforcement` to `disabled` causes the server to skip posture evaluation entirely and always return compliant.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, set enforcement to `disabled`:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+$body = @{
+    action              = "update_org_settings"
+    org_id              = $orgId
+    posture_enforcement = "disabled"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/org-management" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+2. Re-enable a posture policy (if you deleted it in ST4, create a new one with strict requirements):
+
+```powershell
+$body = @{
+    org_id                  = $orgId
+    name                    = "Strict-Test-Policy"
+    require_disk_encryption = $true
+    require_firewall        = $true
+    require_antivirus       = $true
+    enabled                 = $true
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+3. Trigger a posture report from a non-compliant machine (Linux-C if available), or call the API directly with a node_key.
+
+4. Check the posture report:
+
+```powershell
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected behavior:**
+- `compliant` is `true` despite the machine failing policy requirements
+- `violations` is an empty array `[]`
+- The posture-report response includes `mode: "disabled"`
+- No quarantine occurs regardless of posture state
+- The posture data (disk_encrypted, firewall_enabled, etc.) is still stored -- only evaluation is skipped
+
+This happens because the posture-report handler (line 45-57 in `posture-report.ts`) checks `enforcementMode === 'disabled'` first and short-circuits before loading policies.
+
+**Pass:** With enforcement disabled, all machines are always compliant regardless of their actual posture state. Posture data is still recorded.
+
+**Fail / Common issues:**
+- `compliant: false` -- the enforcement setting may be cached. The heartbeat handler caches org_settings for 3600 seconds. The posture-report handler reads org_settings fresh on each call, so this should reflect immediately.
+- Unexpected `mode` value -- ensure the org_settings update was accepted (check for 200 response in step 1).
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Dashboard toggle disables a policy, removing it from evaluation |
+| ST2 | API PATCH with `_filters` disables a policy correctly |
+| ST3 | Disabling all policies causes machines to evaluate as compliant and lifts quarantine |
+| ST4 | DELETE removes a policy permanently; requires JSON body `{}` |
+| ST5 | Setting enforcement to `disabled` skips evaluation entirely (always compliant) |

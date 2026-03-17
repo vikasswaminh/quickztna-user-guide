@@ -19,7 +19,7 @@ QuickZTNA clients report their version on every heartbeat. The backend compares 
 5. **Dashboard:** Machine detail page shows the version in the Attributes card (`node:clientVersion`)
 
 From `cmd_version.go`:
-- Output: `ztna version {Version} (built {BuildTime}, {GOOS}/{GOARCH})`
+- Output: `ztna version VERSION (built BUILDTIME, GOOS/GOARCH)`
 
 From `cmd_update.go`:
 - Flags: `--check` (check only), `--json`, `--yes` (skip prompt)

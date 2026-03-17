@@ -1,0 +1,237 @@
+---
+title: "Hash Lookup"
+topic: "Threat Intelligence"
+order: 63
+machines: ["Win-A"]
+summary: "Look up file hashes against threat intelligence feeds — verify known malware detection."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The CLI command `ztna threat check` accepts file hashes (SHA-256 or MD5) in addition to IPs and domains. The target type detection logic in `cmd_threat.go` works as follows:
+
+1. If `net.ParseIP(target)` succeeds, target type is `ip`
+2. If the input is exactly 64 or 32 hex characters, target type is `hash` (SHA-256 is 64 chars, MD5 is 32 chars)
+3. Otherwise, target type is `domain`
+
+When the CLI detects a hash, it sends `POST /api/threat-check` with `target_type: "hash"` in the request body. The Go client (`pkg/ztna/client.go`) posts to `/threat-check` with fields `org_id`, `target`, and `target_type`.
+
+**Important limitation:** The current backend handler (`handlers/threat-check.ts`) processes `ip_address` and `domain` fields from the request body. The CLI sends `target` and `target_type` fields, which the backend handler does not directly map to a provider query for hash lookups. This means hash lookups via the CLI will currently return results only if the backend is updated to handle the `target` and `target_type` fields, or if a provider-specific hash endpoint is wired up.
+
+The VirusTotal API does support hash lookups at `GET /api/v3/files/{hash}`, but the current handler code only checks `ip_address` and `domain` paths. This test chapter documents both the CLI behaviour and the expected backend gap.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | CLI + API testing |
+
+**Prerequisites:**
+- At least VirusTotal configured as a provider (VirusTotal is the most common hash lookup source)
+- Machine authenticated with `ztna up`
+- A known malware hash for testing (the EICAR test file SHA-256 is widely used)
+
+---
+
+## ST1 -- CLI Hash Type Detection (SHA-256)
+
+**What it verifies:** The CLI correctly identifies a 64-character hex string as a `hash` target type.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, use the EICAR test file SHA-256 hash:
+```powershell
+ztna threat check 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f --json
+```
+
+**Expected output (JSON):**
+```json
+{
+  "target": "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+  "target_type": "hash",
+  "verdict": "...",
+  "score": 0,
+  "providers": []
+}
+```
+
+The key assertion is that `target_type` is `"hash"` (not `"domain"`). This confirms the CLI detection logic works: a 64-character all-hex string is classified as a hash.
+
+**Pass:** `target_type` is `"hash"`.
+
+**Fail / Common issues:**
+- `target_type` is `"domain"` -- the input may contain non-hex characters. Double-check the hash string.
+
+---
+
+## ST2 -- CLI Hash Type Detection (MD5)
+
+**What it verifies:** A 32-character hex string is also detected as `hash`.
+
+**Steps:**
+
+1. Use the EICAR test file MD5 hash:
+```powershell
+ztna threat check 44d88612fea8a8f36de82e1278abb02f --json
+```
+
+**Expected:** `target_type` is `"hash"`.
+
+2. Test with a non-hex 32-character string to confirm it falls through to `domain`:
+```powershell
+ztna threat check abcdefghijklmnopqrstuvwxyz123456 --json
+```
+
+**Expected:** `target_type` is `"domain"` because the string contains non-hex characters (`g`, `h`, `i`, etc.).
+
+**Pass:** MD5-length hex string is classified as `hash`; non-hex string of the same length is classified as `domain`.
+
+**Fail / Common issues:**
+- Both are classified as `domain` -- the hex detection logic may have a bug; check `detectTargetType` in `cmd_threat.go`.
+
+---
+
+## ST3 -- Backend Hash Lookup Behaviour (Current State)
+
+**What it verifies:** Documents the current backend response when a hash target is submitted, confirming the expected gap.
+
+**Steps:**
+
+1. Call the API with the CLI's request format:
+```powershell
+$body = @{
+    org_id      = "$ORG_ID"
+    target      = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+    target_type = "hash"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/threat-check" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+2. Observe the response. Because the backend handler reads `ip_address` and `domain` from the body (not `target`), and neither is present:
+
+**Expected response (one of two outcomes):**
+
+*Outcome A* -- Providers skip the check (no `ip_address` or `domain` to query):
+```json
+{
+  "success": true,
+  "data": {
+    "checked": true,
+    "blocked": false,
+    "results": []
+  }
+}
+```
+
+*Outcome B* -- No enabled providers match:
+```json
+{
+  "success": true,
+  "data": {
+    "checked": false,
+    "message": "No threat intel providers configured"
+  }
+}
+```
+
+3. To get actual hash results from VirusTotal, you would need to pass the hash as `domain` or wait for a backend update that maps `target` to the appropriate provider endpoint.
+
+**Pass:** The API does not error out (no 500); it returns a graceful empty result.
+
+**Fail / Common issues:**
+- 500 error -- unexpected; the handler should handle missing `ip_address`/`domain` gracefully
+- Results returned with actual scores -- this means the backend has been updated to handle `target`/`target_type` fields; adjust expectations accordingly
+
+---
+
+## ST4 -- Generating a File Hash for Testing
+
+**What it verifies:** You can generate a SHA-256 hash of a local file and feed it to the CLI.
+
+**Steps:**
+
+1. Create the EICAR test file on <MachineRef name="Win-A" />:
+```powershell
+# The EICAR test string (industry-standard antivirus test)
+$eicar = 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+Set-Content -Path "$env:TEMP\eicar.txt" -Value $eicar -NoNewline
+```
+
+2. Compute the SHA-256 hash:
+```powershell
+(Get-FileHash "$env:TEMP\eicar.txt" -Algorithm SHA256).Hash.ToLower()
+```
+This should output `275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f`.
+
+3. Use it in a threat check:
+```powershell
+$hash = (Get-FileHash "$env:TEMP\eicar.txt" -Algorithm SHA256).Hash.ToLower()
+ztna threat check $hash --json
+```
+
+4. Confirm `target_type` is `"hash"`.
+
+5. Clean up:
+```powershell
+Remove-Item "$env:TEMP\eicar.txt" -ErrorAction SilentlyContinue
+```
+
+**Pass:** The hash is correctly computed and classified as `hash` by the CLI.
+
+**Fail / Common issues:**
+- Hash length is not 64 -- the file content may have a trailing newline. Use `-NoNewline` with `Set-Content`.
+
+---
+
+## ST5 -- Hash Check Recorded in threat_checks (When IP/Domain Provided)
+
+**What it verifies:** You can associate a hash lookup with an IP to get provider results, and the check is persisted.
+
+**Steps:**
+
+Since the current backend processes `ip_address` and `domain` fields, you can combine a hash check with an IP to get meaningful results and document the hash in the context:
+
+1. Call the API with both an IP and a note about the hash:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/threat-check" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"ip_address\": \"185.220.101.1\",
+    \"domain\": null,
+    \"machine_id\": \"$MACHINE_ID\"
+  }" | jq
+```
+
+2. Verify the check was recorded:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/threat_checks?org_id=eq.$ORG_ID&ip_address=eq.185.220.101.1" \
+  | jq '.data | length'
+```
+
+3. On the `/threat-intel` page, the Recent Checks tab should show the entry with the provider verdict and score.
+
+**Pass:** The threat check is recorded and visible in both API and UI.
+
+**Fail / Common issues:**
+- No record found -- the org_id or ip_address filter may not match exactly
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | SHA-256 detection | 64-char hex string classified as `hash` |
+| ST2 | MD5 detection | 32-char hex string classified as `hash`; non-hex classified as `domain` |
+| ST3 | Backend hash handling | No 500 error; returns graceful empty result (current gap documented) |
+| ST4 | File hash generation | SHA-256 of EICAR test file produces correct hash and correct target_type |
+| ST5 | Persistence with IP fallback | Threat check with IP is recorded and visible on dashboard |

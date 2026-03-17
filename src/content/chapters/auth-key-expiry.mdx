@@ -1,0 +1,310 @@
+---
+title: "Key Expiry Enforcement"
+topic: "Auth Keys"
+order: 45
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that expired auth keys are rejected during registration and that expiry dates are enforced."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Auth keys have a mandatory expiry date stored in the `expires_at` column. The backend enforces expiry at two levels: (1) during registration, the lookup query filters with `expires_at > NOW()`, and (2) a background cron job (`enforce-key-expiry`) periodically revokes expired keys and marks stale machines offline.
+
+Key facts from source code:
+
+**Registration enforcement** (`backend/src/handlers/register-machine.ts`, line 70-74):
+- Lookup query: `SELECT * FROM auth_keys WHERE key_hash = ? AND revoked = FALSE AND expires_at > NOW()`
+- An expired key returns no record, resulting in `{ code: 'INVALID_KEY', message: 'Invalid or expired auth key' }` (HTTP 401)
+
+**Cron enforcement** (`backend/src/handlers/enforce-key-expiry.ts`):
+- **Endpoint:** `POST /api/enforce-key-expiry` (internal/cron)
+- Revokes expired keys: `UPDATE auth_keys SET revoked = TRUE WHERE revoked = FALSE AND expires_at < NOW()`
+- Marks stale machines offline: `UPDATE machines SET status = 'offline' WHERE org_id = ? AND status = 'online' AND last_seen < NOW() - INTERVAL '3 minutes'`
+- Cleans up ephemeral machines: `DELETE FROM machines WHERE ephemeral = TRUE AND status = 'offline' AND last_seen < NOW() - INTERVAL '30 minutes'`
+
+**Expiry constraints** (`backend/src/handlers/api-key-auth.ts`, line 62-63):
+- `expiry_days` must be an integer between 1 and 365
+- Default expiry is 90 days when `expiry_days` is not specified
+- Stored as: `NOW() + INTERVAL 'N days'` in the `expires_at` column (TIMESTAMPTZ)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + API -- create keys, check expiry, trigger enforcement |
+| <MachineRef name="Linux-C" /> | Target -- attempt registration with expired key |
+
+---
+
+## ST1 — Verify Expiry Date Is Set Correctly
+
+**What it verifies:** When creating an auth key with a specific `expiry_days`, the `expires_at` timestamp is set to approximately NOW + N days.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a key with 7-day expiry:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"expiry-test-7d\",
+    \"reusable\": true,
+    \"expiry_days\": 7
+  }" | python3 -m json.tool
+```
+Save the `id` from the response.
+
+2. Query the key's `expires_at` value:
+```bash
+KEY_ID="THE_KEY_UUID"
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&id=eq.$KEY_ID&select=id,name,expires_at,created_at" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `expires_at` is approximately 7 days after `created_at`. For example, if created on `2026-03-17`, the expiry should be around `2026-03-24`.
+
+**Pass:** The `expires_at` timestamp is 7 days after creation. The difference between `expires_at` and `created_at` is approximately 7 days (within a few seconds tolerance).
+
+**Fail / Common issues:**
+- `expires_at` is 90 days out -- the `expiry_days` parameter may not have been sent. Verify the request body includes `"expiry_days": 7`.
+- `expires_at` is null -- this should not happen as the column is `NOT NULL`. Check migration integrity.
+
+---
+
+## ST2 — Default Expiry Is 90 Days
+
+**What it verifies:** When `expiry_days` is omitted, the default is 90 days.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a key without specifying `expiry_days`:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"default-expiry-key\"
+  }" | python3 -m json.tool
+```
+
+**Expected response:** `"expiry_days": 90` in the response data.
+
+2. Query the expiry:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&name=eq.default-expiry-key&select=name,expires_at,created_at" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `expires_at` is approximately 90 days after `created_at`.
+
+**Pass:** Response shows `expiry_days: 90`. The `expires_at` timestamp is approximately 90 days from creation.
+
+**Fail / Common issues:**
+- Different default -- if the backend code changes the default from 90, this test catches it.
+
+---
+
+## ST3 — Expired Key Rejected During Registration
+
+**What it verifies:** A key that has passed its `expires_at` timestamp is rejected during machine registration.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a key with 1-day expiry:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"expires-soon-key\",
+    \"reusable\": true,
+    \"expiry_days\": 1
+  }" | python3 -m json.tool
+```
+Save the key value.
+
+2. **Wait for the key to expire** (24 hours), or if you have database access, manually set the expiry to the past:
+```sql
+-- Direct DB access (production server only):
+UPDATE auth_keys SET expires_at = NOW() - INTERVAL '1 hour' WHERE name = 'expires-soon-key';
+```
+
+3. On <MachineRef name="Linux-C" />, attempt registration with the expired key:
+```bash
+ztna down
+ztna logout
+ztna up --auth-key "tskey-auth-EXPIRED_KEY"
+```
+
+**Expected error:**
+```
+auth key registration failed: INVALID_KEY: Invalid or expired auth key
+```
+
+4. Alternatively, test via direct API:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/register-machine" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"auth_key\": \"tskey-auth-EXPIRED_KEY\",
+    \"name\": \"should-fail-expired\"
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 401):**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_KEY",
+    "message": "Invalid or expired auth key"
+  }
+}
+```
+
+**Pass:** Registration fails with `INVALID_KEY` (401). The error message says "Invalid or expired auth key". No machine record is created.
+
+**Fail / Common issues:**
+- Registration succeeds -- the key may not have actually expired. Check `expires_at` via the API. If you used the DB shortcut, ensure the UPDATE targeted the correct row.
+- Error code is `RATE_LIMITED` -- wait and retry. Rate limiting may trigger if you have been testing rapidly.
+
+---
+
+## ST4 — Enforce-Key-Expiry Cron Revokes Expired Keys
+
+**What it verifies:** The background enforcement handler automatically revokes expired keys and cleans up ephemeral machines.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, check that a key is expired but not yet revoked:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&name=eq.expires-soon-key&select=name,revoked,expires_at" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+Note the `revoked` field (should be `false` if cron has not run yet).
+
+2. Trigger the enforcement endpoint (this is normally called by a cron job):
+```bash
+curl -s -X POST "https://login.quickztna.com/api/enforce-key-expiry" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "expired_count": 0,
+    "ephemeral_cleaned": 0
+  }
+}
+```
+
+The `expired_count` reflects machines marked offline (not keys revoked). The key revocation happens silently via the UPDATE statement.
+
+3. Re-check the key:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&name=eq.expires-soon-key&select=name,revoked,expires_at" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"revoked": true` (set by the enforcement handler).
+
+**Pass:** After running enforce-key-expiry, the expired key has `revoked: true`.
+
+**Fail / Common issues:**
+- Key still shows `revoked: false` -- the key may not have actually expired. Double-check `expires_at` is in the past.
+- Endpoint returns 401 or 403 -- the enforcement endpoint may require internal/cron authentication. Check the router configuration.
+
+---
+
+## ST5 — Ephemeral Machine Cleanup on Expiry
+
+**What it verifies:** Ephemeral machines (registered with an ephemeral auth key) are automatically deleted when they have been offline for more than 30 minutes.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create an ephemeral key and register a machine:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"ephemeral-cleanup-key\",
+    \"reusable\": true,
+    \"ephemeral\": true,
+    \"expiry_days\": 7
+  }" | python3 -m json.tool
+```
+
+2. On <MachineRef name="Linux-C" />, register and then disconnect:
+```bash
+ztna down
+ztna logout
+export ZTNA_AUTH_KEY="tskey-auth-EPHEMERAL_KEY"
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+# Wait a few seconds for registration to complete
+ztna down
+```
+
+3. Verify the machine exists and is marked ephemeral:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&ephemeral=eq.true&select=id,name,status,ephemeral,last_seen" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Machine exists with `ephemeral: true` and status `offline`.
+
+4. The enforcement cron deletes ephemeral machines that have been offline for more than 30 minutes. The deletion query is:
+```sql
+DELETE FROM machines WHERE ephemeral = TRUE AND status = 'offline' AND last_seen < NOW() - INTERVAL '30 minutes'
+```
+
+To test without waiting, you can manually update the `last_seen` timestamp if you have DB access:
+```sql
+UPDATE machines SET last_seen = NOW() - INTERVAL '1 hour' WHERE ephemeral = TRUE AND name = 'Linux-C';
+```
+
+Then trigger enforcement:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/enforce-key-expiry" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+5. Check if the machine was deleted:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&name=eq.Linux-C&select=id,name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Empty result (machine deleted) or the `ephemeral_cleaned` count in the enforcement response is 1 or more.
+
+**Pass:** Ephemeral machine is deleted after being offline beyond the 30-minute threshold.
+
+**Fail / Common issues:**
+- Machine still exists -- it may not have been offline long enough. The 30-minute threshold is enforced strictly based on `last_seen`.
+- Machine is not marked `ephemeral: true` -- check that the auth key used for registration had `ephemeral: true`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Custom expiry date | `expires_at` is approximately N days after creation |
+| ST2 | Default 90-day expiry | Omitting `expiry_days` defaults to 90 days |
+| ST3 | Expired key rejected | Registration returns `INVALID_KEY` (401) for expired key |
+| ST4 | Cron revokes expired keys | `enforce-key-expiry` sets `revoked: true` on expired keys |
+| ST5 | Ephemeral cleanup | Offline ephemeral machines deleted after 30 minutes |

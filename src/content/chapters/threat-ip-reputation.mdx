@@ -1,0 +1,286 @@
+---
+title: "IP Reputation Check"
+topic: "Threat Intelligence"
+order: 61
+machines: ["Win-A", "Linux-C"]
+summary: "Check IP reputation via CLI and API — verify threat score, classification, and data sources."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA integrates with external threat intelligence providers (AbuseIPDB, VirusTotal, CrowdStrike) to score IP addresses. The system has two layers:
+
+- **CLI**: `ztna threat check <ip>` — auto-detects the target as an IP, sends a `POST /api/threat-check` request, and displays a verdict with a 0-100 confidence score
+- **API**: `POST /api/threat-check` — accepts `org_id`, `ip_address`, and optional `machine_id`; iterates over all enabled `threat_intel_configs` rows for the org; queries each provider; records results in the `threat_checks` table; and returns a combined verdict
+
+The backend handler (`handlers/threat-check.ts`) performs these steps for each enabled provider:
+
+1. Decrypts the stored `api_key_encrypted` using the server-side encryption key
+2. Calls the provider API (AbuseIPDB `/api/v2/check`, VirusTotal `/api/v3/ip-addresses/{ip}`, or CrowdStrike Falcon Intel via OAuth2)
+3. Normalises the response to `{ score, verdict, raw }` where verdict is `clean`, `suspicious`, or `malicious`
+4. Compares the score to the provider's `block_threshold` (default 50) to decide `blocked` vs `allowed`
+5. Inserts a row into `threat_checks` with the verdict, confidence score, raw response, and action taken
+
+The CLI command (`cmd_threat.go`) auto-detects the target type: if `net.ParseIP` succeeds, it is classified as `ip`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser (dashboard) + CLI testing |
+| <MachineRef name="Linux-C" /> | CLI testing from a Linux endpoint |
+
+**Prerequisites:**
+- At least one threat intel provider (AbuseIPDB, VirusTotal, or CrowdStrike) configured and enabled on the Threat Intelligence page (`/threat-intel`) with a valid API key
+- The machine must be authenticated (`ztna up` running, or a valid JWT for API calls)
+
+---
+
+## ST1 -- CLI IP Reputation Check (Known Safe IP)
+
+**What it verifies:** `ztna threat check` correctly queries providers for a benign IP and returns a low score with a `clean` verdict.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, ensure the tunnel is up:
+```powershell
+ztna status
+```
+Confirm `Authenticated: true` and an org is connected.
+
+2. Check a well-known safe IP (Google Public DNS):
+```powershell
+ztna threat check 8.8.8.8
+```
+
+**Expected output:**
+```
+Target:  8.8.8.8 (ip)
+Verdict: CLEAN
+Score:   0/100
+
+Provider Results:
+──────────────────────────────────────────────────
+  abuseipdb            clean
+  virustotal           clean
+```
+
+The exact providers listed depend on which are configured for the org. The score should be low (under 25) and the verdict should be `CLEAN`.
+
+3. Repeat with JSON output to inspect the raw structure:
+```powershell
+ztna threat check 8.8.8.8 --json
+```
+
+**Expected JSON shape:**
+```json
+{
+  "target": "8.8.8.8",
+  "target_type": "ip",
+  "verdict": "clean",
+  "score": 0,
+  "providers": [
+    {
+      "name": "abuseipdb",
+      "verdict": "clean",
+      "details": ""
+    }
+  ]
+}
+```
+
+**Pass:** Verdict is `CLEAN`, score is under 25, at least one provider returned results.
+
+**Fail / Common issues:**
+- "not connected to an organization" -- run `ztna up` first
+- "error checking threat" -- the API returned an error; check that the provider API key is valid on the `/threat-intel` dashboard page
+- No providers listed -- no `threat_intel_configs` rows are enabled for the org
+
+---
+
+## ST2 -- CLI IP Reputation Check (Known Malicious IP)
+
+**What it verifies:** A known-bad IP returns a high score and a `malicious` or `suspicious` verdict.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, check an IP from a public threat test list (the AbuseIPDB "most reported" list frequently includes `185.220.101.1` or similar Tor exit nodes):
+```bash
+ztna threat check 185.220.101.1
+```
+
+**Expected output (approximate):**
+```
+Target:  185.220.101.1 (ip)
+Verdict: MALICIOUS
+Score:   87/100
+
+Provider Results:
+──────────────────────────────────────────────────
+  abuseipdb            malicious  (abuseConfidenceScore: 100)
+  virustotal           suspicious  (3 malicious detections)
+```
+
+The score depends on provider data at test time. The key assertion is that the score exceeds 50 and the verdict is either `SUSPICIOUS` or `MALICIOUS`.
+
+2. Verify the check was recorded in the database by calling the CRUD API:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/threat_checks?org_id=eq.$ORG_ID&ip_address=eq.185.220.101.1" | jq '.data[0]'
+```
+
+**Expected fields in the response object:**
+- `ip_address`: `"185.220.101.1"`
+- `verdict`: `"malicious"` or `"suspicious"`
+- `confidence_score`: a number greater than 50
+- `action_taken`: `"blocked"` (if score exceeds the provider's `block_threshold`) or `"allowed"`
+- `raw_response`: a JSON object containing the provider's raw data
+
+**Pass:** Score exceeds 50, verdict is `SUSPICIOUS` or `MALICIOUS`, and a `threat_checks` row was created.
+
+**Fail / Common issues:**
+- Score is 0 with verdict `clean` -- the IP may have been delisted. Try a different known-bad IP from AbuseIPDB's public reports.
+- `action_taken` is `allowed` despite high score -- the `block_threshold` on the `threat_intel_configs` row may be set higher than the returned score. Check the threshold on the `/threat-intel` page.
+
+---
+
+## ST3 -- API Direct IP Check (POST /api/threat-check)
+
+**What it verifies:** The API endpoint accepts a direct IP check request and returns the correct envelope structure.
+
+**Steps:**
+
+1. From <MachineRef name="Win-A" />, call the API directly:
+```powershell
+$body = @{
+    org_id     = "$ORG_ID"
+    ip_address = "1.1.1.1"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/threat-check" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "checked": true,
+    "blocked": false,
+    "results": [
+      {
+        "provider": "abuseipdb",
+        "verdict": "clean",
+        "score": 0,
+        "action": "allowed"
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+2. Verify the `data.checked` field is `true` and `data.results` is an array with one entry per enabled provider.
+
+3. Verify the `data.blocked` field is `false` for a clean IP (it becomes `true` when any provider's score exceeds its `block_threshold`).
+
+**Pass:** `success: true`, `checked: true`, `blocked: false`, and at least one provider result with verdict `clean`.
+
+**Fail / Common issues:**
+- `"checked": false, "message": "No threat intel providers configured"` -- no providers are enabled. Configure one on the `/threat-intel` page.
+- `401 UNAUTHORIZED` -- JWT expired or missing. Re-authenticate.
+- `403 FORBIDDEN` -- the user is not a member of the specified `org_id`.
+
+---
+
+## ST4 -- IP Check With machine_id Association
+
+**What it verifies:** When a `machine_id` is provided, the `threat_checks` record is linked to that machine, which feeds into the risk engine's threat score calculation.
+
+**Steps:**
+
+1. Get a machine ID from the dashboard or API:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/machines?org_id=eq.$ORG_ID&status=eq.online" | jq '.data[0].id'
+```
+
+2. Run a threat check with the machine_id:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/threat-check" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\": \"$ORG_ID\", \"ip_address\": \"185.220.101.1\", \"machine_id\": \"$MACHINE_ID\"}" | jq
+```
+
+3. Verify the recorded threat_check has the machine_id:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/threat_checks?org_id=eq.$ORG_ID&machine_id=eq.$MACHINE_ID" \
+  | jq '.data | length'
+```
+The count should be at least 1.
+
+4. The risk engine (`risk-engine.ts`) uses `threat_checks` rows with a matching `machine_id` from the last 24 hours to calculate the threat component (20% weight) of the machine's overall risk score. Trigger a heartbeat (wait up to 60 seconds) or manually check:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/risk_scores?machine_id=eq.$MACHINE_ID" | jq '.data[0] | {overall_score, risk_level, threat_score}'
+```
+
+**Pass:** The `threat_checks` row has the correct `machine_id`, and the `risk_scores` row shows a non-zero `threat_score`.
+
+**Fail / Common issues:**
+- `machine_id` is `null` in the threat_checks row -- the machine_id was not included in the request body
+- `risk_scores` row shows `threat_score: 0` -- the heartbeat has not fired since the check; wait for the next heartbeat cycle
+
+---
+
+## ST5 -- IP Check With No Providers Configured
+
+**What it verifies:** When no threat intel providers are configured or enabled for an org, the API returns a graceful "not configured" response instead of an error.
+
+**Steps:**
+
+1. If testing in a separate org with no providers, call:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/threat-check" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\": \"$ORG_ID_NO_PROVIDERS\", \"ip_address\": \"8.8.8.8\"}" | jq
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "checked": false,
+    "message": "No threat intel providers configured"
+  },
+  "error": null
+}
+```
+
+2. Alternatively, temporarily disable all providers on the `/threat-intel` page (toggle each provider's Enabled switch off), then repeat the check.
+
+**Pass:** `success: true`, `checked: false`, message says "No threat intel providers configured".
+
+**Fail / Common issues:**
+- Returns `success: false` or a 500 error -- this would indicate a backend bug; the handler should gracefully handle the empty config case
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | CLI check of safe IP | Score under 25, verdict `CLEAN` |
+| ST2 | CLI check of malicious IP | Score over 50, verdict `SUSPICIOUS` or `MALICIOUS`, row in `threat_checks` |
+| ST3 | Direct API call | Envelope: `checked: true`, `blocked: false`, provider results array |
+| ST4 | machine_id association | `threat_checks` row linked to machine, feeds risk engine |
+| ST5 | No providers configured | Graceful `checked: false` response, no error |

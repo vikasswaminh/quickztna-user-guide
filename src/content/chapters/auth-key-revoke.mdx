@@ -1,0 +1,281 @@
+---
+title: "Revoke Auth Key & Verify Rejection"
+topic: "Auth Keys"
+order: 44
+machines: ["Win-A", "Linux-C"]
+summary: "Revoke an auth key and verify that subsequent registration attempts are rejected."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Revoking an auth key sets `revoked = TRUE` on the `auth_keys` record and triggers a cascade: all machines registered with that key are quarantined (`status = 'quarantined'`). Subsequent registration attempts with the revoked key are rejected because the backend query filters with `revoked = FALSE`.
+
+Key facts from source code (`backend/src/handlers/api-key-auth.ts`, lines 132-152):
+- **Endpoint:** `POST /api/key-management` (alias: `POST /api/api-keys`)
+- **Action:** `"revoke_auth_key"`
+- **Required fields:** `action`, `org_id`, `key_id`
+- **Auth:** JWT required, caller must be org admin or owner
+- **Revoke SQL:** `UPDATE auth_keys SET revoked = TRUE WHERE id = ? AND org_id = ?`
+- **Cascade quarantine:** `UPDATE machines SET status = 'quarantined' WHERE auth_key_id = ? AND org_id = ? AND status IN ('online', 'offline')`
+- **Response:** `{ revoked: key_id, machines_quarantined: count }`
+- **Realtime broadcast:** Each quarantined machine gets a WebSocket event so dashboards update live
+
+Registration rejection path (`backend/src/handlers/register-machine.ts`, line 70-74):
+- The lookup query includes `WHERE key_hash = ? AND revoked = FALSE AND expires_at > NOW()`
+- A revoked key returns no record, resulting in `{ code: 'INVALID_KEY', message: 'Invalid or expired auth key' }` (HTTP 401)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + API -- revoke keys, verify quarantine |
+| <MachineRef name="Linux-C" /> | Target -- attempt registration with revoked key |
+
+**Prerequisite:** Have at least one auth key with a registered machine from previous chapters.
+
+---
+
+## ST1 — Revoke an Auth Key via API
+
+**What it verifies:** The `revoke_auth_key` action sets the key's `revoked` flag to TRUE and returns the number of quarantined machines.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, first create a test key and register a machine:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+# Create a key
+RESPONSE=$(curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"revoke-test-key\",
+    \"reusable\": true,
+    \"expiry_days\": 30
+  }")
+echo "$RESPONSE" | python3 -m json.tool
+```
+Save the `id` and `key` from the response.
+
+2. On <MachineRef name="Linux-C" />, register with this key:
+```bash
+ztna down
+ztna logout
+export ZTNA_AUTH_KEY="tskey-auth-YOUR_KEY_HERE"
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+3. On <MachineRef name="Win-A" />, revoke the key:
+```bash
+KEY_ID="THE_KEY_UUID"
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"revoke_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"$KEY_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "revoked": "<key-uuid>",
+    "machines_quarantined": 1
+  }
+}
+```
+
+**Pass:** Response shows `revoked` matching the key ID. `machines_quarantined` is 1 (the machine registered in step 2).
+
+**Fail / Common issues:**
+- `MISSING_FIELDS` (400) -- `key_id` is required. Ensure it is included in the request body.
+- `FORBIDDEN` (403) -- caller is not an org admin.
+- `machines_quarantined: 0` -- the machine may already have been offline or quarantined. This is acceptable if the machine was not in `online` or `offline` status.
+
+---
+
+## ST2 — Verify Machine Is Quarantined
+
+**What it verifies:** After key revocation, all machines registered with that key are moved to `quarantined` status.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, check the machine status:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&auth_key_id=eq.$KEY_ID&select=id,name,status,auth_key_id" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:**
+```json
+{
+  "data": [
+    {
+      "id": "<uuid>",
+      "name": "Linux-C",
+      "status": "quarantined",
+      "auth_key_id": "<key-uuid>"
+    }
+  ]
+}
+```
+
+2. On the dashboard (`https://login.quickztna.com/machines`), verify the machine shows a quarantined indicator.
+
+**Pass:** Machine status is `quarantined`. The machine is visible in the dashboard with quarantined status.
+
+**Fail / Common issues:**
+- Machine still shows `online` -- the revocation may not have matched the `auth_key_id`. Check that the machine's `auth_key_id` matches the revoked key ID.
+- Machine shows `offline` instead of `quarantined` -- the machine may have disconnected before the revocation cascade ran.
+
+---
+
+## ST3 — Registration Rejected with Revoked Key
+
+**What it verifies:** Attempting to register a new machine with a revoked key fails with `INVALID_KEY`.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, clear state and attempt registration with the revoked key:
+```bash
+ztna down
+ztna logout
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+**Expected error:**
+```
+auth key registration failed: INVALID_KEY: Invalid or expired auth key
+```
+
+2. Alternatively, test via direct API call:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/register-machine" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"auth_key\": \"$ZTNA_AUTH_KEY\",
+    \"name\": \"should-fail\"
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 401):**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_KEY",
+    "message": "Invalid or expired auth key"
+  }
+}
+```
+
+**Pass:** Registration is rejected with `INVALID_KEY` (401). No new machine record is created.
+
+**Fail / Common issues:**
+- Registration succeeds -- the key may not have been properly revoked. Query the key's `revoked` field: `GET /api/db/auth_keys?id=eq.KEY_ID&select=id,revoked`.
+- Different error code -- `RATE_LIMITED` (429) may appear if you have been testing rapidly. Wait a few minutes and retry.
+
+---
+
+## ST4 — Verify Revoked Key in Key List
+
+**What it verifies:** Revoked keys are visible in the auth key list with their revoked status.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, query the auth keys including the revoked flag:
+```bash
+curl -s "https://login.quickztna.com/api/db/auth_keys?org_id=$ORG_ID&select=id,name,revoked,used_count" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** The revoked key has `"revoked": true`:
+```json
+{
+  "id": "<key-uuid>",
+  "name": "revoke-test-key",
+  "revoked": true,
+  "used_count": 1
+}
+```
+
+2. Via CLI:
+```bash
+ztna auth-keys list
+```
+
+Note: The CLI `auth-keys list` fetches all keys (including revoked ones) from the CRUD endpoint. Revoked keys will appear in the list.
+
+**Pass:** The revoked key shows `revoked: true` in the API response. The CLI list includes it.
+
+**Fail / Common issues:**
+- Key not found -- double-check the org_id. Keys are org-scoped.
+
+---
+
+## ST5 — Non-Admin Cannot Revoke Keys
+
+**What it verifies:** Only org admins or owners can revoke auth keys. Members get a 403 error.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create another test key (as admin):
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"admin-only-revoke-test\",
+    \"reusable\": true,
+    \"expiry_days\": 7
+  }" | python3 -m json.tool
+```
+Save the key ID.
+
+2. Attempt to revoke using a member (non-admin) JWT token:
+```bash
+MEMBER_TOKEN="NON_ADMIN_JWT"
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"revoke_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"key_id\": \"KEY_ID_HERE\"
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 403):**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin required"
+  }
+}
+```
+
+**Pass:** Non-admin user receives 403 FORBIDDEN. The key remains active and not revoked.
+
+**Fail / Common issues:**
+- Revocation succeeds -- the member may actually have an admin role. Verify the user's role via `GET /api/user-orgs`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Revoke auth key | API returns `revoked: key_id` and `machines_quarantined` count |
+| ST2 | Cascade quarantine | Machines registered with revoked key are set to `quarantined` status |
+| ST3 | Registration rejected | Revoked key returns `INVALID_KEY` (401) on registration attempt |
+| ST4 | Revoked key visibility | Key shows `revoked: true` in API and CLI list |
+| ST5 | Admin-only revocation | Non-admin gets `FORBIDDEN` (403) when attempting to revoke |

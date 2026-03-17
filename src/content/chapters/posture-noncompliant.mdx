@@ -1,0 +1,307 @@
+---
+title: "Policy Evaluation on Non-Compliant Machine"
+topic: "Posture Policies"
+order: 53
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that a machine failing posture checks is quarantined or flagged as non-compliant."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+When a machine sends a posture report and fails one or more policy checks, the server's behavior depends on the `posture_enforcement` mode set in `org_settings`:
+
+**"enforce" mode** (auto-quarantine):
+- If the machine is `online` and posture evaluation fails, the server sets `machines.status = 'quarantined'`
+- A `machine.auto_quarantine` audit event is logged to Loki
+- A realtime WebSocket event is broadcast: `{ table: 'machines', type: 'UPDATE', data: { id, status: 'quarantined' } }`
+- The posture-report response returns `quarantined: true`
+- If AI Operator mode is enabled for the org, the server may create `agent_commands` for auto-remediation (e.g., `enable_firewall`, `enable_disk_encryption`)
+
+**"monitor" mode** (log only):
+- The compliance evaluation runs and violations are recorded in `posture_reports`
+- The response returns `compliant: false` and lists violations
+- The machine status is NOT changed -- it remains `online`
+- `quarantined` in the response is `false`
+
+**"disabled" mode** (no evaluation):
+- The posture report is stored with `compliant: true` and empty violations
+- No policy evaluation occurs at all
+
+**Quarantine behavior:**
+- Quarantined machines still send heartbeats, but the heartbeat handler preserves the `quarantined` status and only updates `last_seen` (line 31 in `machine-heartbeat.ts`)
+- The heartbeat response for a quarantined machine returns `status: 'quarantined'`, `quarantined: true`, and an empty peer list
+- The Go client enters a QUARANTINE state and polls `POST /api/posture-report` every 60 seconds; if the device becomes compliant, the server sets status back to `online` and the client transitions to COMPLIANT, then reconnects
+
+**Auto-unquarantine:**
+- When a quarantined machine sends a posture report that passes all checks, the server sets `machines.status = 'online'` and logs a `machine.auto_unquarantine` audit event
+- This only happens in `enforce` mode
+
+**Important edge case:**
+- Machines with status `offline` are NOT quarantined even if non-compliant. The server only quarantines machines whose current status is `online` (line 103 in `posture-report.ts`).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard + API verification |
+| <MachineRef name="Linux-C" /> | Non-compliant machine (Linux VM without disk encryption, ClamAV, or firewall rules) |
+
+**Prerequisites:**
+- A posture policy exists with `require_disk_encryption = true`, `require_firewall = true`, and `require_antivirus = true` (created in Chapter 51)
+- Posture enforcement is set to `enforce` on the org (Chapter 51, ST3)
+- <MachineRef name="Linux-C" /> is connected and status is `online`
+
+---
+
+## ST1 -- Trigger Quarantine via Posture Report
+
+**What it verifies:** A connected Linux machine without disk encryption, firewall rules, or ClamAV is automatically quarantined when posture enforcement is in `enforce` mode.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, confirm the machine is online:
+
+```bash
+ztna status
+```
+
+2. Force a posture report by running:
+
+```bash
+ztna posture status
+```
+
+If the machine lacks LUKS encryption, has no iptables rules, and ClamAV is not running, the output should show:
+
+```
+Device Posture Status
+-------------------------------------
+OS:                linux/amd64
+Disk Encryption:   disabled
+Firewall:          disabled
+Antivirus:         disabled
+
+Compliance:        NON-COMPLIANT
+Violations:
+  - disk_encryption_required
+  - firewall_required
+  - antivirus_required
+```
+
+3. On <MachineRef name="Win-A" />, check the machine status:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$machineId = "LINUX_C_MACHINE_ID"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected behavior:**
+- The machine `status` is now `quarantined`
+- On the dashboard Machines page, the machine shows a quarantine badge
+
+**Pass:** Machine status changed from `online` to `quarantined` after the non-compliant posture report.
+
+**Fail / Common issues:**
+- Status still `online` -- check that `posture_enforcement` is `enforce` (not `monitor` or `disabled`). Query `org_settings` to verify.
+- Status `offline` -- the machine went offline before the posture report. Quarantine only applies to `online` machines.
+
+---
+
+## ST2 -- Verify Quarantined Machine Heartbeat Behavior
+
+**What it verifies:** A quarantined machine continues to heartbeat, but the server does not change its status back to `online` -- it stays quarantined.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, the client should still be running after quarantine. The agent enters the QUARANTINE state and continues polling.
+
+2. On <MachineRef name="Win-A" />, check the machine's `last_seen` timestamp:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$machineId = "LINUX_C_MACHINE_ID"
+
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+
+$result.data[0] | Select-Object status, last_seen
+```
+
+3. Wait 30 seconds and query again.
+
+**Expected behavior:**
+- `status` remains `quarantined`
+- `last_seen` updates (the heartbeat handler updates `last_seen` even for quarantined machines)
+- The heartbeat response to the client includes `quarantined: true` and an empty peer list
+
+**Pass:** Machine stays quarantined but `last_seen` advances, confirming heartbeats are still processed.
+
+**Fail / Common issues:**
+- Machine goes `offline` -- the client may have disconnected. Check `ztna status` on Linux-C.
+- Machine becomes `online` -- this should NOT happen unless a compliant posture report was sent. Check the posture report in ST3.
+
+---
+
+## ST3 -- Check Posture Report Violations in Database
+
+**What it verifies:** The `posture_reports` table contains the correct violation codes after a non-compliant evaluation.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, query the posture report:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$machineId = "LINUX_C_MACHINE_ID"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "<uuid>",
+      "machine_id": "<machine-id>",
+      "org_id": "<org-id>",
+      "os_version": "linux/amd64",
+      "disk_encrypted": false,
+      "firewall_enabled": false,
+      "antivirus_enabled": false,
+      "compliant": false,
+      "violations": [
+        "disk_encryption_required",
+        "firewall_required",
+        "antivirus_required"
+      ],
+      "reported_at": "2026-..."
+    }
+  ]
+}
+```
+
+The violation codes are generated by the posture-report handler:
+- `disk_encryption_required` -- when `policy.require_disk_encryption` is true and `body.disk_encrypted` is false
+- `firewall_required` -- when `policy.require_firewall` is true and `body.firewall_enabled` is false
+- `antivirus_required` -- when `policy.require_antivirus` is true and `body.antivirus_enabled` is false
+- `patch_age_exceeded (N > M days)` -- when `body.patch_age_days` exceeds `policy.max_patch_age_days`
+
+**Pass:** Violations array contains the expected codes matching the policy requirements and the machine's actual posture state.
+
+**Fail / Common issues:**
+- `violations` is empty -- the enabled policy may not have the expected requirements toggled on. Check the policy with `GET /api/db/posture_policies`.
+- `compliant` is true -- enforcement may be `disabled`, which skips evaluation and always stores `compliant: true`.
+
+---
+
+## ST4 -- Verify Monitor Mode Does NOT Quarantine
+
+**What it verifies:** In `monitor` mode, non-compliant machines are flagged but NOT quarantined.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, switch enforcement to `monitor`:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+$body = @{
+    action              = "update_org_settings"
+    org_id              = $orgId
+    posture_enforcement = "monitor"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/org-management" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+2. If <MachineRef name="Linux-C" /> is currently quarantined, it will not auto-unquarantine in monitor mode (auto-unquarantine only works in `enforce` mode). Manually set the machine back to `online` via the machine admin API or wait for a compliant report in enforce mode first. Alternatively, switch briefly to `enforce`, fix the posture issue, then switch to `monitor`.
+
+3. Once the machine is `online` in `monitor` mode, trigger a posture report:
+
+```bash
+ztna posture status
+```
+
+4. On <MachineRef name="Win-A" />, check the machine status:
+
+```powershell
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected behavior:**
+- `status` remains `online` (NOT quarantined)
+- The posture report shows `compliant: false` with violations
+- The `POST /api/posture-report` response returns `mode: "monitor"` and `quarantined: false`
+
+**Pass:** Non-compliant machine stays `online` in monitor mode. Violations are logged but not enforced.
+
+**Fail / Common issues:**
+- Machine gets quarantined -- enforcement may still be `enforce`. Verify org_settings.
+- Cached settings -- the heartbeat handler caches `org_settings` for 3600 seconds. If you just changed the mode, the cache may still have the old value. Wait or restart the API container.
+
+---
+
+## ST5 -- Verify Non-Compliant Machine Gets Empty Peer List
+
+**What it verifies:** When a machine is quarantined, its heartbeat response contains an empty peer list, effectively isolating it from the mesh network.
+
+**Steps:**
+
+1. Ensure <MachineRef name="Linux-C" /> is in `quarantined` status (switch enforcement back to `enforce` and trigger a non-compliant posture report if needed).
+
+2. On <MachineRef name="Linux-C" />, check peer connectivity:
+
+```bash
+ztna peers
+```
+
+**Expected behavior:**
+- The peer list is empty or the command indicates the machine is quarantined
+- The heartbeat handler (line 32 in `machine-heartbeat.ts`) returns `peers: []` for quarantined machines
+- Attempting to `ztna ping` another machine should fail because no peers are available
+
+3. Verify via API on <MachineRef name="Win-A" /> by checking the machine detail:
+
+```powershell
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+The `status` field should be `quarantined`.
+
+**Pass:** Quarantined machine receives no peers in heartbeat response and cannot communicate with other mesh nodes.
+
+**Fail / Common issues:**
+- Machine can still reach peers -- there may be a cached peer list from before quarantine. The WireGuard tunnel stays up until the next heartbeat cycle removes the peers.
+- Client crashes -- older client versions may not handle the quarantine state gracefully. Ensure v3.2.0+.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Non-compliant machines are auto-quarantined in `enforce` mode |
+| ST2 | Quarantined machines continue to heartbeat but stay quarantined |
+| ST3 | Violation codes are correctly stored in `posture_reports.violations` |
+| ST4 | `monitor` mode logs violations without quarantining |
+| ST5 | Quarantined machines receive empty peer lists (network isolation) |

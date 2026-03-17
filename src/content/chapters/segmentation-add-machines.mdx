@@ -1,0 +1,203 @@
+---
+title: "Add Machines to Group"
+topic: "Network Segmentation (Departments)"
+order: 32
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Add machines to segmentation groups and verify membership via dashboard and API."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Once segmentation groups exist, machines are assigned to them via the `segmentation_group_members` table. This is a child table that does not have its own `org_id` column -- it inherits org scope through its foreign key to `segmentation_groups`. The CRUD layer handles this via the `CHILD_TABLES_NO_ORG_COL` set in `db-crud.ts`.
+
+Key facts from the schema:
+- Each membership row has `id`, `group_id` (FK to `segmentation_groups.id`, ON DELETE CASCADE), `machine_id` (FK to `machines.id`, ON DELETE CASCADE), `added_at`
+- A `UNIQUE(group_id, machine_id)` constraint prevents adding the same machine twice to the same group
+- The dashboard provides both single-add (dropdown select) and bulk-add (checkbox list) flows
+- Writing requires admin or owner role
+- When inserting via API, pass `org_id` as a query parameter for auth scoping, but `org_id` is NOT included in the row body (the column does not exist on this table)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin dashboard + API testing |
+| <MachineRef name="Win-B" /> | Target machine to add to a group |
+| <MachineRef name="Linux-C" /> | Target machine to add to a group |
+
+**Prerequisite:** At least one segmentation group exists (e.g., `engineering` from Chapter 31).
+
+---
+
+## ST1 -- Add a Single Machine via Dashboard
+
+**What it verifies:** The single-add dialog on the Segmentation page inserts a row into `segmentation_group_members` with the correct `group_id` and `machine_id`.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/segmentation`.
+2. Find the `engineering` group card.
+3. Click the **Add** button (the small outline button with a "+" icon).
+4. In the dialog, select <MachineRef name="Win-B" /> from the machine dropdown.
+5. Click **Add to Group**.
+
+**Expected:** A toast "Machine added to group" appears. The group card refreshes showing "1 machines" in the badge. A table row appears with the machine name and the "Added" date.
+
+6. Verify the machine table inside the card shows:
+   - Machine: the name of <MachineRef name="Win-B" />
+   - Added: today's date
+
+**Pass:** Machine appears in the group member table. Badge count updates to 1.
+
+**Fail / Common issues:**
+- Dropdown is empty -- ensure <MachineRef name="Win-B" /> is registered and not in `pending` status. Only machines already in the group are filtered out.
+- Toast says "Failed" -- check that you are an admin. Members cannot modify group membership.
+
+---
+
+## ST2 -- Bulk Add Multiple Machines via Dashboard
+
+**What it verifies:** The Bulk Add dialog allows selecting multiple machines at once and inserts them in a loop.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, on the Segmentation page, find the `engineering` group card.
+2. Click the **Bulk Add** button.
+3. In the dialog, check the boxes for <MachineRef name="Win-A" /> and <MachineRef name="Linux-C" />.
+   - Note: <MachineRef name="Win-B" /> should not appear in the list since it was already added in ST1.
+4. Click **Add 2 Machines**.
+
+**Expected:** A toast "2 machine(s) added to group" appears. The group card now shows "3 machines" in the badge. The member table lists all three machines.
+
+5. Verify that clicking **Bulk Add** again shows either an empty list or a message "All machines are already in this group" (if no other machines exist in the org).
+
+**Pass:** Both machines added. Badge count is 3. The bulk add dialog correctly filters out already-added machines.
+
+---
+
+## ST3 -- Add Machine via API
+
+**What it verifies:** The CRUD insert endpoint for `segmentation_group_members` works correctly, including the special handling for child tables without an `org_id` column.
+
+**Steps:**
+1. First, get the group ID for the `finance` group (created in Chapter 31):
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&name=eq.finance" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+Note the `id` field from the response.
+
+2. Get the machine ID for <MachineRef name="Linux-C" />:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=id,name" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+Note the `id` for <MachineRef name="Linux-C" />.
+
+3. Add the machine to the group:
+```bash
+GROUP_ID="FINANCE_GROUP_ID"
+MACHINE_ID="LINUX_C_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"group_id\":\"$GROUP_ID\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid",
+    "group_id": "uuid",
+    "machine_id": "uuid",
+    "added_at": "..."
+  }
+}
+```
+
+Note: The response does NOT contain `org_id` because this column does not exist on the `segmentation_group_members` table.
+
+**Pass:** Insert succeeds. The response contains `group_id`, `machine_id`, and `added_at` but no `org_id`.
+
+---
+
+## ST4 -- Duplicate Membership Rejection
+
+**What it verifies:** The `UNIQUE(group_id, machine_id)` constraint prevents adding the same machine to the same group twice.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, repeat the same API call from ST3 (same group_id and machine_id):
+```bash
+curl -s -X POST "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"group_id\":\"$GROUP_ID\",\"machine_id\":\"$MACHINE_ID\"}" | python3 -m json.tool
+```
+
+**Expected:** The API returns an error due to the unique constraint violation:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "..."
+  }
+}
+```
+
+2. Via dashboard: open the **Add** dialog on the `finance` group. The dropdown should NOT show <MachineRef name="Linux-C" /> because the frontend filters out machines that are already members.
+
+**Pass:** API rejects duplicate insert. Dashboard dropdown hides already-added machines.
+
+---
+
+## ST5 -- List Group Members via API
+
+**What it verifies:** The CRUD select endpoint for `segmentation_group_members` returns members scoped to the correct group, using `org_id` for auth and `group_id` as a filter.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, list all members of the `engineering` group:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+ENG_GROUP_ID="ENGINEERING_GROUP_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID&group_id=eq.$ENG_GROUP_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected response:** An array of membership rows for all machines added to `engineering` in ST1 and ST2:
+```json
+{
+  "success": true,
+  "data": [
+    { "id": "...", "group_id": "...", "machine_id": "...", "added_at": "..." },
+    { "id": "...", "group_id": "...", "machine_id": "...", "added_at": "..." },
+    { "id": "...", "group_id": "...", "machine_id": "...", "added_at": "..." }
+  ]
+}
+```
+
+2. Verify the count matches the dashboard badge (should be 3 for `engineering`).
+
+3. Remove a member via dashboard: on the `engineering` group card, click the red trash icon next to one of the machines. Verify the toast "Machine removed from group" appears and the badge decrements.
+
+**Pass:** API returns correct members. Count matches dashboard. Remove works via the trash icon.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Single machine add via dashboard | Machine appears in group, badge increments |
+| ST2 | Bulk add via dashboard | Multiple machines added at once, already-added filtered out |
+| ST3 | API member insert | CRUD insert works for child table without org_id column |
+| ST4 | Duplicate rejection | UNIQUE constraint blocks double-add, dashboard hides duplicates |
+| ST5 | API member listing + removal | GET returns correct members, dashboard remove works |

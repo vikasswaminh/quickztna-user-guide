@@ -1,0 +1,328 @@
+---
+title: "Posture Report from Linux-C Client"
+topic: "Posture Policies"
+order: 52
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that the client sends posture data during registration and heartbeat — disk encryption, antivirus, firewall status."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The QuickZTNA client collects device posture data and reports it to the control plane in two ways:
+
+1. **During machine registration** (`POST /api/register-machine`) -- the client sends a `posture` object alongside the auth key and machine name. The backend evaluates posture against all enabled policies and stores a `posture_reports` row. The registration response includes `posture_compliant: true/false`.
+
+2. **Via the dedicated posture report endpoint** (`POST /api/posture-report`) -- the client sends posture data authenticated by `node_key`. The agent calls this automatically every 60 seconds during the MONITOR state and also when the user runs `ztna posture status`.
+
+3. **Via heartbeat** (`POST /api/machine-heartbeat`) -- the heartbeat response includes a `posture_check` boolean that tells the client whether posture checks are enabled for the org. If true, the agent runs `posture.Check()` and sends reports via the posture-report endpoint.
+
+The Go client's `posture.Check()` function (in `pkg/posture/posture.go`) performs platform-specific checks:
+
+**Linux checks:**
+- **Disk encryption**: runs `lsblk -o TYPE` looking for `crypt` entries (LUKS/dm-crypt), falls back to `dmsetup table --target crypt`
+- **Firewall**: checks `iptables -L -n` for rules beyond default chain headers, then falls back to `ufw status` looking for "active"
+- **Antivirus**: checks `systemctl is-active clamav-daemon` and `clamav-freshclam`
+
+**Windows checks:**
+- **Disk encryption**: `Get-BitLockerVolume -MountPoint C:` -- checks `ProtectionStatus` is "On" or "1"
+- **Firewall**: `(Get-NetFirewallProfile -Profile Domain,Public,Private).Enabled -contains 'True'`
+- **Antivirus**: `Get-MpComputerStatus | Select-Object -ExpandProperty RealTimeProtectionEnabled`
+
+**macOS checks:**
+- **Disk encryption**: `fdesetup status` -- looks for "FileVault is On"
+- **Firewall**: `/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate` -- looks for "enabled"
+- **Antivirus**: always true (macOS has XProtect built-in)
+
+The `posture_reports` table stores:
+- `machine_id` (UUID, UNIQUE -- one report per machine, upserted on each report)
+- `os_version` (TEXT) -- e.g., `linux/amd64`
+- `disk_encrypted`, `firewall_enabled`, `antivirus_enabled` (BOOLEAN)
+- `antivirus_name` (TEXT, nullable)
+- `last_patch_date` (TIMESTAMPTZ, nullable)
+- `compliant` (BOOLEAN) -- result of policy evaluation
+- `violations` (JSONB) -- array of violation codes like `["disk_encryption_required", "firewall_required"]`
+- `reported_at` (TIMESTAMPTZ)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard + API verification |
+| <MachineRef name="Linux-C" /> | Client machine that sends posture reports |
+
+Ensure <MachineRef name="Linux-C" /> is registered and connected (`ztna status` shows connected). Ensure posture enforcement is set to at least `monitor` on the org (see Chapter 51, ST3).
+
+---
+
+## ST1 -- Run Local Posture Check via CLI
+
+**What it verifies:** The `ztna posture status` command runs local device posture checks and displays results.
+
+**Steps:**
+
+On <MachineRef name="Linux-C" />, run:
+
+```bash
+ztna posture status
+```
+
+**Expected output (table format):**
+
+```
+Device Posture Status
+-------------------------------------
+OS:                linux/amd64
+Disk Encryption:   enabled
+Firewall:          disabled
+Antivirus:         disabled
+
+Compliance:        NON-COMPLIANT
+Violations:
+  - firewall_required
+  - antivirus_required
+```
+
+The exact values depend on the actual state of the Linux machine. If the machine is not connected, you will see:
+
+```
+Compliance:        (not connected -- run 'ztna up' first)
+```
+
+**Pass:** The command outputs posture data with correct OS, and each check reflects the actual device state.
+
+**Fail / Common issues:**
+- "not connected" -- run `ztna up` first. The command needs an active connection to get server-side compliance status.
+- All checks show "disabled" on a Linux VM -- this is expected if LUKS is not configured, iptables has no rules, and ClamAV is not installed.
+
+---
+
+## ST2 -- Run Posture Check with JSON Output
+
+**What it verifies:** The `--json` flag produces machine-readable JSON output with compliance status from the server.
+
+**Steps:**
+
+On <MachineRef name="Linux-C" />, run:
+
+```bash
+ztna posture status --json
+```
+
+**Expected output:**
+
+```json
+{
+  "os_version": "linux/amd64",
+  "disk_encrypted": false,
+  "firewall_enabled": false,
+  "antivirus_enabled": false,
+  "compliant": false,
+  "violations": [
+    "disk_encryption_required",
+    "firewall_required",
+    "antivirus_required"
+  ]
+}
+```
+
+The `compliant` and `violations` fields are only present when the client is connected and the server-side posture report succeeds. If the machine is offline, only the four local fields appear.
+
+**Pass:** JSON output includes all four posture fields, plus `compliant` and `violations` from the server when connected.
+
+**Fail / Common issues:**
+- No `compliant` field -- the client is not connected, or the node_key is invalid. Check `ztna status`.
+- Empty violations array with `compliant: true` -- no enabled posture policy exists for the org, or enforcement is `disabled`. When enforcement is `disabled`, the server always returns `compliant: true` with empty violations.
+
+---
+
+## ST3 -- Verify Posture Data Sent During Registration
+
+**What it verifies:** When a machine registers via auth key, the client sends posture data and the response includes `posture_compliant`.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, create an auth key via the dashboard (Settings page) or API.
+
+2. On <MachineRef name="Linux-C" />, register with the auth key (if testing a fresh registration):
+
+```bash
+ztna login --auth-key=tskey-auth-XXXX
+```
+
+The registration request sent by the client to `POST /api/register-machine` includes a `posture` object:
+
+```json
+{
+  "auth_key": "tskey-auth-XXXX",
+  "name": "linux-c",
+  "os": "linux",
+  "posture": {
+    "os_version": "linux/amd64",
+    "disk_encrypted": false,
+    "antivirus_enabled": false,
+    "antivirus_name": null,
+    "firewall_enabled": false,
+    "last_patch_date": null
+  }
+}
+```
+
+3. Verify the registration response on the API side. On <MachineRef name="Win-A" />, fetch the posture report for the machine:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+$machineId = "THE_MACHINE_ID"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "<uuid>",
+      "machine_id": "<machine-id>",
+      "org_id": "<org-id>",
+      "os_version": "linux/amd64",
+      "disk_encrypted": false,
+      "firewall_enabled": false,
+      "antivirus_enabled": false,
+      "compliant": false,
+      "violations": ["Disk encryption required", "Firewall required"],
+      "reported_at": "2026-..."
+    }
+  ]
+}
+```
+
+Note: the violation messages from the registration handler use human-readable strings ("Disk encryption required") rather than the code-style strings used by the posture-report handler ("disk_encryption_required").
+
+**Pass:** A `posture_reports` row exists for the machine with correct posture data and compliance evaluation.
+
+**Fail / Common issues:**
+- No posture report row -- the client did not send the `posture` object during registration. Check client version (posture reporting requires v3.2.0+).
+- `compliant: true` despite missing disk encryption -- no enabled policy exists for the org. Create one first (Chapter 51).
+
+---
+
+## ST4 -- Verify Periodic Posture Reporting via Agent
+
+**What it verifies:** The connected agent automatically sends posture reports to `POST /api/posture-report` and the server stores updated data.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, ensure the client is connected:
+
+```bash
+ztna up
+ztna status
+```
+
+2. Wait at least 60 seconds (the agent's posture reporting interval in the MONITOR state).
+
+3. On <MachineRef name="Win-A" />, check the posture report timestamp:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$machineId = "THE_MACHINE_ID"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+4. Note the `reported_at` timestamp. Wait another 60 seconds and query again.
+
+**Expected behavior:**
+- The `reported_at` timestamp updates on each reporting cycle
+- Since `posture_reports` has a UNIQUE constraint on `machine_id`, the row is upserted (not duplicated) -- the handler uses `ON CONFLICT (machine_id) DO UPDATE`
+- The posture values reflect the current device state
+
+**Pass:** The `reported_at` timestamp advances, confirming the agent is periodically reporting posture.
+
+**Fail / Common issues:**
+- Timestamp not changing -- the heartbeat response `posture_check` field may be `false` (enforcement is `disabled`). Set enforcement to `monitor` or `enforce`.
+- Multiple rows for the same machine -- this should not happen due to the UNIQUE constraint added in migration `002_quarantine_and_fixes.sql`.
+
+---
+
+## ST5 -- Verify Posture Report API Response Shape
+
+**What it verifies:** Directly calling `POST /api/posture-report` returns the correct envelope with `compliant`, `violations`, `quarantined`, and `mode` fields.
+
+**Steps:**
+
+This endpoint is normally called by the Go client using the machine's `node_key`. For manual testing, you need the raw node key (not the hash). If you captured the node key during registration, use it here:
+
+```powershell
+$body = @{
+    node_key          = "nodekey-XXXX"
+    os_version        = "linux/amd64"
+    disk_encrypted    = $false
+    firewall_enabled  = $true
+    antivirus_enabled = $false
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/posture-report" `
+    -Method POST `
+    -Headers @{ "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+Note: this endpoint uses **node_key authentication**, not JWT. No `Authorization` header is needed.
+
+**Expected response (enforcement mode = "enforce"):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "compliant": false,
+    "violations": ["disk_encryption_required", "antivirus_required"],
+    "quarantined": true,
+    "mode": "enforce"
+  }
+}
+```
+
+**Expected response (enforcement mode = "disabled"):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "compliant": true,
+    "violations": [],
+    "quarantined": false,
+    "mode": "disabled"
+  }
+}
+```
+
+When enforcement is `disabled`, the server always returns `compliant: true` regardless of actual posture data. The report is still stored.
+
+**Pass:** Response includes all four fields (`compliant`, `violations`, `quarantined`, `mode`) and values match the enforcement mode and policy evaluation.
+
+**Fail / Common issues:**
+- 400 `MISSING_NODE_KEY` -- the `node_key` field is missing from the request body
+- 401 `UNAUTHORIZED` -- the node key is invalid or has been rotated. The server hashes the key with SHA-256 and looks up `machines.node_key_hash`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | CLI `ztna posture status` runs local posture checks and shows server compliance |
+| ST2 | JSON output mode works for scripting and automation |
+| ST3 | Posture data is sent during machine registration and stored in `posture_reports` |
+| ST4 | The agent automatically reports posture every 60 seconds while connected |
+| ST5 | The `POST /api/posture-report` endpoint returns the correct response shape with mode-aware compliance |

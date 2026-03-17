@@ -1,0 +1,354 @@
+---
+title: "ACL Rule Creation (Deny)"
+topic: "Access Control Lists (ACLs)"
+order: 27
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Create deny rules and verify they block traffic between specified machines."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Deny rules explicitly block traffic between machines. The ACL engine in `acl-evaluate.ts` evaluates rules in **priority order** (ascending -- lower number = higher priority) and uses **first-match-wins** logic (line 121: `break; // First match wins`). This means:
+
+- A deny rule with priority 10 overrides an allow rule with priority 100
+- If no rule matches at all, the default decision is **deny** (zero-trust)
+- The `action` field must be exactly `"deny"` (CHECK constraint: `action IN ('allow', 'deny')`)
+
+Deny rules use the same selector syntax as allow rules: `*`, machine ID, tailnet IP, `tag:name`, `user:id`, `group:name`, or CIDR notation.
+
+Beyond explicit deny rules, the evaluation engine also auto-denies traffic when:
+- Either machine has status `quarantined` or `pending` (line 50-60)
+- The organization is in `lockdown_mode` (line 82-90)
+- Source machine fails posture compliance (line 126-135)
+- Source machine has an active threat intelligence block (line 174-183)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + API testing (admin) |
+| <MachineRef name="Win-B" /> | Destination machine (will be blocked) |
+| <MachineRef name="Linux-C" /> | Source machine (will attempt blocked connections) |
+
+Prerequisite: Ensure an allow-all rule exists (source `*`, destination `*`, action `allow`, priority 100) so you can observe deny rules overriding it.
+
+---
+
+## ST1 -- Create a Deny Rule via Dashboard
+
+**What it verifies:** An admin can create a deny rule from the ACLs page, and the rule card shows the destructive (red) badge.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/acls`.
+2. Click the **+ Add Rule** button.
+3. Fill in the form:
+   - Name: `Deny-WinB-SSH`
+   - Source: `*`
+   - Destination: the machine ID or tailnet IP of <MachineRef name="Win-B" />
+   - Protocol: `tcp`
+   - Ports: `22`
+   - Action: select **deny**
+   - (Priority will default to 100)
+4. Click **Save**.
+
+**Expected behavior:**
+- Success toast: "Rule added"
+- The rule appears in the list with a **red "deny" badge** (the dashboard uses `variant="destructive"` for deny actions)
+- Fields match: Source `*`, Destination is the Win-B identifier, Ports `22`, Protocol TCP
+
+5. Verify via the evaluation API:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 22,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "allowed": false,
+    "decision": "deny",
+    "matched_rule": {
+      "name": "Deny-WinB-SSH",
+      "action": "deny"
+    }
+  }
+}
+```
+
+**Pass:** Rule created with deny badge. Evaluation API returns `allowed: false` with the deny rule as the matched rule.
+
+**Fail / Common issues:**
+- If `allowed: true` is returned, the deny rule has a higher priority number (lower precedence) than an existing allow rule. Check priorities.
+
+---
+
+## ST2 -- Verify Denied Traffic is Blocked
+
+**What it verifies:** A deny rule actually prevents connectivity when tested end-to-end.
+
+**Prerequisites:** The deny rule from ST1 exists (blocking port 22 to Win-B).
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, attempt to connect to <MachineRef name="Win-B" /> on port 22:
+```bash
+ztna ping Win-B
+```
+
+Note: `ztna ping` uses ICMP-like probes over the WireGuard tunnel. Whether it is blocked depends on the rule's protocol and port configuration. If the deny rule targets only port 22/tcp, a general ping may still succeed.
+
+2. Test the specific blocked port using the CLI's ACL test command:
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 22 --proto tcp
+```
+
+**Expected output:**
+```
+DENIED: Linux-C -> Win-B:22/tcp
+  Denied by rule: Deny-WinB-SSH
+```
+
+3. Now test a port that is NOT denied (e.g., port 443):
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 443 --proto tcp
+```
+
+**Expected output:**
+```
+ALLOWED: Linux-C -> Win-B:443/tcp
+  Matched rule: <name of the allow-all rule>
+```
+
+**Pass:** Port 22 is denied with the correct rule name. Port 443 is allowed (falls through to the allow-all rule).
+
+**Fail / Common issues:**
+- If both ports are denied, check whether a broader deny rule exists with higher priority (lower number).
+- "cannot resolve source/destination" -- the machine name must match exactly as shown in `ztna peers` or the control plane. You can also use the machine UUID directly.
+
+---
+
+## ST3 -- Deny Overrides Allow (Priority Test)
+
+**What it verifies:** A deny rule with a lower priority number (higher precedence) overrides an allow rule with a higher priority number.
+
+**Steps:**
+1. First, ensure an allow rule exists:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Allow-All-HTTP",
+    "source": "*",
+    "destination": "*",
+    "ports": "80,443",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 100
+  }'
+```
+
+2. Create a deny rule with higher precedence (lower priority number):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Deny-HTTP-Override",
+    "source": "*",
+    "destination": "*",
+    "ports": "80",
+    "protocol": "tcp",
+    "action": "deny",
+    "priority": 10
+  }'
+```
+
+3. Evaluate port 80 (should be denied):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 80,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** `allowed: false`, `matched_rule.name`: `"Deny-HTTP-Override"`, `matched_rule.priority`: 10.
+
+4. Evaluate port 443 (should be allowed -- the deny rule only covers port 80):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 443,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** `allowed: true`, `matched_rule.name`: `"Allow-All-HTTP"`, `matched_rule.priority`: 100.
+
+5. Also verify via CLI:
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 80 --proto tcp
+```
+Expected: `DENIED: Linux-C -> Win-B:80/tcp`
+
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 443 --proto tcp
+```
+Expected: `ALLOWED: Linux-C -> Win-B:443/tcp`
+
+**Pass:** Port 80 is denied (priority 10 deny wins). Port 443 is allowed (priority 100 allow, because the deny rule's ports field only includes 80).
+
+**Fail / Common issues:**
+- Both ports denied -- the deny rule's ports field is `*` instead of `80`. Check the exact rule configuration.
+- Both ports allowed -- the deny rule may have a higher priority number than the allow rule. Priority 10 must come before priority 100.
+
+---
+
+## ST4 -- Deny Specific Port While Allowing Others
+
+**What it verifies:** A deny rule can block a specific port while other ports on the same machine remain accessible.
+
+**Steps:**
+1. Create two rules (if not already from ST3):
+   - Allow rule: source `*`, destination `*`, ports `*`, protocol `*`, action `allow`, priority 100
+   - Deny rule: source `*`, destination `*`, ports `3389`, protocol `tcp`, action `deny`, priority 20
+
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Deny-RDP",
+    "source": "*",
+    "destination": "*",
+    "ports": "3389",
+    "protocol": "tcp",
+    "action": "deny",
+    "priority": 20
+  }'
+```
+
+2. Test denied port (3389):
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 3389 --proto tcp
+```
+Expected: `DENIED`
+
+3. Test allowed port (443):
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 443 --proto tcp
+```
+Expected: `ALLOWED`
+
+4. Test allowed port (22):
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 22 --proto tcp
+```
+Expected: `ALLOWED` (unless another deny rule blocks it)
+
+**Pass:** Only port 3389 is denied. All other ports are allowed by the catch-all allow rule.
+
+**Fail / Common issues:**
+- All ports denied -- verify the allow-all rule exists and is enabled. Check with `ztna acl list`.
+- Port 3389 allowed -- the deny rule may have a higher priority number than the allow rule, or it may be disabled.
+
+---
+
+## ST5 -- Verify Deny Rules in CLI List
+
+**What it verifies:** Deny rules are correctly displayed in `ztna acl list` output with their action field set to `deny`.
+
+**Steps:**
+1. Ensure at least one deny rule and one allow rule exist (from previous sub-tests).
+
+2. On <MachineRef name="Win-A" />, run:
+```powershell
+ztna acl list
+```
+
+**Expected output:**
+```
+ACL Rules (N):
+
+  [1] {
+    "id": "...",
+    "name": "Deny-HTTP-Override",
+    "source": "*",
+    "destination": "*",
+    "ports": "80",
+    "protocol": "tcp",
+    "action": "deny",
+    "priority": 10,
+    "enabled": true
+  }
+  [2] {
+    "id": "...",
+    "name": "Deny-RDP",
+    ...
+    "action": "deny",
+    "priority": 20,
+    ...
+  }
+  [3] {
+    "id": "...",
+    "name": "Allow-All-HTTP",
+    ...
+    "action": "allow",
+    "priority": 100,
+    ...
+  }
+```
+
+3. Verify:
+   - Rules are numbered sequentially
+   - Deny rules show `"action": "deny"`
+   - The total count in the header is correct
+   - Rules appear in the order the backend returns them (typically by priority)
+
+4. On the dashboard (`https://login.quickztna.com/acls`), verify:
+   - Deny rules display a **red badge** labeled "deny"
+   - Allow rules display a **default/blue badge** labeled "allow"
+   - Priority numbers are visible on each rule card
+
+**Pass:** CLI output shows deny rules with `"action": "deny"`. Dashboard shows red badges for deny rules. Rule count and ordering are consistent between CLI and dashboard.
+
+**Fail / Common issues:**
+- Rules appear in unexpected order -- the CLI fetches rules from the backend, which returns them ordered by priority (ASC). The dashboard also orders by priority.
+- Missing rules -- check that all rules belong to the same org. Run `ztna status` to confirm which org the CLI is authenticated to.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Deny rules can be created via dashboard with correct visual indicators |
+| ST2 | Denied traffic is blocked -- verified via `ztna acl test` |
+| ST3 | Lower priority number (higher precedence) deny rules override allow rules |
+| ST4 | Port-specific deny rules block only the targeted port |
+| ST5 | Deny rules display correctly in CLI and dashboard with proper action labels |

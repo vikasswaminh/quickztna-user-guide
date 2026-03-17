@@ -1,0 +1,203 @@
+---
+title: "Role Change (Member to Admin)"
+topic: "Users & Invitations"
+order: 48
+machines: ["Win-A"]
+summary: "Change member roles between member and admin — verify permissions change immediately."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Organization admins can change the role of other members. The backend (`handlers/org-management.ts`, action `change_role`) implements:
+
+- **Endpoint**: `POST /api/org-management` with `action: "change_role"`, `org_id`, `target_user_id`, `new_role`
+- **Valid roles**: `owner`, `admin`, `member`, `auditor` (enforced by both the `org_members` table CHECK constraint and handler validation)
+- **Authorization**: Only admins and owners can change roles (`isOrgAdmin` check)
+- **Self-change blocked**: A user cannot change their own role — returns `FORBIDDEN` with "Can't change your own role"
+- **Owner promotion restricted**: Only users with the `owner` role can promote someone to `owner`
+- **Realtime broadcast**: After a role change, a `members:UPDATE` event is broadcast to all connected WebSocket clients
+- **Audit logging**: The change is logged via Loki with event `member.role_changed`
+
+The frontend (`UsersPage.tsx`) exposes this via a **Change Role** option in the actions dropdown menu on each member row. The dialog offers three selectable roles: `Admin`, `Member`, and `Auditor`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin/Owner browser session |
+
+Prerequisites: The organization must have at least two members — one admin/owner (you) and one member whose role you will change. Complete Chapters 46-47 first to have a second member in the org.
+
+---
+
+## ST1 — Promote Member to Admin via Dashboard
+
+**What it verifies:** An admin can change a member's role to admin using the UI, and the change reflects immediately.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as an org admin or owner.
+2. Navigate to the **Users** page.
+3. Find a member with the `member` role badge in the active members table.
+4. Click the three-dot menu icon (far right of their row).
+5. Select **Change Role**.
+6. In the dialog, change the role dropdown from `Member` to `Admin`.
+7. Click **Update Role**.
+
+**Expected behavior:**
+- Toast: "Role updated"
+- The dialog closes
+- The member's role badge in the table changes from `member` to `admin` (no page refresh needed)
+
+**Pass:** Role badge updates to `admin` immediately. The member now has admin privileges.
+
+**Fail / Common issues:**
+- "Failed to update role" — check browser dev tools Network tab. The PATCH request to `/api/db/org_members` should include `{ "role": "admin" }`.
+- Three-dot menu not visible — the target member may be an `owner`, or you may be viewing your own row. The menu is hidden for owners and for the current user's own row.
+
+---
+
+## ST2 — Demote Admin Back to Member
+
+**What it verifies:** An admin can be demoted back to member, and the role change reflects immediately.
+
+**Steps:**
+1. On the Users page, find the user you just promoted to `admin` in ST1.
+2. Click the three-dot menu and select **Change Role**.
+3. Change the role dropdown to `Member`.
+4. Click **Update Role**.
+
+**Expected behavior:**
+- Toast: "Role updated"
+- Role badge changes from `admin` back to `member`
+
+**Pass:** Role reverted to `member`. The user no longer has admin privileges.
+
+**Fail / Common issues:**
+- Same failure modes as ST1. Verify the PATCH request body contains `{ "role": "member" }`.
+
+---
+
+## ST3 — Change Role via API (curl)
+
+**What it verifies:** The `change_role` action works correctly through the API with proper validation.
+
+**Steps:**
+1. Get your access token and org ID.
+2. Get the `user_id` of the target member (visible in the `get_org_members` RPC response or by inspecting the Users page network requests).
+3. Send the role change request:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"change_role","org_id":"<org_id>","target_user_id":"<user_id>","new_role":"auditor"}'
+```
+
+**Expected behavior:**
+- HTTP 200
+- Response body:
+```json
+{
+  "success": true,
+  "data": {
+    "user_id": "<user_id>",
+    "role": "auditor"
+  }
+}
+```
+
+**Pass:** Response confirms the new role. Refreshing the Users page shows the `auditor` badge on that member.
+
+**Fail / Common issues:**
+- HTTP 400 with `MISSING_FIELDS` — ensure all three fields (`org_id`, `target_user_id`, `new_role`) are present.
+- HTTP 400 with `INVALID_ROLE` — the `new_role` value must be exactly one of: `owner`, `admin`, `member`, `auditor`.
+- HTTP 403 with `FORBIDDEN` — you are not an admin/owner of this org, or you are trying to change your own role.
+
+---
+
+## ST4 — Self Role Change Blocked
+
+**What it verifies:** A user cannot change their own role (prevents accidental self-demotion or unauthorized self-promotion).
+
+**Steps:**
+1. Attempt to change your own role via API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"change_role","org_id":"<org_id>","target_user_id":"<your_own_user_id>","new_role":"member"}'
+```
+
+**Expected behavior:**
+- HTTP 400
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Can't change your own role"
+  }
+}
+```
+
+**Dashboard note:** The three-dot menu does not appear on your own row in the Users page, so this scenario cannot happen through the UI — only through direct API calls.
+
+**Pass:** Self role change is rejected with a clear error message.
+
+**Fail / Common issues:**
+- Returns 200 — the self-change guard (`target_user_id === user.user_id`) is missing or broken.
+
+---
+
+## ST5 — Owner Promotion Restricted to Owners
+
+**What it verifies:** Only an `owner` can promote someone to the `owner` role. An `admin` cannot do this.
+
+**Steps:**
+1. Log in as a user who has the `admin` role (not `owner`) in the org.
+2. Attempt to promote a member to owner via API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <admin_access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"change_role","org_id":"<org_id>","target_user_id":"<member_user_id>","new_role":"owner"}'
+```
+
+**Expected behavior:**
+- HTTP 403
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Only owners can promote to owner role"
+  }
+}
+```
+
+3. Now log in as the org `owner` and send the same request.
+
+**Expected behavior (as owner):**
+- HTTP 200
+- Response confirms the target user now has the `owner` role
+
+**Pass:** Admin is blocked from granting owner. Owner can grant owner.
+
+**Fail / Common issues:**
+- Admin can promote to owner — the caller-role check is missing. The handler must verify `callerRole?.role === 'owner'` before allowing `new_role === 'owner'`.
+- The `owner` role does not appear in the frontend dropdown — by design, the frontend Change Role dialog only shows `Admin`, `Member`, and `Auditor`. Owner promotion is an API-only operation.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Dashboard promote member to admin | Role badge changes to `admin`, toast confirmation |
+| ST2 | Dashboard demote admin to member | Role badge reverts to `member` |
+| ST3 | API `change_role` to auditor | 200 response with new role, page reflects change |
+| ST4 | Self role change blocked | 400 `FORBIDDEN` — "Can't change your own role" |
+| ST5 | Owner promotion restriction | Admin gets 403, only owner can promote to owner |

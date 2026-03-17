@@ -1,0 +1,479 @@
+---
+title: "ACL Validation & Syntax Errors"
+topic: "Access Control Lists (ACLs)"
+order: 29
+machines: ["Win-A"]
+summary: "Verify ACL input validation — invalid ports, malformed CIDRs, missing fields, duplicate rules, and protocol validation."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+ACL rules are validated at two levels:
+
+1. **CRUD layer** (`db-crud.ts`) -- enforces writable columns via a whitelist. For `acl_rules`, the allowed columns are: `name`, `source`, `destination`, `ports`, `protocol`, `action`, `priority`, `enabled`, `updated_at`, `created_by`, `expires_at`, `time_start`, `time_end`. Any column not in this list is silently dropped.
+
+2. **Dry-run validation** (`POST /api/acl-validate`, handler: `acl-validate.ts`) -- accepts `proposed_rules` and validates syntax without applying changes. It checks:
+   - `source` is present (required)
+   - `destination` is present (required)
+   - `action` is `"allow"` or `"deny"` (required)
+   - `priority` is a non-negative number (if provided)
+
+3. **Database constraints** -- the `acl_rules` table has a CHECK constraint: `action IN ('allow', 'deny')`. The `name` column is `NOT NULL`. The `org_id` column is `NOT NULL` with a foreign key to `organizations`.
+
+The `acl-validate` endpoint also performs **impact analysis**: it simulates the proposed rules against all machine pairs and reports which connections would change from allow-to-deny or deny-to-allow.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + curl for validation tests |
+
+All tests use the API directly since validation is a backend concern.
+
+---
+
+## ST1 -- Invalid Port Range
+
+**What it verifies:** The evaluation engine gracefully handles malformed port specifications in rules, and the port parser skips invalid entries.
+
+**Steps:**
+1. Create a rule with an invalid port range (start greater than end):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Bad-Port-Range",
+    "source": "*",
+    "destination": "*",
+    "ports": "9000-8000",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 200
+  }'
+```
+
+The CRUD layer will accept this (it does not validate port syntax). The rule is stored in the database.
+
+2. Evaluate traffic on port 8500 against this rule:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "SOURCE_ID",
+    "destination_machine_id": "DEST_ID",
+    "port": 8500,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** The port parser in `acl-evaluate.ts` (line 250-252) checks `start > end` and skips the entry with `continue`. So port `8500` will NOT match this rule. The evaluation falls through to the next rule or default deny.
+
+3. Test with out-of-range ports (above 65535):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Out-Of-Range-Port",
+    "source": "*",
+    "destination": "*",
+    "ports": "70000",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 201
+  }'
+```
+
+4. Evaluate on port 70000:
+
+**Expected:** The port parser checks `p >= 1 && p <= 65535` (line 258) and skips invalid ports. The rule will never match any traffic.
+
+5. Test with non-numeric port value:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Non-Numeric-Port",
+    "source": "*",
+    "destination": "*",
+    "ports": "http",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 202
+  }'
+```
+
+**Expected:** The rule is stored (CRUD does not validate port syntax), but `parseInt("http")` returns `NaN`, which fails the `!isNaN(p)` check. The rule never matches.
+
+**Pass:** Rules with invalid port specifications are stored but never match traffic. The evaluation engine does not crash on malformed ports.
+
+**Fail / Common issues:**
+- If the rule unexpectedly matches, verify no other wildcard rule with ports `*` exists at a higher priority.
+
+---
+
+## ST2 -- Malformed Source/Destination Selectors
+
+**What it verifies:** Rules with malformed CIDR notation or invalid selectors are stored but do not match any machines during evaluation.
+
+**Steps:**
+1. Create a rule with a malformed CIDR:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Bad-CIDR",
+    "source": "999.999.999.0/24",
+    "destination": "*",
+    "ports": "*",
+    "protocol": "*",
+    "action": "allow",
+    "priority": 300
+  }'
+```
+
+2. Evaluate:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "SOURCE_ID",
+    "destination_machine_id": "DEST_ID"
+  }'
+```
+
+**Expected:** The rule does not match. The CIDR matcher in `acl-evaluate.ts` converts IP octets with `parseInt` and checks `octet < 0 || octet > 255` (line 239). An IP like `999.999.999.0` returns `null` from `ipToNumber()`, causing `ipInCidr()` to return `false`.
+
+3. Test with an invalid prefix length:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Bad-Prefix",
+    "source": "100.64.0.0/99",
+    "destination": "*",
+    "ports": "*",
+    "protocol": "*",
+    "action": "allow",
+    "priority": 301
+  }'
+```
+
+**Expected:** The prefix check `prefix < 0 || prefix > 32` (line 224) rejects it. The rule never matches.
+
+4. Test with an unresolvable selector (not a UUID, not an IP, not a tag/user/group prefix, not a CIDR):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Unknown-Selector",
+    "source": "not-a-valid-selector",
+    "destination": "*",
+    "ports": "*",
+    "protocol": "*",
+    "action": "allow",
+    "priority": 302
+  }'
+```
+
+**Expected:** The `matchesTarget()` function checks each selector pattern in order (`*`, machine ID, IP, `tag:`, `user:`, `group:`, CIDR) and returns `false` if none match. The rule is stored but inert.
+
+**Pass:** Malformed CIDRs, invalid prefixes, and unrecognized selectors are accepted by the CRUD layer but never match during evaluation. No server errors or crashes.
+
+**Fail / Common issues:**
+- If the evaluation endpoint returns a 500 error, that would indicate a bug in the parser. Report it. The current implementation handles all edge cases gracefully.
+
+---
+
+## ST3 -- Missing Required Fields (CRUD Insert)
+
+**What it verifies:** The CRUD endpoint and database constraints reject ACL rules that are missing required fields.
+
+**Steps:**
+1. Missing `name` (NOT NULL in the database):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source": "*",
+    "destination": "*",
+    "action": "allow"
+  }'
+```
+
+**Expected:** 500 or 400 error -- PostgreSQL rejects the insert because `name` is NOT NULL.
+
+2. Missing `org_id`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "name": "No-Org",
+    "source": "*",
+    "destination": "*",
+    "action": "allow"
+  }'
+```
+
+**Expected:** 400 error -- the CRUD handler requires `org_id` for org-scoped tables.
+
+3. Missing `source` and `destination` (NOT NULL):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "No-Source-Dest",
+    "action": "allow"
+  }'
+```
+
+**Expected:** Database error -- `source` and `destination` are NOT NULL.
+
+4. Test the dry-run validation endpoint with missing fields:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-validate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "proposed_rules": [
+      { "destination": "*", "ports": "*", "protocol": "*", "action": "allow", "priority": 100 }
+    ]
+  }'
+```
+
+**Expected:** 400 error with code `VALIDATION_ERROR`, details array includes `"Rule 0: missing source"`.
+
+5. Test with invalid action value:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-validate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "proposed_rules": [
+      { "source": "*", "destination": "*", "ports": "*", "protocol": "*", "action": "block", "priority": 100 }
+    ]
+  }'
+```
+
+**Expected:** 400 error with `VALIDATION_ERROR`, details: `"Rule 0: action must be 'allow' or 'deny'"`.
+
+**Pass:** Missing `name`, `org_id`, `source`, or `destination` are rejected. The validate endpoint catches missing source, missing destination, and invalid action values with specific error messages.
+
+**Fail / Common issues:**
+- If missing `name` returns 200 with a null name, the database is not enforcing NOT NULL. Check the migration has been applied.
+- The CRUD layer silently drops unknown columns but does NOT validate required columns -- that is the database's job.
+
+---
+
+## ST4 -- Invalid Protocol Value
+
+**What it verifies:** Rules with non-standard protocol values are stored but only match if the evaluation request uses the exact same protocol string.
+
+**Steps:**
+1. Create a rule with an invalid protocol:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Invalid-Protocol",
+    "source": "*",
+    "destination": "*",
+    "ports": "*",
+    "protocol": "xyz",
+    "action": "allow",
+    "priority": 400
+  }'
+```
+
+**Expected:** The CRUD layer accepts this -- there is no CHECK constraint on the `protocol` column in the database (unlike `action`). The rule is stored with `protocol: "xyz"`.
+
+2. Evaluate with protocol `tcp`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "SOURCE_ID",
+    "destination_machine_id": "DEST_ID",
+    "port": 80,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** The rule does NOT match. Line 116 of `acl-evaluate.ts`: `if (rule.protocol !== '*' && rule.protocol !== requestProtocol) continue;` -- `"xyz" !== "tcp"`, so it skips.
+
+3. Test the database constraint on `action`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Invalid-Action",
+    "source": "*",
+    "destination": "*",
+    "ports": "*",
+    "protocol": "tcp",
+    "action": "block",
+    "priority": 401
+  }'
+```
+
+**Expected:** Database error -- the CHECK constraint `action IN ('allow', 'deny')` rejects `"block"`.
+
+4. Test valid protocol values. The evaluation engine recognizes these protocol strings:
+   - `"tcp"` -- matches only TCP traffic
+   - `"udp"` -- matches only UDP traffic
+   - `"icmp"` -- matches only ICMP traffic
+   - `"*"` -- matches all protocols (wildcard)
+
+**Pass:** Invalid protocol strings are stored but never match standard traffic. Invalid action values are rejected by the database. Valid protocols (`tcp`, `udp`, `icmp`, `*`) work as expected.
+
+**Fail / Common issues:**
+- If `action: "block"` is accepted, the CHECK constraint may not exist. Verify via the database or check that migration `001_initial.sql` has been applied.
+
+---
+
+## ST5 -- Duplicate Rule Detection (Validate Endpoint)
+
+**What it verifies:** The `POST /api/acl-validate` endpoint can detect when proposed rules would conflict with or duplicate existing rules, through its impact analysis.
+
+**Steps:**
+1. Ensure an existing allow rule: source `*`, destination `*`, ports `443`, protocol `tcp`, priority 100.
+
+2. Propose a duplicate rule via the validate endpoint:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-validate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "proposed_rules": [
+      {
+        "source": "*",
+        "destination": "*",
+        "ports": "443",
+        "protocol": "tcp",
+        "action": "allow",
+        "priority": 100,
+        "name": "Duplicate-Allow"
+      }
+    ]
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "impact": [ ... ],
+    "summary": {
+      "total_machines": N,
+      "connections_tested": N,
+      "changes": 0,
+      "newly_allowed": 0,
+      "newly_denied": 0
+    },
+    "proposed_rules_count": 1,
+    "current_rules_count": N
+  }
+}
+```
+
+The `changes: 0` indicates the proposed rule does not change any traffic decisions -- it is effectively a duplicate.
+
+3. Now propose a conflicting rule (deny instead of allow at higher priority):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-validate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "proposed_rules": [
+      {
+        "source": "*",
+        "destination": "*",
+        "ports": "443",
+        "protocol": "tcp",
+        "action": "deny",
+        "priority": 5,
+        "name": "Override-Deny"
+      }
+    ]
+  }'
+```
+
+**Expected:** `changes` is greater than 0, `newly_denied` is greater than 0. The `impact` array shows individual connection pairs that would flip from `allow` to `deny`, each with `changed: true`.
+
+4. Examine the impact details:
+```json
+{
+  "impact": [
+    {
+      "source": { "id": "...", "name": "Linux-C", "ip": "100.64.x.x" },
+      "destination": { "id": "...", "name": "Win-B", "ip": "100.64.x.x" },
+      "port": 0,
+      "protocol": "tcp",
+      "current": { "decision": "allow", "rule": { "name": "Allow-HTTPS" } },
+      "proposed": { "decision": "deny", "rule": { "name": "Override-Deny" } },
+      "changed": true
+    }
+  ]
+}
+```
+
+5. Verify that the validate endpoint requires admin access:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-validate" `
+  -H "Authorization: Bearer MEMBER_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{ "org_id": "YOUR_ORG_ID" }'
+```
+
+**Expected:** 403 error with code `FORBIDDEN`, message `"Admin access required"`.
+
+**Pass:** Duplicate rules show `changes: 0`. Conflicting rules show the correct number of newly denied/allowed connections. The impact array details which connections change. Non-admin users are rejected.
+
+**Fail / Common issues:**
+- `connections_tested: 0` -- no online machines exist in the organization. The auto-generated test pairs only include machines with status `online`.
+- Empty `impact` array -- if you specify `test_connections` in the request body, you can manually define which machine pairs to test.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Invalid port ranges/values are stored but never match traffic during evaluation |
+| ST2 | Malformed CIDRs and unrecognized selectors do not crash the engine -- they simply never match |
+| ST3 | Missing required fields (name, org_id, source, destination) are rejected by DB constraints or the validate endpoint |
+| ST4 | Invalid protocol strings are inert; invalid action values are rejected by the DB CHECK constraint |
+| ST5 | The validate endpoint detects duplicate/conflicting rules via impact analysis and requires admin access |

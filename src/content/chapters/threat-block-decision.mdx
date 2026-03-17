@@ -1,0 +1,335 @@
+---
+title: "Block Decision Based on Threat Score"
+topic: "Threat Intelligence"
+order: 65
+machines: ["Win-A", "Linux-C"]
+summary: "Verify that high-threat-score IPs/domains are blocked via DNS blocklist delivery in heartbeat."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA has two blocking mechanisms driven by threat intelligence data:
+
+**1. Provider-level blocking (threat-check handler)**
+When `POST /api/threat-check` is called, the handler compares each provider's returned `score` against the provider's `block_threshold` (stored in `threat_intel_configs`). If `score >= block_threshold`, the `action_taken` is `blocked`; otherwise `allowed`. The combined response includes `blocked: true` if any provider triggered a block.
+
+**2. DNS blocklist delivery via heartbeat**
+The heartbeat handler (`handlers/machine-heartbeat.ts`) assembles a `dns_blocklist` field in the response when DNS filtering is enabled:
+- Queries `dns_feed_cache` for all domains where `expires_at > NOW()`
+- Queries `dns_filter_entries` for org-specific custom blocklist entries
+- Deduplicates against the org's allowlist
+- Returns `{ version, domains, wildcards }` in the heartbeat response
+
+Additionally, the heartbeat delivers a `blocked_ips` field:
+- Queries `threat_blocked_ips` for all IP/CIDR entries where `expires_at > NOW()` (up to 10,000)
+- Returns `{ version, ips }` where `ips` is an array of IP/CIDR strings
+
+The Go client applies these on-device:
+- **DNS blocklist**: The DNS resolver (`pkg/dns/resolver.go`) checks every query against exact-match and wildcard-suffix blocklists. Blocked domains receive an NXDOMAIN response.
+- **Blocked IPs**: The firewall manager (`pkg/firewall/firewall.go`) applies DROP rules for the IP/CIDR list via `ApplyBlockedIPs()`.
+
+**3. Risk engine auto-quarantine**
+The risk engine (`handlers/risk-engine.ts`) calculates a weighted score where threat intel contributes 20% (blocked checks in 24h) and IP reputation contributes 15%. If the overall score exceeds 80, the machine is automatically quarantined (`status = 'quarantined'`).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + API testing, verify heartbeat response |
+| <MachineRef name="Linux-C" /> | CLI testing, verify DNS blocking on-device |
+
+**Prerequisites:**
+- DNS filtering enabled for the org (business/enterprise plan)
+- Threat feeds synced (run `sync_feeds` if not done recently)
+- At least one threat intel provider configured with a `block_threshold`
+- Both machines connected with `ztna up`
+
+---
+
+## ST1 -- Provider Block Decision (score vs block_threshold)
+
+**What it verifies:** When a threat check returns a score at or above the provider's `block_threshold`, the action is `blocked`.
+
+**Steps:**
+
+1. First, check the current threshold for your providers:
+```powershell
+$configs = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/threat_intel_configs?org_id=eq.$ORG_ID" `
+    -Headers @{ Authorization = "Bearer $TOKEN" }
+
+$configs.data | ForEach-Object { "$($_.provider): threshold=$($_.block_threshold), enabled=$($_.enabled)" }
+```
+
+Note the `block_threshold` value (default is 50).
+
+2. Run a threat check against a known-bad IP:
+```powershell
+$body = @{
+    org_id     = "$ORG_ID"
+    ip_address = "185.220.101.1"
+} | ConvertTo-Json
+
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/threat-check" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$result.data | ConvertTo-Json -Depth 3
+```
+
+**Expected response (if provider score exceeds threshold):**
+```json
+{
+  "checked": true,
+  "blocked": true,
+  "results": [
+    {
+      "provider": "abuseipdb",
+      "verdict": "malicious",
+      "score": 100,
+      "action": "blocked"
+    }
+  ]
+}
+```
+
+3. Verify `data.blocked` is `true` and at least one result has `action: "blocked"`.
+
+4. Check the persisted record:
+```powershell
+$checks = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/threat_checks?org_id=eq.$ORG_ID&ip_address=eq.185.220.101.1&action_taken=eq.blocked" `
+    -Headers @{ Authorization = "Bearer $TOKEN" }
+
+$checks.data | Select-Object provider, verdict, confidence_score, action_taken | Format-Table
+```
+
+**Pass:** `blocked: true` in the API response, `action_taken: "blocked"` in the database record.
+
+**Fail / Common issues:**
+- `blocked: false` despite high score -- check that the score actually exceeds the `block_threshold`. A threshold of 50 means scores of 50 or above trigger blocking.
+- IP reports a low score -- use a different known-bad IP from AbuseIPDB's recent reports.
+
+---
+
+## ST2 -- DNS Blocklist Delivery in Heartbeat
+
+**What it verifies:** The heartbeat response includes a `dns_blocklist` field with domains from threat feeds and custom blocklist entries.
+
+**Steps:**
+
+1. To observe the heartbeat response, you can inspect the Go client logs. On <MachineRef name="Linux-C" />:
+```bash
+# Run ztna with verbose logging to see heartbeat data
+sudo journalctl -u quickztna-svc -f --no-pager | grep -i "blocklist\|dns_blocklist"
+```
+
+2. In a separate terminal, force a heartbeat by restarting the tunnel:
+```bash
+ztna down && ztna up
+```
+
+3. Watch the logs for a message like:
+```
+DNS blocklist updated  version=43250 exact_domains=42000 wildcards=1250
+```
+
+This log line comes from `dns/resolver.go` when the heartbeat delivers a new blocklist version.
+
+4. Alternatively, verify via API by adding a custom domain to the blocklist and checking if it appears in the next heartbeat:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-filter" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\": \"add_entry\", \"org_id\": \"$ORG_ID\", \"domain\": \"test-block-$(date +%s).example.com\", \"list_type\": \"block\", \"reason\": \"testing heartbeat delivery\"}"
+```
+
+The next heartbeat (within 60 seconds) should include this domain in the blocklist.
+
+**Pass:** Heartbeat logs show `DNS blocklist updated` with non-zero domain and wildcard counts.
+
+**Fail / Common issues:**
+- No blocklist in heartbeat -- DNS filtering is not enabled for the org. Enable it via the API or dashboard.
+- Version is 0 -- no feeds have been synced and no custom blocklist entries exist. Run `sync_feeds`.
+
+---
+
+## ST3 -- On-Device DNS Blocking
+
+**What it verifies:** The Go client DNS resolver blocks domains from the threat feed blocklist, returning NXDOMAIN.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, add a test domain to the custom blocklist:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-filter" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\": \"add_entry\", \"org_id\": \"$ORG_ID\", \"domain\": \"threat-test-block.example.com\", \"list_type\": \"block\", \"reason\": \"manual test\"}"
+```
+
+2. Wait for the next heartbeat (up to 60 seconds) or restart the tunnel:
+```bash
+ztna down && ztna up
+```
+
+3. Attempt a DNS query for the blocked domain through the QuickZTNA DNS resolver:
+```bash
+ztna dns query threat-test-block.example.com
+```
+
+**Expected:** The query should fail or return NXDOMAIN because the domain is in the blocklist. The resolver logs `DNS query blocked by threat blocklist`.
+
+4. Verify the block counter increments:
+```bash
+ztna status
+```
+Look for DNS statistics showing blocked query counts.
+
+5. Clean up the test entry:
+```bash
+# Get the entry ID
+ENTRY_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/dns_filter_entries?org_id=eq.$ORG_ID&domain=eq.threat-test-block.example.com" \
+  | jq -r '.data[0].id')
+
+# Remove it
+curl -s -X POST "https://login.quickztna.com/api/dns-filter" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\": \"remove_entry\", \"org_id\": \"$ORG_ID\", \"entry_id\": \"$ENTRY_ID\"}"
+```
+
+**Pass:** DNS query for the blocked domain returns NXDOMAIN or fails; block counter increments.
+
+**Fail / Common issues:**
+- Domain resolves normally -- the heartbeat has not delivered the updated blocklist yet. Wait for the next heartbeat cycle or restart `ztna up`.
+- DNS query goes to system resolver, not QuickZTNA -- `ztna dns query` must be used (not `nslookup` or `dig` against a system resolver).
+
+---
+
+## ST4 -- Blocked IP Distribution via Heartbeat
+
+**What it verifies:** The heartbeat delivers `blocked_ips` (from Spamhaus DROP/EDROP, CrowdSec) and the client firewall applies DROP rules.
+
+**Steps:**
+
+1. Verify that IP-type feeds have been synced (Spamhaus, CrowdSec):
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-filter" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\": \"get_feed_stats\", \"org_id\": \"$ORG_ID\"}" | jq '.data.ip_feeds'
+```
+
+**Expected:** At least one IP feed with a non-zero `ip_count`.
+
+2. On <MachineRef name="Linux-C" />, check the client logs for blocked IP application:
+```bash
+sudo journalctl -u quickztna-svc -f --no-pager | grep -i "blocked.*ips\|threat.*intel"
+```
+
+3. After the next heartbeat, you should see:
+```
+Applying threat intel blocked IPs  count=6050 version=6050
+```
+
+This log comes from `pkg/agent/agent.go` when `resp.BlockedIPs` is received.
+
+4. The firewall manager applies these as DROP rules. On Linux, verify:
+```bash
+sudo iptables -L -n | grep -c DROP
+```
+The count should be non-zero if IP feed entries are being applied.
+
+**Pass:** Client logs show blocked IPs being applied; iptables (Linux) shows DROP rules.
+
+**Fail / Common issues:**
+- No `blocked_ips` in heartbeat -- no IP/CIDR feeds are enabled or synced. Enable `spamhaus_drop` or `crowdsec_community` and run `sync_feeds`.
+- Firewall rules not applied -- the firewall manager may not be active. Check `ztna status` for firewall state.
+
+---
+
+## ST5 -- Risk Engine Auto-Quarantine on High Threat Score
+
+**What it verifies:** When a machine accumulates enough threat check blocks, the risk engine raises its score and can auto-quarantine it.
+
+**Steps:**
+
+1. First, check the current risk score for a machine:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/risk_scores?machine_id=eq.$MACHINE_ID" | jq '.data[0]'
+```
+
+**Expected fields:**
+- `overall_score`: 0-100
+- `risk_level`: `low`, `medium`, `high`, or `critical`
+- `threat_score`: the raw threat component (0-100, weighted at 20%)
+- `factors`: JSON array of risk factors
+
+2. The risk engine (`risk-engine.ts`) calculates the threat component as:
+   - Counts `threat_checks` rows with `action_taken = 'blocked'` in the last 24 hours
+   - Formula: `min(100, blocked_count * 30 + avg_confidence * 0.5)`
+   - This is weighted at 20% of the overall score
+
+3. The IP reputation component (15% weight) checks `threat_checks` for the machine's `public_endpoint` IP over 7 days:
+   - Formula: `min(100, blocked_count * 25 + flagged_count * 10 + max_confidence * 0.3)`
+
+4. Auto-quarantine triggers when `overall_score > 80`:
+   - Machine status is set to `quarantined`
+   - An audit log entry `machine.auto_quarantined` is created
+   - The machine is effectively disconnected from the mesh
+
+5. To see if a machine has been auto-quarantined:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/machines?id=eq.$MACHINE_ID" | jq '.data[0] | {status, name}'
+```
+
+If `status` is `"quarantined"`, the machine was auto-quarantined.
+
+6. Verify the risk factors breakdown:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://login.quickztna.com/api/db/risk_scores?machine_id=eq.$MACHINE_ID" \
+  | jq '.data[0].factors' | jq 'map(select(.type == "threat" or .type == "ip_reputation"))'
+```
+
+**Expected factors for a machine with threat blocks:**
+```json
+[
+  {
+    "type": "threat",
+    "detail": "3 threat(s) blocked in 24h",
+    "impact": 90,
+    "weight": 0.2
+  },
+  {
+    "type": "ip_reputation",
+    "detail": "IP 203.0.113.5: 2 flagged, 1 blocked in 7d (max confidence: 85)",
+    "impact": 60,
+    "weight": 0.15
+  }
+]
+```
+
+**Pass:** Risk score includes a non-zero threat component; machines with enough blocks are quarantined.
+
+**Fail / Common issues:**
+- `threat_score` is 0 -- no threat checks with `action_taken = 'blocked'` exist for this machine in the last 24 hours
+- Machine not quarantined despite high threat score -- the overall score must exceed 80 (not just the threat component). Other factors (posture, key age, etc.) contribute to the total.
+- Risk score not updated -- the risk engine runs during heartbeat. Wait for the next heartbeat or trigger one by restarting `ztna up`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | Provider block decision | `action: "blocked"` when score meets or exceeds `block_threshold` |
+| ST2 | DNS blocklist in heartbeat | Heartbeat includes `dns_blocklist` with domains and wildcards |
+| ST3 | On-device DNS blocking | Blocked domain returns NXDOMAIN from QuickZTNA resolver |
+| ST4 | Blocked IP distribution | Heartbeat delivers `blocked_ips`; client firewall applies DROP rules |
+| ST5 | Risk engine auto-quarantine | Threat blocks raise risk score; overall score over 80 triggers quarantine |

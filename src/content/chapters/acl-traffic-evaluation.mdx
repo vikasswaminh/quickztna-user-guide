@@ -1,0 +1,471 @@
+---
+title: "ACL Traffic Evaluation"
+topic: "Access Control Lists (ACLs)"
+order: 28
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Test the ACL evaluation API endpoint — verify allow/deny decisions for specific source/destination/port combinations."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The ACL evaluation endpoint (`POST /api/acl-evaluate`, handler: `acl-evaluate.ts`) is the core decision engine that determines whether traffic between two machines is allowed or denied. It accepts these fields:
+
+```
+{
+  "org_id": "UUID (required)",
+  "source_machine_id": "UUID (required)",
+  "destination_machine_id": "UUID (required)",
+  "port": number (optional, defaults to 0),
+  "protocol": "string (optional, defaults to 'tcp')"
+}
+```
+
+The evaluation pipeline (in order):
+1. **Authentication** -- via JWT token or `node_key` (machine-to-machine)
+2. **Machine lookup** -- fetches source and destination from the `machines` table
+3. **Status check** -- machines with status `quarantined` or `pending` are auto-denied
+4. **Lockdown check** -- organizations in `lockdown_mode` deny all traffic
+5. **ACL rule matching** -- iterates enabled rules ordered by priority ASC; first match wins
+6. **Posture compliance** -- if allowed, checks the source machine's latest posture report
+7. **ABAC policies** -- evaluates attribute-based conditions (time, OS, tags, country)
+8. **Threat intelligence** -- checks for recent threat blocks on the source machine
+
+The response always includes:
+- `allowed` (boolean), `decision` ("allow" or "deny")
+- `matched_rule` (the rule or policy that determined the outcome)
+- `posture_compliant` (boolean), `threat_blocked` (boolean)
+- `source` and `destination` objects with `id`, `name`, and `ip`
+
+The CLI equivalent is `ztna acl test --src NAME --dst NAME --port PORT --proto PROTO`, which resolves machine names to IDs and calls the same endpoint.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | API caller (browser or curl) |
+| <MachineRef name="Win-B" /> | Destination machine in evaluations |
+| <MachineRef name="Linux-C" /> | Source machine in evaluations |
+
+Prerequisite: Note down the machine UUIDs for Win-B and Linux-C. You can find them via `GET /api/db/machines?org_id=YOUR_ORG_ID` or on the Machines page in the dashboard.
+
+---
+
+## ST1 -- Evaluate Allowed Traffic
+
+**What it verifies:** The evaluation endpoint correctly returns `allowed: true` when an allow rule matches the source, destination, port, and protocol.
+
+**Prerequisites:** An allow rule exists: source `*`, destination `*`, ports `443`, protocol `tcp`, action `allow`, priority 100.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 443,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "allowed": true,
+    "decision": "allow",
+    "matched_rule": {
+      "id": "RULE_UUID",
+      "name": "Allow-All-HTTP",
+      "action": "allow",
+      "priority": 100
+    },
+    "posture_compliant": true,
+    "threat_blocked": false,
+    "source": {
+      "id": "LINUX_C_MACHINE_ID",
+      "name": "Linux-C",
+      "ip": "100.64.x.x"
+    },
+    "destination": {
+      "id": "WIN_B_MACHINE_ID",
+      "name": "Win-B",
+      "ip": "100.64.x.x"
+    }
+  },
+  "error": null
+}
+```
+
+2. Verify the same result via CLI on <MachineRef name="Linux-C" />:
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 443 --proto tcp
+```
+
+**Expected:**
+```
+ALLOWED: Linux-C -> Win-B:443/tcp
+  Matched rule: Allow-All-HTTP
+```
+
+**Pass:** `allowed: true`, `decision: "allow"`, matched rule name and priority are correct. CLI output confirms the allow decision.
+
+**Fail / Common issues:**
+- `allowed: false` with `matched_rule: null` -- no allow rule matches. The default is deny (zero-trust). Create an appropriate allow rule.
+- `matched_rule.name` is `"Machine \"Linux-C\" is pending"` -- the source machine's status is not `online`. Approve it from the Machines page.
+
+---
+
+## ST2 -- Evaluate Denied Traffic
+
+**What it verifies:** The evaluation endpoint returns `allowed: false` when a deny rule matches, or when no rule matches at all (default deny).
+
+**Steps:**
+1. Test with a port that has no matching allow rule (assuming rules only allow specific ports):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 9999,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected (no rule matches -- default deny):**
+```json
+{
+  "success": true,
+  "data": {
+    "allowed": false,
+    "decision": "deny",
+    "matched_rule": null,
+    "posture_compliant": true,
+    "threat_blocked": false
+  }
+}
+```
+
+Note: when no rule matches, `matched_rule` is `null` and the default deny applies.
+
+2. Test with an explicit deny rule (create one if needed with priority 10, ports `*`):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 80,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected (explicit deny rule matches):**
+```json
+{
+  "data": {
+    "allowed": false,
+    "decision": "deny",
+    "matched_rule": {
+      "id": "...",
+      "name": "Deny-HTTP-Override",
+      "action": "deny",
+      "priority": 10
+    }
+  }
+}
+```
+
+3. CLI equivalent:
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 9999 --proto tcp
+```
+Expected: `DENIED: Linux-C -> Win-B:9999/tcp`
+
+**Pass:** Default deny returns `allowed: false` with `matched_rule: null`. Explicit deny rule returns `allowed: false` with the correct rule details.
+
+**Fail / Common issues:**
+- Unexpectedly allowed -- a wildcard allow rule (ports `*`, source `*`, destination `*`) may exist. Check `ztna acl list` for overly permissive rules.
+
+---
+
+## ST3 -- Port-Specific Evaluation
+
+**What it verifies:** The evaluation engine correctly matches port specifications including single ports, comma-separated lists, and port ranges.
+
+**Steps:**
+1. Create a rule with a port range:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Allow-HighPorts",
+    "source": "*",
+    "destination": "*",
+    "ports": "8000-8100",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 50
+  }'
+```
+
+2. Delete or disable any wildcard allow rules that might match first.
+
+3. Evaluate a port inside the range:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 8080,
+    "protocol": "tcp"
+  }'
+```
+**Expected:** `allowed: true`, matched rule is `Allow-HighPorts`.
+
+4. Evaluate a port outside the range:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 9000,
+    "protocol": "tcp"
+  }'
+```
+**Expected:** `allowed: false` (port 9000 is not in range 8000-8100).
+
+5. Test comma-separated ports. Create a rule with `ports: "22,80,443"` and verify:
+   - Port 80: allowed
+   - Port 81: denied
+
+6. Test port `0` (the default when no port is specified). When `port` is 0 or omitted, the evaluation skips port matching entirely -- the rule matches regardless of its `ports` field (see `acl-evaluate.ts` line 110: `if (rule.ports !== '*' && requestPort > 0)`).
+
+**Important note on port ranges:** The engine caps range expansion to 1000 ports per range segment to prevent denial-of-service. A range like `1-65535` will only expand to ports `1-1000`. This is by design (`acl-evaluate.ts` line 254: `const cappedEnd = Math.min(end, start + 999)`).
+
+**Pass:** Ports inside the specified range/list are allowed. Ports outside are denied. Port 0 skips port matching.
+
+**Fail / Common issues:**
+- Port range not working -- ensure the format is `START-END` with no spaces (e.g., `8000-8100`, not `8000 - 8100`).
+- Large ranges only matching first 1000 ports -- this is the intentional cap to prevent DoS.
+
+---
+
+## ST4 -- Protocol Wildcard Evaluation
+
+**What it verifies:** Rules with protocol `"*"` match traffic regardless of the requested protocol, while protocol-specific rules only match their protocol.
+
+**Steps:**
+1. Create a rule with protocol wildcard:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Allow-All-Protocols",
+    "source": "*",
+    "destination": "*",
+    "ports": "53",
+    "protocol": "*",
+    "action": "allow",
+    "priority": 40
+  }'
+```
+
+2. Evaluate with TCP:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 53,
+    "protocol": "tcp"
+  }'
+```
+**Expected:** `allowed: true`, matched rule `Allow-All-Protocols`.
+
+3. Evaluate with UDP:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 53,
+    "protocol": "udp"
+  }'
+```
+**Expected:** `allowed: true`, same matched rule.
+
+4. Evaluate with ICMP:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID",
+    "port": 53,
+    "protocol": "icmp"
+  }'
+```
+**Expected:** `allowed: true`, same matched rule (protocol `"*"` matches everything).
+
+5. Now test with the CLI. The `--proto` flag defaults to `*` if not specified:
+```bash
+ztna acl test --src Linux-C --dst Win-B --port 53 --proto udp
+```
+Expected: `ALLOWED`
+
+6. Create a TCP-only rule and verify it does NOT match UDP:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Allow-TCP-Only",
+    "source": "*",
+    "destination": "*",
+    "ports": "5432",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 45
+  }'
+```
+
+Evaluate with UDP on port 5432 (no other matching rules):
+**Expected:** `allowed: false` -- the TCP rule does not match UDP traffic.
+
+**Pass:** Protocol `"*"` matches all protocols (tcp, udp, icmp). Protocol-specific rules only match their exact protocol.
+
+**Fail / Common issues:**
+- If the protocol field is omitted from the evaluation request, it defaults to `"tcp"` (line 73: `const requestProtocol = protocol || 'tcp'`).
+- The CLI `--proto` flag defaults to `*` (all protocols) when not specified.
+
+---
+
+## ST5 -- Missing Fields Validation
+
+**What it verifies:** The evaluation endpoint returns clear error responses when required fields are missing or the request is malformed.
+
+**Steps:**
+1. Missing `org_id`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID"
+  }'
+```
+
+**Expected:** 400 status, error code `MISSING_FIELDS`, message: `"org_id, source_machine_id, destination_machine_id required"`.
+
+2. Missing `source_machine_id`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID"
+  }'
+```
+
+**Expected:** Same 400 error with `MISSING_FIELDS`.
+
+3. Missing `destination_machine_id`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID"
+  }'
+```
+
+**Expected:** Same 400 error with `MISSING_FIELDS`.
+
+4. Invalid JSON body:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d 'not-json'
+```
+
+**Expected:** 400 status, error code `INVALID_JSON`, message: `"Request body must be valid JSON"`.
+
+5. Non-existent machine ID:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "00000000-0000-0000-0000-000000000000",
+    "destination_machine_id": "WIN_B_MACHINE_ID"
+  }'
+```
+
+**Expected:** 404 status, error code `NOT_FOUND`, message: `"Source or destination machine not found"`.
+
+6. No authorization header:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_B_MACHINE_ID"
+  }'
+```
+
+**Expected:** 401 status, error code `UNAUTHORIZED`.
+
+**Pass:** Each missing/invalid field produces the correct HTTP status code and error code. The error messages clearly indicate what is wrong.
+
+**Fail / Common issues:**
+- Getting 200 instead of 400 -- the endpoint wraps errors in the standard envelope. Check the `success` field: it should be `false` for validation errors.
+- Getting 401 when token is provided -- the JWT may have expired. Refresh it from the browser's local storage.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Evaluation API returns `allowed: true` with correct matched rule for allowed traffic |
+| ST2 | Evaluation returns `allowed: false` for both default deny (no match) and explicit deny rules |
+| ST3 | Port specifications (ranges, comma-separated, wildcard) are evaluated correctly |
+| ST4 | Protocol wildcard `"*"` matches all protocols; specific protocols only match their own |
+| ST5 | Missing/invalid fields produce correct error codes: MISSING_FIELDS, INVALID_JSON, NOT_FOUND, UNAUTHORIZED |

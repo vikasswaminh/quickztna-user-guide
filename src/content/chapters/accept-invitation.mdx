@@ -1,0 +1,194 @@
+---
+title: "Accept Invitation & Account Creation"
+topic: "Users & Invitations"
+order: 47
+machines: ["Win-A", "Win-B"]
+summary: "Accept an organization invitation — verify account creation for new users and org joining for existing users."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+When an invited user clicks the invitation link, the frontend (`AcceptInvitePage.tsx`) loads the invitation details and provides an "Accept Invitation" button. The backend (`handlers/accept-invitation.ts`) implements:
+
+- **Accept endpoint**: `POST /api/accept-invitation` with `{ token }` — validates the invitation and adds the user to the org
+- **Authentication required**: The user must be logged in (JWT) before accepting
+- **Token validation**: Checks `org_invitations` for a row matching the token with `status = 'pending'` and `expires_at > NOW()`
+- **Email match enforcement**: The logged-in user's email must match the invitation email (case-insensitive) — returns `EMAIL_MISMATCH` (403) otherwise
+- **Already-member guard**: Returns `ALREADY_MEMBER` (409) if the user is already in the org
+- **Atomic acceptance**: Batch operation that inserts into `org_members` (with the invitation's role) and updates the invitation status to `accepted`
+- **Redirect flow**: If the user is not logged in, the page redirects to `/auth?redirect=/invite/{token}` so they can sign up or log in first
+
+The invitation link format is `https://login.quickztna.com/invite/{token}`, which maps to the frontend route `/invite/:token` (a protected route requiring authentication).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin who sent the invitation |
+| <MachineRef name="Win-B" /> | Invited user who accepts |
+
+Prerequisites: Complete Chapter 46 (Invite Member via Email) first. You need a pending invitation with a known invite link.
+
+---
+
+## ST1 — Accept Invitation as a New User
+
+**What it verifies:** A user who does not have a QuickZTNA account can create one and then accept the invitation.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, note the invitation email and link from Chapter 46 (or send a new invite to a fresh test email).
+2. On <MachineRef name="Win-B" />, open the invite link in a browser: `https://login.quickztna.com/invite/{token}`.
+3. Since the user is not logged in, the page redirects to the auth page with a redirect parameter. Observe the URL: `/auth?redirect=/invite/{token}`.
+4. Click **Sign Up** and create an account using the exact email address the invitation was sent to.
+5. After signup, the browser redirects back to `/invite/{token}`.
+6. The invitation page loads showing:
+   - Organization name
+   - Assigned role (badge)
+   - Invited email address
+7. Click **Accept Invitation**.
+
+**Expected behavior:**
+- Toast: "Invitation accepted!" with description "You've joined OrgName"
+- Browser redirects to `/` (which routes to the dashboard)
+- The user is now a member of the organization with the invited role
+
+**Pass:** New account created, invitation accepted, user lands on dashboard with the correct org context.
+
+**Fail / Common issues:**
+- "Invitation not found, expired, or already used" — the invitation token is invalid, the invitation was revoked, or it expired (7-day TTL). Send a new invitation.
+- Page shows error but no invitation details — the CRUD query for `org_invitations` may have failed. Check that the token in the URL is the full 64-character hex string.
+- Redirect loop — if the signup does not properly store tokens, the protected route keeps bouncing to `/auth`.
+
+---
+
+## ST2 — Accept Invitation as an Existing User
+
+**What it verifies:** A user who already has a QuickZTNA account (but is not in this org) can accept an invitation to join.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, send an invitation to an email that belongs to an existing QuickZTNA user (who is not already in this org).
+2. On <MachineRef name="Win-B" />, log in as that existing user.
+3. Open the invite link: `https://login.quickztna.com/invite/{token}`.
+4. The invitation page loads directly (no auth redirect, since the user is already logged in).
+5. Verify the invitation card shows the organization name, role badge, and email.
+6. Click **Accept Invitation**.
+
+**Expected behavior:**
+- Toast: "Invitation accepted!"
+- Redirect to `/` (dashboard)
+- The org switcher (if present) now includes the newly joined organization
+
+**Pass:** Existing user joins the org without needing to re-authenticate.
+
+**Fail / Common issues:**
+- "This invitation was sent to a different email address" (`EMAIL_MISMATCH`) — the logged-in user's email does not match the invitation email. Log out and log in with the correct account.
+- "You are already a member" (`ALREADY_MEMBER`) — the user was already added to this org by another path.
+
+---
+
+## ST3 — Email Mismatch Rejection
+
+**What it verifies:** The backend rejects acceptance when the logged-in user's email does not match the invitation email.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, send an invitation to `invite-mismatch-test@example.com`.
+2. On <MachineRef name="Win-B" />, log in as a different user (e.g., `other-user@example.com`).
+3. Attempt to accept the invitation via curl:
+```bash
+curl -s -X POST https://login.quickztna.com/api/accept-invitation \
+  -H "Authorization: Bearer <other_users_access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"token":"<invitation_token>"}'
+```
+
+**Expected behavior:**
+- HTTP 403
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "EMAIL_MISMATCH",
+    "message": "This invitation was sent to a different email address"
+  }
+}
+```
+
+**Pass:** The backend rejects the attempt with `EMAIL_MISMATCH`. The invitation remains in `pending` status and can still be accepted by the correct user.
+
+**Fail / Common issues:**
+- Returns 200 instead of 403 — the email comparison logic may be missing. The handler should compare `invitation.email.toLowerCase()` against `user.email.toLowerCase()`.
+
+---
+
+## ST4 — Expired Invitation Rejection
+
+**What it verifies:** An invitation that has passed its 7-day expiry window cannot be accepted.
+
+**Steps:**
+1. This test requires either waiting 7 days (impractical) or manually updating the database. On the production server, expire an invitation:
+```bash
+ssh root@172.99.189.211 "docker exec quickztna-api-1 sh -c \"
+  psql \\\$DATABASE_URL -c \\\"UPDATE org_invitations SET expires_at = NOW() - INTERVAL '1 hour' WHERE email = 'expired-test@example.com' AND status = 'pending'\\\"
+\""
+```
+2. Attempt to accept using the token for that invitation:
+```bash
+curl -s -X POST https://login.quickztna.com/api/accept-invitation \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"token":"<expired_invitation_token>"}'
+```
+
+**Expected behavior:**
+- HTTP 404
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_INVITATION",
+    "message": "Invitation not found, expired, or already used"
+  }
+}
+```
+
+**Pass:** Expired invitation cannot be accepted. The query filters on `expires_at > NOW()`.
+
+**Fail / Common issues:**
+- Returns 200 — the expiry check is missing from the SQL WHERE clause.
+
+---
+
+## ST5 — Verify Membership After Acceptance
+
+**What it verifies:** After accepting an invitation, the user appears in the org's member list with the correct role.
+
+**Steps:**
+1. On <MachineRef name="Win-A" /> (admin), navigate to the **Users** page.
+2. Check the active members table for the newly accepted user.
+3. Verify:
+   - The user's name or email appears in the list
+   - The role badge matches the role specified in the invitation (e.g., `member`)
+   - The "Joined" date is today's date
+4. Check the Pending Invitations section — the accepted invitation should no longer appear (its status changed from `pending` to `accepted`).
+
+**Pass:** New member visible in the active members list with correct role and join date. Invitation no longer in pending list.
+
+**Fail / Common issues:**
+- User appears with wrong role — the `accept-invitation` handler reads the role from `invitation.role`. Verify the invitation was created with the intended role.
+- Invitation still shows as pending — the batch update to `org_invitations` may have failed. Check the database: `SELECT status FROM org_invitations WHERE token = '<token>'`.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | New user signup + accept flow | Account created, invitation accepted, user in org |
+| ST2 | Existing user accept flow | Joins org without re-auth, correct role assigned |
+| ST3 | Email mismatch rejection | 403 `EMAIL_MISMATCH` when wrong user tries to accept |
+| ST4 | Expired invitation rejection | 404 `INVALID_INVITATION` after 7-day expiry |
+| ST5 | Post-acceptance member list | User visible in members table, invitation cleared from pending |

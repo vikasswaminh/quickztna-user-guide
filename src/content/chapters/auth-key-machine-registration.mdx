@@ -1,0 +1,251 @@
+---
+title: "Machine Registration with Auth Key"
+topic: "Auth Keys"
+order: 42
+machines: ["Win-A", "Linux-C"]
+summary: "Register machines using auth keys — verify the headless registration flow and machine status."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+This chapter tests the end-to-end machine registration flow using auth keys. The CLI sends `POST /api/register-machine` with the auth key and machine name. The backend validates the key (hash lookup via `SHA256(key.replace('tskey-auth-', ''))`), checks expiry, revocation status, reuse limit, IP restrictions, and tag filtering, then creates or re-activates a machine record.
+
+Key facts from source code (`backend/src/handlers/register-machine.ts`):
+- **CLI command:** `ztna up --auth-key tskey-auth-xxx` or `ztna login --auth-key tskey-auth-xxx`
+- **Environment variable (preferred):** `ZTNA_AUTH_KEY=tskey-auth-xxx` (avoids exposing the key in process listing)
+- **API endpoint:** `POST /api/register-machine` (no JWT required -- the auth key IS the credential)
+- **Request fields:** `auth_key` (required), `name` (required), `os`, `wireguard_public_key`, `tags`, `advertise_routes`, `advertise_exit_node`, `version`, `posture`
+- **New machine status:** `pending` (then goes `online` after heartbeat connection)
+- **Re-registration (same name+org):** Updates existing machine record, preserves machine ID and tailnet IP
+- **Rate limits:** 10 registrations per IP per 10 minutes; 5 registrations per key per 5 minutes
+- **Machine quota:** Enforced from `billing_subscriptions.machine_limit` (default free: 5 machines)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard -- create auth key and verify machine appears |
+| <MachineRef name="Linux-C" /> | Target -- headless registration via auth key |
+
+**Prerequisite:** Create a reusable auth key from Chapter 41 (ST1) and save the full key value.
+
+---
+
+## ST1 — Register Machine via CLI with Auth Key
+
+**What it verifies:** `ztna up --auth-key` registers the machine without browser interaction.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, ensure no existing session:
+```bash
+ztna down
+ztna logout
+```
+
+2. Register using the auth key (prefer env var to avoid process-list exposure):
+```bash
+export ZTNA_AUTH_KEY="tskey-auth-YOUR_KEY_HERE"
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+**Expected output:**
+```
+Starting QuickZTNA...
+Registered: Linux-C (100.64.0.x)
+Connected as Linux-C (100.64.0.x) [tun]
+VPN started!
+Node key: a1b2c3d4e5f6g7h8...
+Press Ctrl+C to stop...
+```
+
+3. Verify the machine is connected:
+```bash
+ztna status
+```
+
+**Expected status output:**
+```
+QuickZTNA Status
+================
+Version:       3.2.8
+Node Key:      a1b2c3d4e5f6g7h8...
+Authenticated: true
+Machine ID:    <uuid>
+Machine Name:  Linux-C
+Tailnet IP:    100.64.0.x
+Mode:          TUN (kernel)
+DERP Region:   blr1
+```
+
+**Pass:** Machine registered and connected. `ztna status` shows `Authenticated: true` and a valid tailnet IP.
+
+**Fail / Common issues:**
+- `INVALID_KEY` (401) -- key may be expired, revoked, or mistyped. Verify the key in the dashboard.
+- `not authenticated. Run 'ztna login' first or use --auth-key` -- the `--auth-key` flag was not passed, or the env var is empty.
+- `WARNING: passing auth-key via CLI flag exposes it in process listing...` -- This is a warning, not an error. It appears when using `--auth-key` flag directly instead of `ZTNA_AUTH_KEY` env var.
+- `RATE_LIMITED` (429) -- too many registration attempts. Wait 10 minutes and retry.
+
+---
+
+## ST2 — Verify Machine Appears in Dashboard
+
+**What it verifies:** The newly registered machine is visible in the admin dashboard with correct metadata.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/machines`.
+2. Look for the machine named `Linux-C` (or the hostname of your test machine).
+
+**Expected:** The machine appears in the list with:
+- **Status:** `online` (green indicator)
+- **Tailnet IP:** `100.64.0.x`
+- **OS:** `linux`
+- **Last seen:** Within the last few seconds
+
+3. Alternatively, verify via API:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&name=eq.Linux-C" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Pass:** Machine record exists with status `online`, correct name, and a valid `100.64.x.x` tailnet IP.
+
+**Fail / Common issues:**
+- Machine not visible -- check that you are logged in as an admin in the same org that owns the auth key.
+- Machine shows `pending` -- auth-key registered machines should go to `online` status. If stuck in pending, check the backend logs.
+
+---
+
+## ST3 — Register via API Directly (curl)
+
+**What it verifies:** The `POST /api/register-machine` endpoint works directly without the CLI.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, call the registration endpoint directly:
+```bash
+AUTH_KEY="tskey-auth-YOUR_KEY_HERE"
+curl -s -X POST "https://login.quickztna.com/api/register-machine" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"auth_key\": \"$AUTH_KEY\",
+    \"name\": \"api-test-machine\",
+    \"os\": \"linux\",
+    \"tags\": [\"test\"]
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 200):**
+```json
+{
+  "success": true,
+  "data": {
+    "machine_id": "<uuid>",
+    "tailnet_ip": "100.64.0.x",
+    "org_id": "<uuid>",
+    "name": "api-test-machine",
+    "node_key": "<hex string>",
+    "status": "online",
+    "wg_public_key": "<base64>",
+    "wg_private_key": "<base64>",
+    "token": "<jwt>",
+    "refresh_token": "",
+    "expires_in": 86400
+  }
+}
+```
+
+**Pass:** HTTP 200 with a valid `machine_id`, `tailnet_ip`, `node_key`, and WireGuard key pair. A JWT token is also returned for authenticated commands.
+
+**Fail / Common issues:**
+- `MISSING_FIELDS` (400) -- both `auth_key` and `name` are required.
+- `INVALID_INPUT` (400) -- machine name contains invalid characters. Names are sanitized by `sanitizeName()`.
+- `QUOTA_EXCEEDED` (403) -- the org has reached its machine limit. Upgrade the plan or delete unused machines.
+
+---
+
+## ST4 — Re-registration Preserves Machine Identity
+
+**What it verifies:** Registering with the same machine name and org re-activates the existing record (preserves ID and tailnet IP, replaces WireGuard and node keys).
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, note the current machine ID and tailnet IP:
+```bash
+ztna status
+```
+Record the Machine ID and Tailnet IP values.
+
+2. Stop the VPN and re-register:
+```bash
+ztna down
+ztna up --auth-key "$ZTNA_AUTH_KEY"
+```
+
+3. Check the machine ID and IP again:
+```bash
+ztna status
+```
+
+**Pass:** Machine ID and Tailnet IP are identical to the values from step 1. The node key may differ (re-generated on each registration).
+
+**Fail / Common issues:**
+- Different machine ID -- the hostname may have changed between registrations. Use `ztna up --auth-key "$ZTNA_AUTH_KEY" --hostname Linux-C` to pin the name.
+- `REGISTRATION_CONFLICT` (409) -- race condition during concurrent registrations. Retry.
+
+---
+
+## ST5 — CIDR-Restricted Key Rejects Wrong IP
+
+**What it verifies:** A key with `allowed_cidrs` rejects registration attempts from IPs outside the allowed range.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a CIDR-restricted key that only allows a narrow IP range:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"narrow-cidr-key\",
+    \"reusable\": true,
+    \"allowed_cidrs\": [\"203.0.113.0/24\"]
+  }" | python3 -m json.tool
+```
+Save the returned key.
+
+2. On <MachineRef name="Linux-C" />, attempt to register with this key (assuming your IP is not in `203.0.113.0/24`):
+```bash
+ztna down
+ztna logout
+ztna up --auth-key "tskey-auth-CIDR_RESTRICTED_KEY"
+```
+
+**Expected error:**
+```
+IP_NOT_ALLOWED: Registration not allowed from this IP address
+```
+
+The backend checks the client's IP against the key's `allowed_cidrs` using CIDR matching. If the IP does not fall within any allowed range, registration is rejected with HTTP 403.
+
+**Pass:** Registration fails with `IP_NOT_ALLOWED` (403). The machine does not appear in the dashboard.
+
+**Fail / Common issues:**
+- Registration succeeds -- your public IP may coincidentally fall within `203.0.113.0/24`. Choose a CIDR that definitely excludes your IP.
+- `INVALID_KEY` instead of `IP_NOT_ALLOWED` -- the key may have expired or been revoked. Check the key status first.
+
+**Cleanup:** Revoke the narrow-cidr-key after testing.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | CLI auth-key registration | `ztna up --auth-key` registers and connects, `ztna status` shows authenticated |
+| ST2 | Dashboard visibility | Machine appears in dashboard with `online` status and correct metadata |
+| ST3 | Direct API registration | `POST /api/register-machine` returns machine_id, tailnet_ip, node_key, and JWT |
+| ST4 | Re-registration identity | Same machine ID and tailnet IP preserved across re-registrations |
+| ST5 | CIDR restriction enforcement | Key with `allowed_cidrs` rejects registration from non-matching IP with `IP_NOT_ALLOWED` |

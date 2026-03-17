@@ -1,0 +1,241 @@
+---
+title: "Hostname Resolution via Tailnet"
+topic: "DNS & MagicDNS"
+order: 37
+machines: ["Win-A", "Win-B", "Linux-C"]
+summary: "Verify hostname resolution — resolve peer names to tailnet IPs using ztna dns query and system DNS."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+MagicDNS hostname resolution works at two levels: (1) the CLI `ztna dns query` command which calls the backend's `resolve` action over HTTPS, and (2) the local DNS resolver (`pkg/dns/resolver.go`) which intercepts system DNS queries on `127.0.0.53:53` and resolves tailnet hostnames from the in-memory peer list.
+
+Key facts from source code:
+
+- **Backend resolve action** (`dns-management.ts` lines 92-138): Three-stage lookup -- FQDN match (`hostname.{slug}.zt.net`), short hostname match (first label, case-insensitive against `machines.name`), then custom `dns_records` table
+- **Local resolver** (`resolver.go`): Maintains an in-memory `records` map (`hostname -> tailnet IP`). Updated via `UpdateRecords()` when the peer list changes. Resolution order: exact match, then strip search domain suffix and retry (`resolver.go` lines 257-277)
+- **Search domain:** Default `"ztna"`. The resolver treats queries ending in `.{searchDomain}` as tailnet queries (`isTailnetQuery`, line 360). Bare hostnames that exist in the records map also match.
+- **DNS record TTL:** 60 seconds (constant `defaultTTL` in `resolver.go` line 38)
+- **AAAA queries:** Return empty response with NOERROR (no IPv6 tailnet IPs yet, `resolver.go` line 386)
+- **NXDOMAIN:** Returned when a tailnet hostname is not found in the local records
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Peer machine -- will be resolved by name |
+| <MachineRef name="Win-B" /> | Peer machine -- will be resolved by name |
+| <MachineRef name="Linux-C" /> | Resolver machine -- runs DNS queries |
+
+All three machines must be connected (`ztna up`) and MagicDNS must be enabled (see Chapter 36).
+
+---
+
+## ST1 -- Resolve Peer by Short Hostname
+
+**What it verifies:** `ztna dns query` resolves a bare machine name to its tailnet IP via the backend.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, confirm all machines are online:
+```bash
+ztna peers
+```
+
+You should see <MachineRef name="Win-A" /> and <MachineRef name="Win-B" /> in the peer list with their tailnet IPs.
+
+2. Resolve <MachineRef name="Win-A" /> by short name:
+```bash
+ztna dns query Win-A
+```
+
+**Expected output:**
+```
+Win-A.yourorg.zt.net -> 100.64.0.1
+```
+
+The CLI sends `action: "resolve"` with `hostname: "Win-A"` to `/api/dns-management`. The backend performs a case-insensitive match against `machines.name` and returns the tailnet IP with `source: "machine_auto"`.
+
+3. Resolve <MachineRef name="Win-B" />:
+```bash
+ztna dns query Win-B
+```
+
+**Expected:** Similar output with Win-B's tailnet IP.
+
+**Pass:** Both peers resolve to their correct tailnet IPs.
+
+**Fail / Common issues:**
+- `(not found)` -- the machine name must match exactly (case-insensitive). Check `ztna peers` for the actual registered names.
+- The CLI first tries the hostname as-is. If no result and the hostname has no dots, it retries with the search domain appended (`Win-A.ztna`). Both attempts go to the backend.
+
+---
+
+## ST2 -- Resolve Peer by FQDN
+
+**What it verifies:** Resolution works when using the fully qualified tailnet domain name.
+
+**Steps:**
+1. First, find your org's DNS domain:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -c "
+import sys, json
+print(json.load(sys.stdin)['data']['domain'])
+"
+```
+
+This returns something like `yourorg.zt.net`.
+
+2. On <MachineRef name="Linux-C" />, resolve using the full domain:
+```bash
+ztna dns query Win-A.yourorg.zt.net
+```
+
+**Expected output:**
+```
+Win-A.yourorg.zt.net -> 100.64.0.1
+```
+
+The backend checks if the hostname ends with `.{slug}.zt.net`, strips the suffix to get the machine name, and performs a case-insensitive lookup in the `machines` table (`dns-management.ts` lines 100-110).
+
+**Pass:** FQDN resolves to the correct tailnet IP with `source: "machine_fqdn"` in the API response.
+
+**Fail / Common issues:**
+- `(not found)` with FQDN -- verify the domain matches your org's slug exactly. The domain is `{slug}.zt.net` where slug comes from the `organizations.slug` column.
+- If the org has no slug, the domain defaults to `ztna.zt.net`.
+
+---
+
+## ST3 -- System-Level DNS Resolution (Local Resolver)
+
+**What it verifies:** When the local DNS resolver is running, system tools like `nslookup` and `ping` can resolve tailnet hostnames.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, check if the local DNS resolver is active. When `ztna up` starts with MagicDNS enabled, the resolver binds to `127.0.0.53:53` (or `127.0.0.53:15353` if port 53 is unavailable).
+
+2. Try resolving via the local resolver directly:
+```bash
+nslookup Win-A 127.0.0.53
+```
+
+If the resolver is on port 15353 (port 53 was busy):
+```bash
+nslookup -port=15353 Win-A 127.0.0.53
+```
+
+**Expected output:**
+```
+Server:		127.0.0.53
+Address:	127.0.0.53#53
+
+Name:	Win-A
+Address: 100.64.0.1
+```
+
+3. On a Linux system with systemd-resolved configured (the DNS manager uses `resolvectl` to set per-interface DNS on `ztna0`), you can also try:
+```bash
+resolvectl query Win-A.ztna
+```
+
+4. On <MachineRef name="Win-A" /> (Windows), the DNS manager uses NRPT (Name Resolution Policy Table) rules via PowerShell. Check if the rule exists:
+```powershell
+Get-DnsClientNrptRule | Where-Object { $_.Comment -eq "QuickZTNA MagicDNS" }
+```
+
+**Expected:** An NRPT rule routing `.ztna` (or your search domain) queries to `127.0.0.53`.
+
+**Pass:** System DNS tools resolve tailnet hostnames to the correct IPs. The platform-specific DNS manager (NRPT on Windows, systemd-resolved or resolv.conf on Linux) routes tailnet queries to the local resolver.
+
+**Fail / Common issues:**
+- `SERVFAIL` or timeout -- the local resolver may not be running. Check if `ztna up` is active and MagicDNS is enabled in the client config.
+- Port 53 conflict on Linux -- another DNS service (e.g., systemd-resolved's stub resolver on `127.0.0.53:53`) may occupy the port. The resolver falls back to port 15353, but system DNS may not know about the high port unless the DNS manager configured it.
+- NRPT rule missing on Windows -- the PowerShell command requires admin privileges. If `ztna up` ran without elevation, the NRPT rule creation may have failed silently.
+
+---
+
+## ST4 -- Case-Insensitive Resolution
+
+**What it verifies:** Hostname resolution is case-insensitive at both the backend and local resolver levels.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, try different casings via the CLI:
+```bash
+ztna dns query win-a
+ztna dns query WIN-A
+ztna dns query Win-a
+```
+
+**Expected:** All three resolve to the same tailnet IP. The backend uses `LOWER(name) = LOWER(?)` in the SQL query (`dns-management.ts` lines 104, 115). The local resolver lowercases the hostname before map lookup (`resolver.go` line 261).
+
+2. If the local resolver is active, test via nslookup:
+```bash
+nslookup win-a 127.0.0.53
+nslookup WIN-A 127.0.0.53
+```
+
+**Pass:** All case variations resolve to the same IP. DNS is case-insensitive per RFC 4343.
+
+**Fail / Common issues:**
+- Different results for different casings would indicate a bug in the lowercase normalization. This should not happen with the current implementation.
+
+---
+
+## ST5 -- Resolution of Offline vs Online Machines
+
+**What it verifies:** MagicDNS records include both `online` and `offline` machines (but not `pending` or `quarantined`).
+
+**Steps:**
+1. On <MachineRef name="Win-B" />, disconnect from the VPN:
+```bash
+ztna down
+```
+
+2. Wait 30 seconds for the heartbeat to expire and the machine to transition to `offline` status.
+
+3. On <MachineRef name="Linux-C" />, try to resolve <MachineRef name="Win-B" />:
+```bash
+ztna dns query Win-B
+```
+
+**Expected:** Win-B still resolves to its tailnet IP. The backend query filters machines with `status IN ('online', 'offline')` (`dns-management.ts` line 29), so offline machines retain their DNS records.
+
+4. Verify via the API that the DNS records include both machines:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -c "
+import sys, json
+records = json.load(sys.stdin)['data']['dns_records']
+for r in records:
+    print(f\"{r['name']} -> {r['value']}\")
+"
+```
+
+**Expected:** Both Win-A and Win-B appear in the records. Win-B's record persists even though it is offline.
+
+5. Note: the local resolver's in-memory records (`resolver.go`) are updated from the peer list, which may only contain currently reachable peers. The CLI `ztna dns query` always goes to the backend, which includes offline machines. This is a key difference between the two resolution paths.
+
+**Pass:** Offline machines are resolvable via `ztna dns query` (backend). Local resolver may or may not include offline peers depending on peer list freshness.
+
+**Cleanup:** Reconnect <MachineRef name="Win-B" />:
+```bash
+ztna up
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Short hostname resolution | `ztna dns query Win-A` returns correct tailnet IP |
+| ST2 | FQDN resolution | `Win-A.{slug}.zt.net` resolves via the FQDN lookup path |
+| ST3 | System-level DNS | `nslookup` / `resolvectl` resolves tailnet names via local resolver |
+| ST4 | Case-insensitive matching | `win-a`, `WIN-A`, `Win-a` all resolve identically |
+| ST5 | Offline machine resolution | Offline machines retain DNS records at the backend level |

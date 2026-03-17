@@ -1,0 +1,174 @@
+---
+title: "Invite Member via Email"
+topic: "Users & Invitations"
+order: 46
+machines: ["Win-A"]
+summary: "Send organization invitations via email — verify invitation creation, email delivery, and invitation listing."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Organization admins can invite new members by email. The backend (`handlers/org-management.ts`, action `invite_member`) implements:
+
+- **Invite endpoint**: `POST /api/org-management` with `action: "invite_member"` — creates an invitation record in `org_invitations` and sends an email
+- **Authorization**: Only org admins or owners can invite (`isOrgAdmin` check)
+- **Duplicate guard**: Rejects if a pending invitation already exists for the same email + org (`DUPLICATE_INVITATION`)
+- **Existing member guard**: Rejects if the email already belongs to an org member (`ALREADY_MEMBER`)
+- **Plan limit enforcement**: Checks `billing_subscriptions.user_limit` — rejects with `PLAN_LIMIT_REACHED` if the org is at capacity
+- **Invitation token**: 32-byte cryptographic random hex string, expires in 7 days
+- **Email delivery**: Self-hosted SMTP via `noreply@quickztna.com` — sends invitation link `https://login.quickztna.com/invite/{token}`
+- **Role selection**: `admin`, `member`, or `auditor` (defaults to `member` if omitted)
+
+The invitation record is stored in the `org_invitations` table with status `pending`, and the invite link directs to the frontend route `/invite/:token`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin browser session + curl for API tests |
+
+Log in as an admin or owner of an existing organization at `https://login.quickztna.com`.
+
+---
+
+## ST1 — Invite a Member via Dashboard
+
+**What it verifies:** An admin can open the invite dialog, enter an email and role, and successfully send an invitation.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as an org admin or owner.
+2. Navigate to the **Users** page from the sidebar.
+3. Click the **Invite User** button (top right).
+4. In the dialog, enter:
+   - **Email address**: a valid test email (e.g., `testinvite-YYYYMMDD@yourdomain.com`)
+   - **Role**: select `Member` from the dropdown
+5. Click **Send Invite**.
+
+**Expected behavior:**
+- Toast notification: "Invitation sent" with description "Invited testinvite-...@yourdomain.com as member"
+- The dialog closes automatically
+- A new row appears in the **Pending Invitations** section at the bottom of the Users page showing the email, role badge (`member`), and sent date
+
+**Pass:** Invitation created, toast shown, pending invitation row visible.
+
+**Fail / Common issues:**
+- "A pending invitation already exists for this email" (`DUPLICATE_INVITATION`) — an active invitation for that email already exists. Revoke it first, then re-invite.
+- "This user is already a member of the organization" (`ALREADY_MEMBER`) — the email belongs to someone who is already in the org.
+- "User limit reached" (`PLAN_LIMIT_REACHED`) — the organization has reached its plan's user cap. Upgrade the plan or remove existing members.
+- **Invite User button not visible** — you are logged in as a `member` or `auditor`, not an admin/owner. Only admins and owners see the button.
+
+---
+
+## ST2 — Invite with Admin Role
+
+**What it verifies:** The role selected in the invite dialog is stored correctly and will apply when the invitation is accepted.
+
+**Steps:**
+1. On the Users page, click **Invite User**.
+2. Enter a different test email address.
+3. Change the **Role** dropdown to `Admin`.
+4. Click **Send Invite**.
+
+**Expected behavior:**
+- Toast: "Invitation sent" with description ending in "as admin"
+- In the Pending Invitations table, the new row shows a role badge of `admin`
+
+**Pass:** The invitation is created with the `admin` role and displays correctly in the pending invitations list.
+
+**Fail / Common issues:**
+- Role badge shows `member` instead of `admin` — the role was not passed correctly. Check the network request body in dev tools: `POST /api/org-management` should include `"role": "admin"`.
+
+---
+
+## ST3 — Verify Invitation Email Delivery
+
+**What it verifies:** The invitation email is actually sent via SMTP and contains the correct invite link.
+
+**Steps:**
+1. Send an invitation to an email address you control (from ST1 or ST2).
+2. Check the inbox of that email address (also check spam/junk).
+3. Inspect the email content.
+
+**Expected behavior:**
+- **From**: `noreply@quickztna.com`
+- **Subject**: "You've been invited to join OrgName on QuickZTNA"
+- **Body** contains:
+  - The inviter's name (from their profile `full_name`, or their email, or "A team member")
+  - The organization name
+  - The assigned role
+  - A clickable link in the format `https://login.quickztna.com/invite/{64-char-hex-token}`
+
+**Pass:** Email received, subject matches, invite link present and well-formed.
+
+**Fail / Common issues:**
+- Email not received — check spam folder. If still missing, verify SMTP is running on the server: `ssh root@172.99.189.211 "docker logs quickztna-api-1 --tail 50 | grep -i smtp"`.
+- Link points to wrong domain — the `FRONTEND_URL` environment variable may be misconfigured. It should be `https://login.quickztna.com`.
+
+---
+
+## ST4 — Duplicate Invitation Prevention
+
+**What it verifies:** The backend rejects a second pending invitation to the same email in the same org.
+
+**Steps:**
+1. Using curl or the dashboard, invite `duplicate-test@example.com`:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"invite_member","org_id":"<your_org_id>","email":"duplicate-test@example.com","role":"member"}'
+```
+2. Send the exact same request again (same email, same org).
+
+**Expected behavior (second request):**
+- HTTP 409
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "DUPLICATE_INVITATION",
+    "message": "A pending invitation already exists for this email"
+  }
+}
+```
+
+**Pass:** First invite returns 201 with `invitation_id` and `token`. Second invite returns 409 with `DUPLICATE_INVITATION`.
+
+**Fail / Common issues:**
+- Both requests return 201 — the duplicate check query may not be filtering by `status = 'pending'` and `expires_at > NOW()`. Check the handler logic.
+
+---
+
+## ST5 — Revoke a Pending Invitation
+
+**What it verifies:** An admin can revoke (delete) a pending invitation from the Users page.
+
+**Steps:**
+1. On the Users page, scroll to the **Pending Invitations** section.
+2. Find a pending invitation row.
+3. Click the trash icon button (red, far right of the row).
+
+**Expected behavior:**
+- The invitation row disappears from the table immediately
+- If you re-invite the same email, it should succeed (the duplicate guard no longer blocks because the old invitation was deleted)
+
+**Pass:** Invitation removed from the list. Re-inviting the same email creates a new invitation without a `DUPLICATE_INVITATION` error.
+
+**Fail / Common issues:**
+- Invitation row remains after clicking trash — check browser dev tools for a failed `DELETE` request to `/api/db/org_invitations`.
+- Re-invite still shows `DUPLICATE_INVITATION` — the delete may have failed silently. Verify the invitation was actually removed from the database.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Dashboard invite dialog, `invite_member` action | Invitation created, toast + pending row visible |
+| ST2 | Role selection (`admin`) | Role stored correctly, badge matches |
+| ST3 | SMTP email delivery | Email received with correct subject, invite link |
+| ST4 | Duplicate prevention | Second invite to same email returns 409 `DUPLICATE_INVITATION` |
+| ST5 | Revoke invitation | Pending invite deleted, re-invite succeeds |

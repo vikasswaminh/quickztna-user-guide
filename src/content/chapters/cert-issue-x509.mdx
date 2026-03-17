@@ -1,0 +1,345 @@
+---
+title: "Issue X.509 Certificate for Internal Domain"
+topic: "Certificate Authority"
+order: 56
+machines: ["Win-A"]
+summary: "Issue an X.509 TLS certificate for an internal domain via the QuickZTNA CA -- verify certificate fields and chain."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA includes a built-in Certificate Authority that generates real X.509v3 certificates with ECDSA P-256 signatures. The CA is per-organization and must be initialized before any certificates can be issued.
+
+The X.509 flow involves two API endpoints on `POST /api/issue-certificate`:
+
+1. **`action: "initialize_ca"`** -- Generates an ECDSA P-256 CA key pair, builds a self-signed CA certificate (10-year validity, CN=`QuickZTNA CA`, O=`QuickZTNA`), encrypts the private key at rest, and stores it in the `ca_configs` table. Returns the CA certificate PEM, SHA-256 fingerprint, and expiry date.
+
+2. **`action: "issue"`** -- Generates an ephemeral ECDSA P-256 key pair for the end-entity, signs a new X.509v3 certificate using the CA's private key, and inserts a record into `issued_certificates`. The issued certificate includes Basic Constraints (CA:FALSE), Key Usage (digitalSignature + keyEncipherment), and the subject CN from the `subject_cn` field. The private key is returned **once** at issuance and is never stored on the server.
+
+Key parameters for issuance:
+- **org_id** (required) -- organization scope
+- **subject_cn** (optional) -- the Common Name for the certificate; defaults to `machine_id` or `"unknown"`
+- **machine_id** (optional) -- ties the certificate to a specific machine; triggers posture and quarantine checks
+- **ttl_hours** (optional) -- validity period in hours; must be between 1 and 87600 (10 years); capped by `ca_configs.max_cert_ttl_hours` (default 720h) and any `certificate_policies.max_ttl_hours` for the org
+
+Both actions require **org admin** role. The CLI command `ztna cert [domain]` wraps the issue action, calling `POST /api/issue-certificate` with `action: "issue"` and writing the certificate and key to local files.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard, PowerShell for curl and CLI commands |
+
+Ensure you are logged in as an org admin. Have your JWT token and org ID ready for API calls.
+
+---
+
+## ST1 -- Initialize the X.509 CA
+
+**What it verifies:** The `initialize_ca` action generates a valid self-signed CA certificate with correct fields.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "initialize_ca",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "ca_certificate": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
+    "fingerprint": "AB:CD:12:...",
+    "expires_at": "2036-03-17T..."
+  },
+  "error": null
+}
+```
+
+2. Verify the response contains:
+   - `ca_certificate` starts with `-----BEGIN CERTIFICATE-----`
+   - `fingerprint` is a colon-separated uppercase hex string (SHA-256)
+   - `expires_at` is approximately 10 years from now
+
+3. Save the CA certificate to a file for later verification:
+```powershell
+# Copy the ca_certificate value (including newlines) to ca.pem
+# Or extract it programmatically:
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "initialize_ca", "org_id": "YOUR_ORG_ID"}' | python -c "import sys,json; print(json.load(sys.stdin)['data']['ca_certificate'])" > ca.pem
+```
+
+**Pass:** Response returns `success: true` with a valid PEM certificate, fingerprint, and future expiry date.
+
+**Fail / Common issues:**
+- 401 Unauthorized -- JWT token is expired or missing. Get a fresh token from the browser.
+- 403 Forbidden -- you are not an org admin. Only admin or owner roles can initialize the CA.
+
+---
+
+## ST2 -- Issue an X.509 Certificate for a Domain
+
+**What it verifies:** The `issue` action generates an end-entity certificate signed by the org's CA.
+
+**Prerequisites:** CA must be initialized (ST1 completed).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "subject_cn": "internal-web.myorg.ztna",
+    "ttl_hours": 720
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nMIG...\n-----END PRIVATE KEY-----",
+    "serial_number": "0a1b2c3d...",
+    "fingerprint": "EF:01:23:...",
+    "expires_at": "2026-04-16T...",
+    "ttl_hours": 720,
+    "warning": "Save the private_key now. It is not stored on the server and cannot be retrieved again."
+  },
+  "error": null
+}
+```
+
+2. Verify the response contains:
+   - `certificate` -- a PEM-encoded X.509 certificate
+   - `private_key` -- a PEM-encoded ECDSA private key (PKCS#8 format)
+   - `serial_number` -- a hex string (32 characters, from 16 random bytes)
+   - `fingerprint` -- SHA-256 fingerprint of the certificate DER
+   - `ttl_hours` -- should be 720 (or capped by `max_cert_ttl_hours`)
+   - `warning` -- reminds you to save the private key
+
+3. Save both files:
+```powershell
+# Save to files (copy PEM content manually or use python extraction)
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "issue", "org_id": "YOUR_ORG_ID", "subject_cn": "internal-web.myorg.ztna", "ttl_hours": 720}' > cert-response.json
+```
+
+**Pass:** Response returns `success: true` with both certificate and private key PEMs, a hex serial number, and a future expiry date.
+
+**Fail / Common issues:**
+- `CA_NOT_INITIALIZED` (400) -- the CA has not been set up yet. Run ST1 first.
+- `INVALID_TTL` (400) -- `ttl_hours` is outside the 1--87600 range. Use a value within bounds.
+
+---
+
+## ST3 -- Issue Certificate via CLI (`ztna cert`)
+
+**What it verifies:** The `ztna cert` CLI command requests a certificate from the API and writes the cert and key to local files.
+
+**Prerequisites:** Machine must be authenticated (`ztna login`) and registered (`ztna up`). CA must be initialized.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, confirm the CLI is authenticated:
+```powershell
+ztna status
+```
+Should show connected/authenticated state.
+
+2. Request a certificate for a domain:
+```powershell
+ztna cert my-server.myorg.ztna
+```
+
+**Expected output:**
+```
+Requesting certificate for my-server.myorg.ztna...
+Certificate written to my-server.myorg.ztna.crt
+Private key written to my-server.myorg.ztna.key
+Expires: 2026-04-16T...
+```
+
+3. Verify the files were created:
+```powershell
+dir my-server.myorg.ztna.crt
+dir my-server.myorg.ztna.key
+```
+
+4. Check the certificate content:
+```powershell
+type my-server.myorg.ztna.crt
+```
+Should start with `-----BEGIN CERTIFICATE-----`.
+
+5. You can also specify custom output paths:
+```powershell
+ztna cert my-server.myorg.ztna --cert-file=C:\certs\server.crt --key-file=C:\certs\server.key
+```
+
+**Pass:** CLI outputs the certificate and key file paths, and the files contain valid PEM data.
+
+**Fail / Common issues:**
+- "not authenticated. Run 'ztna login' first" -- CLI session expired. Run `ztna login`.
+- "not registered. Run 'ztna up' first" -- the machine has no state. Run `ztna up` to register.
+- "issue certificate: ..." -- API returned an error. Check that the CA is initialized for your org.
+
+---
+
+## ST4 -- Issue Certificate Tied to a Machine
+
+**What it verifies:** When `machine_id` is provided, the handler checks the machine's quarantine status and posture compliance before issuing.
+
+**Steps:**
+1. Get a machine ID from the dashboard (Machines page) or via:
+```powershell
+curl -s "https://login.quickztna.com/api/db/machines?org_id=YOUR_ORG_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" | python -m json.tool
+```
+Pick a machine that is online and compliant.
+
+2. Issue a certificate tied to that machine:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "MACHINE_UUID",
+    "subject_cn": "machine-cert-test"
+  }'
+```
+
+**Expected:** `success: true` with certificate data, same structure as ST2.
+
+3. Now try with a quarantined machine (if you have one, or quarantine a test machine from the dashboard):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "QUARANTINED_MACHINE_UUID",
+    "subject_cn": "should-fail"
+  }'
+```
+
+**Expected error response:**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "MACHINE_QUARANTINED",
+    "message": "Cannot issue certificate to a quarantined machine"
+  }
+}
+```
+HTTP status: 403.
+
+4. Similarly, a machine with a non-compliant posture report returns:
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "POSTURE_NON_COMPLIANT",
+    "message": "Cannot issue certificate to a non-compliant machine"
+  }
+}
+```
+
+**Pass:** Certificates are issued for healthy machines. Quarantined machines return `MACHINE_QUARANTINED` (403). Non-compliant machines return `POSTURE_NON_COMPLIANT` (403).
+
+**Fail / Common issues:**
+- Certificate issued to a quarantined machine -- this is a security bug. The handler should check `machines.status` before issuing.
+- No posture check triggered -- the machine has no posture reports in the database. The handler only blocks if a posture report exists and `compliant` is `false`.
+
+---
+
+## ST5 -- List Issued X.509 Certificates
+
+**What it verifies:** The `list` action returns all certificates issued for the organization, including metadata for audit.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "certificates": [
+      {
+        "id": "uuid-1",
+        "org_id": "YOUR_ORG_ID",
+        "machine_id": null,
+        "serial_number": "0a1b2c3d...",
+        "subject_cn": "internal-web.myorg.ztna",
+        "fingerprint": "EF:01:23:...",
+        "certificate_pem": "-----BEGIN CERTIFICATE-----...",
+        "issued_at": "2026-03-17T...",
+        "expires_at": "2026-04-16T...",
+        "revoked": false,
+        "revoked_at": null,
+        "revoke_reason": null
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+2. Verify:
+   - Certificates from ST2, ST3, and ST4 all appear in the list
+   - Each entry has `serial_number`, `subject_cn`, `fingerprint`, `issued_at`, and `expires_at`
+   - `revoked` is `false` for freshly issued certificates
+   - The list is ordered by `issued_at DESC` (newest first)
+   - Maximum 100 entries are returned
+
+3. Note: the `list` action does not require admin role -- any org member can list certificates.
+
+**Pass:** All previously issued certificates appear in the list with correct metadata. The `revoked` field is `false` for active certificates.
+
+**Fail / Common issues:**
+- Empty list despite issuing certificates -- verify the `org_id` matches the org where certificates were issued.
+- Missing fields -- check that the `issued_certificates` table schema includes all expected columns after migrations.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | CA initialization generates a valid self-signed X.509 CA certificate (ECDSA P-256, 10-year validity) |
+| ST2 | End-entity certificates are issued with correct subject CN, serial, fingerprint, and TTL capping |
+| ST3 | The `ztna cert` CLI command requests and saves certificates to local files |
+| ST4 | Machine-bound certificates enforce quarantine and posture compliance checks before issuance |
+| ST5 | The list action returns all issued certificates with metadata for audit |

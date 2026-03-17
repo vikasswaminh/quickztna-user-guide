@@ -1,0 +1,255 @@
+---
+title: "Enable MagicDNS"
+topic: "DNS & MagicDNS"
+order: 36
+machines: ["Win-A", "Linux-C"]
+summary: "Enable MagicDNS for the organization and verify peer hostname resolution works."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+MagicDNS lets machines resolve each other by hostname instead of tailnet IP. When enabled, the Go client starts a local DNS resolver (package `pkg/dns`, file `resolver.go`) that intercepts queries for tailnet hostnames and resolves them from the local peer list. Non-tailnet queries are forwarded upstream via DNS-over-TLS (Quad9: `9.9.9.9:853`, `149.112.112.112:853`).
+
+Key facts from source code:
+
+- **Backend endpoint:** `POST /api/dns-management` with `action: "get_settings"` returns the current MagicDNS state, nameservers, and auto-generated DNS records from online machines (`dns-management.ts` lines 23-46)
+- **Backend endpoint:** `POST /api/dns-management` with `action: "update_settings"` toggles `magic_dns_enabled` (requires org admin, `dns-management.ts` lines 49-66)
+- **DNS domain format:** `{org_slug}.zt.net` -- each machine gets `{machine_name}.{org_slug}.zt.net` as an A record pointing to its tailnet IP
+- **Local resolver listen address:** `127.0.0.53:53` (falls back to port `15353` if 53 is unavailable -- `resolver.go` lines 176-189)
+- **Default search domain:** `"ztna"` -- used when `DNSSearchDomain` in client config is empty (`resolver.go` line 94, `cmd_dns.go` line 45)
+- **CLI subcommands:** `ztna dns status` shows resolver state; `ztna dns query <hostname>` resolves a hostname via the control plane (`cmd_dns.go`)
+- **Config fields:** `dns_enabled` (bool) and `dns_search_domain` (string) in the client config file (`config.go` lines 107-108)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard admin -- enable MagicDNS, verify settings |
+| <MachineRef name="Linux-C" /> | CLI machine -- verify local DNS resolver starts and resolves peers |
+
+---
+
+## ST1 -- Enable MagicDNS via Dashboard
+
+**What it verifies:** An org admin can enable MagicDNS and the backend persists the setting.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/dns`.
+2. Find the **MagicDNS** toggle (it controls `magic_dns_enabled`).
+3. Enable MagicDNS.
+4. The page should save the setting automatically or provide a Save button.
+
+**Verify via API:**
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -m json.tool
+```
+
+**Expected response shape:**
+```json
+{
+  "success": true,
+  "data": {
+    "settings": {
+      "magic_dns_enabled": true,
+      "search_domains": "[]"
+    },
+    "nameservers": [],
+    "dns_records": [
+      {
+        "name": "Win-A.yourorg.zt.net",
+        "type": "A",
+        "value": "100.64.0.1"
+      }
+    ],
+    "domain": "yourorg.zt.net"
+  }
+}
+```
+
+**Pass:** `magic_dns_enabled` is `true`. The `dns_records` array contains an A record for each online machine in the org, with `{machine_name}.{org_slug}.zt.net` as the name and the tailnet IP as the value.
+
+**Fail / Common issues:**
+- `FORBIDDEN` error -- you must be an org admin to update DNS settings.
+- `dns_records` is empty -- no machines are registered with a tailnet IP, or machines have status other than `online` or `offline` (the query filters on `status IN ('online', 'offline')`).
+
+---
+
+## ST2 -- Verify DNS Records Are Generated from Machines
+
+**What it verifies:** The `get_settings` action auto-generates A records from the `machines` table (not a separate static DNS records table).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, with MagicDNS enabled, call the API:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -c "
+import sys, json
+data = json.load(sys.stdin)['data']
+print('Domain:', data['domain'])
+print('Records:')
+for r in data['dns_records']:
+    print(f\"  {r['name']} -> {r['value']} ({r['type']})\")
+"
+```
+
+**Expected:** One A record per registered machine that has a tailnet IP and status `online` or `offline`. The domain follows the pattern `{org_slug}.zt.net`.
+
+2. Check the org slug matches your org:
+```bash
+curl -s "https://login.quickztna.com/api/db/organizations?id=eq.YOUR_ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "
+import sys, json
+orgs = json.load(sys.stdin)['data']
+if orgs: print('Slug:', orgs[0].get('slug', '(none)'))
+"
+```
+
+**Pass:** The domain prefix matches your org's slug. Each online/offline machine appears as a DNS record.
+
+**Fail / Common issues:**
+- Domain shows `ztna.zt.net` instead of your org slug -- the org may not have a `slug` field set. The backend falls back to `"ztna"` when `org.slug` is null.
+- Missing machines -- machines with status `pending` or `quarantined` are excluded from DNS records.
+
+---
+
+## ST3 -- Check DNS Status on CLI
+
+**What it verifies:** `ztna dns status` reads the local client config and reports whether MagicDNS is enabled and what search domain is configured.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, ensure the machine is connected:
+```bash
+ztna status
+```
+
+2. Check DNS status:
+```bash
+ztna dns status
+```
+
+**Expected output:**
+```
+MagicDNS:       enabled
+Search domain:  ztna
+Resolution:     <hostname>.ztna -> tailnet IP
+```
+
+The `Search domain` line shows the value of `dns_search_domain` from the client config. If not set, it defaults to `ztna`.
+
+**Pass:** Output shows `MagicDNS: enabled` and a search domain. The resolution pattern shows how hostnames map to tailnet IPs.
+
+**Fail / Common issues:**
+- `MagicDNS: disabled` -- the client config file has `dns_enabled: false`. This is the local client-side setting and may not match the server-side org setting. The client must have DNS enabled locally for the resolver to start.
+- `error loading config` -- the machine is not authenticated. Run `ztna login` first.
+
+---
+
+## ST4 -- Resolve a Peer Hostname via CLI
+
+**What it verifies:** `ztna dns query` calls the backend's `resolve` action and returns the tailnet IP for a known machine name.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, resolve <MachineRef name="Win-A" /> by name:
+```bash
+ztna dns query Win-A
+```
+
+**Expected output:**
+```
+Win-A.yourorg.zt.net -> 100.64.0.1
+```
+
+The CLI first tries the hostname as-is against the backend. If the response returns no IP and the hostname has no dots, it retries with the search domain appended (`Win-A.ztna`). The backend's `resolve` action (`dns-management.ts` lines 92-138) performs three lookups in order:
+1. FQDN match: hostname ending with `.{org_slug}.zt.net`
+2. Short hostname match: first label before any dot, case-insensitive lookup in `machines` table
+3. Custom DNS record match: user-created records in `dns_records` table
+
+2. Try a hostname that does not exist:
+```bash
+ztna dns query nonexistent-machine
+```
+
+**Expected output:**
+```
+nonexistent-machine -> (not found)
+```
+
+**Pass:** Known machine name resolves to its tailnet IP. Unknown machine name shows `(not found)`.
+
+**Fail / Common issues:**
+- `not authenticated. Run 'ztna login' first` -- the client config has no `org_id`. You must be logged in.
+- `DNS resolution failed` -- network error reaching the control plane. Check connectivity to `login.quickztna.com`.
+- Machine resolves but with wrong IP -- the machine may have been re-registered and received a new tailnet IP.
+
+---
+
+## ST5 -- Verify MagicDNS Can Be Disabled
+
+**What it verifies:** Disabling MagicDNS via the API removes the DNS records from the settings response.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, disable MagicDNS via the dashboard DNS page toggle, or via API:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_settings","org_id":"YOUR_ORG_ID","magic_dns_enabled":false}'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": { "updated": true }
+}
+```
+
+2. Fetch settings again:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"get_settings","org_id":"YOUR_ORG_ID"}' | python3 -c "
+import sys, json
+data = json.load(sys.stdin)['data']
+print('MagicDNS enabled:', data['settings']['magic_dns_enabled'])
+print('DNS records count:', len(data['dns_records']))
+"
+```
+
+**Expected:** `magic_dns_enabled` is `false`. Note that `dns_records` may still be populated (the backend always builds them from machines) -- the `magic_dns_enabled` flag is what the client uses to decide whether to start the local resolver.
+
+3. On <MachineRef name="Linux-C" />, `ztna dns query` still works because it calls the backend's `resolve` action directly (it does not depend on the local resolver). The local resolver is what handles system-level DNS interception.
+
+**Pass:** Setting toggled to `false` successfully. The `update_settings` action returns `updated: true`.
+
+**Fail / Common issues:**
+- `FORBIDDEN` -- only org admins can update DNS settings.
+
+**Cleanup:** Re-enable MagicDNS for subsequent DNS tests:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/dns-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"update_settings","org_id":"YOUR_ORG_ID","magic_dns_enabled":true}'
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | MagicDNS enable toggle | `magic_dns_enabled` is `true`, DNS records generated for online machines |
+| ST2 | Auto-generated DNS records | Each machine with tailnet IP appears as `{name}.{slug}.zt.net` A record |
+| ST3 | CLI dns status | `ztna dns status` shows enabled state and search domain |
+| ST4 | Hostname resolution via CLI | `ztna dns query` resolves known peers, returns `(not found)` for unknown |
+| ST5 | MagicDNS disable | Setting toggled to `false`, re-enabled for subsequent tests |

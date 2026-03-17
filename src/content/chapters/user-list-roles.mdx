@@ -1,0 +1,184 @@
+---
+title: "User List & Role Badge Verification"
+topic: "Users & Invitations"
+order: 50
+machines: ["Win-A"]
+summary: "Verify the members list page — user listing, role badges, invite status, and member count accuracy."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The Users page (`UsersPage.tsx`) displays three distinct sections and several data-driven UI elements:
+
+- **Active members table**: Fetched via `api.rpc("get_org_members", { _org_id })` which calls the `get_org_members` RPC in `db-crud.ts` — returns members joined with `profiles` (full_name, avatar_url) and `user_credentials` (email), ordered by `joined_at ASC`
+- **Pending approval section**: Members with `status = 'pending'` (domain-matched users awaiting admin approval) — shown in a separate card with approve/reject buttons
+- **Pending invitations table**: Fetched via CRUD query on `org_invitations` filtered by `org_id` and `status = 'pending'` — shows email, role badge, sent date, and resend/revoke actions
+- **Role badges**: Color-coded by role — `owner` and `admin` use the `default` variant, `auditor` uses `outline`, and `member` uses `secondary`
+- **Plan limit banner**: On the Free plan, a warning alert appears when usage reaches 80% or more of the user limit (default 3 users for free, configurable via `billing_subscriptions.user_limit`)
+- **CSV export**: Downloads the active members list as a CSV file with columns: Name, Email, Role, Joined
+- **Admin-only actions**: The three-dot menu (Change Role, Remove) and the Invite User button are only visible when `orgRole` is `owner` or `admin`
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for viewing the Users page |
+
+Prerequisites: The organization should have multiple members with different roles and at least one pending invitation (from Chapters 46-49).
+
+---
+
+## ST1 — Active Members Table Rendering
+
+**What it verifies:** All active org members are displayed with correct names, emails, roles, and join dates.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as any org member.
+2. Navigate to the **Users** page from the sidebar.
+3. Review the active members table.
+
+**Expected behavior:**
+- Each row shows:
+  - **Avatar initials** (circle with first letters of name) and **full name** (or "Unknown" if no profile name set)
+  - "You" label under your own name
+  - **Email** address (or dash if not available)
+  - **Role badge**: colored and capitalized (`Owner`, `Admin`, `Member`, `Auditor`)
+  - **Joined date** in localized format
+- The page subtitle shows the total count: "N members" (and ", M pending" if there are pending members)
+- Members are ordered by join date (earliest first), matching the `ORDER BY om.joined_at ASC` query
+
+**Pass:** All members visible, correct names/emails/roles, "You" label on your own row, count is accurate.
+
+**Fail / Common issues:**
+- "Unknown" for all names — the `profiles` table may be empty. Profile `full_name` is only set if the user updated their profile.
+- Email shows dash for all members — the JOIN on `user_credentials` may be failing. Check that `user_credentials.user_id` matches `org_members.user_id`.
+- Missing members — the RPC only returns members for the specific `org_id`. Verify the correct org is selected in the org context.
+
+---
+
+## ST2 — Role Badge Color Verification
+
+**What it verifies:** Each role has the correct visual badge variant for quick identification.
+
+**Steps:**
+1. On the Users page, identify members with different roles (if available): `owner`, `admin`, `member`, `auditor`.
+2. Inspect the badge styling for each:
+   - **Owner**: `default` variant (solid primary color background)
+   - **Admin**: `default` variant (solid primary color background, same as owner)
+   - **Member**: `secondary` variant (muted/gray background)
+   - **Auditor**: `outline` variant (border only, no fill)
+
+**Expected behavior:**
+- Owner and Admin badges share the same prominent styling (they are both privileged roles)
+- Member badges are visually subdued
+- Auditor badges are outlined, visually distinct from member badges
+- All badges show the role name capitalized (CSS `capitalize` class)
+
+**Pass:** Each role badge has distinct, correct styling. Visual hierarchy: owner/admin (prominent) then auditor (outline) then member (subdued).
+
+**Fail / Common issues:**
+- All badges look the same — the `roleBadgeVariant` function may be returning the same variant. Inspect the function logic: it switches on the role string.
+- Badge text not capitalized — missing `capitalize` CSS class on the Badge component.
+
+---
+
+## ST3 — Pending Invitations Section
+
+**What it verifies:** Pending invitations are displayed correctly with email, role, date, and admin action buttons.
+
+**Steps:**
+1. Ensure at least one pending invitation exists (send one via Chapter 46 if needed).
+2. On the Users page, scroll to the **Pending Invitations** card.
+3. Verify each row shows:
+   - **Email**: the invited email address
+   - **Role**: badge showing the invited role
+   - **Sent**: the date the invitation was created
+   - **Action buttons** (admin-only): resend icon (paper plane) and revoke icon (trash)
+
+**Expected behavior:**
+- The Pending Invitations card only appears when there are pending invitations (`invitations.length > 0`)
+- Each invitation row has the correct email and role badge
+- Admin users see the resend and revoke buttons; non-admin members do not
+
+4. Test the **Resend** button:
+   - Click the paper plane icon on an invitation row
+   - A new invitation is created for the same email/role, and the old one is deleted
+
+5. Test the **Revoke** button:
+   - Click the trash icon on an invitation row
+   - The row disappears from the list
+
+**Pass:** Pending invitations render correctly, resend creates a new invitation, revoke removes it.
+
+**Fail / Common issues:**
+- Pending Invitations card not visible — no invitations with `status = 'pending'` exist for this org. Send a new invitation.
+- Resend shows "A pending invitation already exists" — the old invitation must be deleted before the new one is inserted. The handler deletes the old invite after creating the new one; if the new insert fails, the old invite remains.
+- Action buttons not visible — you are logged in as a `member` or `auditor`. Only admins/owners see the action column.
+
+---
+
+## ST4 — CSV Export
+
+**What it verifies:** The CSV export downloads a correctly formatted file with all active member data.
+
+**Steps:**
+1. On the Users page, click the **CSV** button (top right, next to the Invite User button).
+2. A file named `users.csv` downloads automatically.
+3. Open the file in a text editor or spreadsheet application.
+
+**Expected behavior:**
+- First row (headers): `Name,Email,Role,Joined`
+- Subsequent rows: one per active member, with values matching the table
+- Values containing commas or quotes are properly escaped (wrapped in double quotes, internal quotes doubled)
+- The file includes only active members (not pending members or pending invitations)
+
+Example content:
+```
+Name,Email,Role,Joined
+"Vikas S","vikas@networkershome.com","owner","2026-01-15T10:30:00.000Z"
+"Test User","testuser@example.com","member","2026-03-17T14:22:00.000Z"
+```
+
+**Pass:** CSV downloads with correct headers and data for all active members.
+
+**Fail / Common issues:**
+- File is empty (only headers) — `activeMembers` array is empty. Check that members have `status = 'active'`.
+- "Unknown" in the Name column — member has no `full_name` set in their profile. This is expected behavior (the CSV exports what the table displays).
+
+---
+
+## ST5 — Plan Limit Warning Banner
+
+**What it verifies:** The Free plan user limit warning appears at the correct thresholds.
+
+**Steps:**
+1. Log in to an organization on the Free plan.
+2. Check the user limit. By default, Free plan allows 3 users (configurable via `billing_subscriptions.user_limit`, defaults to 3 if no subscription exists, or 5 from the `invite_member` handler).
+3. Add members until you reach 80% of the limit.
+
+**Expected behavior based on thresholds:**
+- Below 80% of limit: no warning banner
+- At or above 80% but below 100%: **yellow warning** — "You're using N of LIMIT member slots. Upgrade your plan for unlimited users."
+- At 100% (limit reached): **red warning** — "You've used N of LIMIT member slots on the Free plan. Upgrade to invite more."
+- On paid plans (`plan !== "free"`): no warning banner regardless of member count (the percentage calculation is skipped)
+
+**Pass:** Warning banner appears at the correct threshold with the right color and message. No banner on paid plans.
+
+**Fail / Common issues:**
+- Banner never appears — the org may be on a paid plan, or the `useBillingData` hook may not be returning subscription data. Check `billingData?.subscription` in dev tools.
+- Banner shows wrong numbers — the count uses `activeMembers.length` (members with `status = 'active'`), not total members including pending. Verify the member statuses.
+- Banner appears on paid plans — the `isPaidPlan` check (`subscription?.plan && subscription.plan !== "free"`) may not be evaluating correctly for your plan type.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Active members table | All members listed with name, email, role, join date, "You" label |
+| ST2 | Role badge variants | Owner/Admin = default, Member = secondary, Auditor = outline |
+| ST3 | Pending invitations section | Invitations shown with resend/revoke, admin-only actions |
+| ST4 | CSV export | Downloads valid CSV with headers + active member data |
+| ST5 | Plan limit banner | Yellow at 80%, red at 100%, hidden on paid plans |

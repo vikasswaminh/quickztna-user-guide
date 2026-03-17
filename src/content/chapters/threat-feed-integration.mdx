@@ -1,0 +1,329 @@
+---
+title: "Threat Feed Integration Verification"
+topic: "Threat Intelligence"
+order: 64
+machines: ["Win-A"]
+summary: "Verify threat feed integration — check feed sources, update frequency, and cached entries."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA aggregates domains and IPs from multiple open-source threat intelligence feeds into a local cache used for DNS-level blocking. The system is managed through the DNS filtering handler (`handlers/dns-filter.ts`) and involves:
+
+- **14 built-in threat feeds** covering malware, phishing, C2, tracking, ads, and known-bad IP ranges
+- **`dns_feed_cache` table** -- stores domains from threat feeds with a 7-day TTL (`expires_at`)
+- **`threat_blocked_ips` table** -- stores IP/CIDR entries from IP-specific feeds (Spamhaus DROP/EDROP, CrowdSec)
+- **`dns_filter_policies` table** -- per-org configuration with `enabled_feeds` JSON array
+- **Feed sync** -- triggered manually via `POST /api/dns-filter` with `action: "sync_feeds"`
+- **Feed stats** -- queried via `action: "get_feed_stats"`
+
+The 14 available feeds are:
+
+| Key | Name | Format | Content |
+|-----|------|--------|---------|
+| `urlhaus` | URLhaus | hosts | Malware distribution hosts |
+| `phishtank` | OpenPhish | url | Phishing URLs |
+| `disconnect_tracking` | Disconnect Tracking | domain | Tracking domains |
+| `disconnect_ad` | Disconnect Ads | domain | Advertising domains |
+| `steven_black` | Steven Black's Unified Hosts | hosts | Adware + malware hosts |
+| `phishtank_community` | PhishTank | url (CSV) | Community-verified phishing URLs |
+| `abuse_ch_feodo` | Feodo Tracker | domain | Feodo/Emotet/Dridex C2 domains |
+| `abuse_ch_threatfox` | ThreatFox IOCs | hosts | ThreatFox malware C2 hosts |
+| `abuse_ch_ssl` | SSL Blacklist | url (CSV) | SSL certs used by botnet C2 servers |
+| `spamhaus_drop` | Spamhaus DROP | ip_cidr | Hijacked IP ranges |
+| `spamhaus_edrop` | Spamhaus EDROP | ip_cidr | Extended hijacked IP ranges |
+| `crowdsec_community` | CrowdSec Community | ip_cidr | Community-sourced threat IPs |
+| `hagezi_threat` | HageZi Threat Intelligence | hosts | Malware, C2, phishing |
+| `nocoin` | NoCoin Filter | hosts | Cryptojacking domains |
+
+Default enabled feeds (when a new policy is created): `urlhaus` and `steven_black`.
+
+DNS filtering is feature-gated: it requires the `dns_filtering` feature, which is available on `personal`, `business`, and `enterprise` plans (not `free`).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + API testing |
+
+**Prerequisites:**
+- Org on `business` or `enterprise` plan (DNS filtering feature enabled)
+- Admin role in the org (feed sync requires admin)
+
+---
+
+## ST1 -- View Available Feeds and Current Policy
+
+**What it verifies:** The `get_policy` action returns the list of available feeds and the org's current configuration.
+
+**Steps:**
+
+1. Call the DNS filter API:
+```powershell
+$body = @{
+    action = "get_policy"
+    org_id = "$ORG_ID"
+} | ConvertTo-Json
+
+$response = Invoke-RestMethod -Uri "https://login.quickztna.com/api/dns-filter" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$response.data | ConvertTo-Json -Depth 5
+```
+
+**Expected response structure:**
+```json
+{
+  "success": true,
+  "data": {
+    "policy": {
+      "id": "...",
+      "org_id": "...",
+      "enabled": true,
+      "blocked_categories": ["malware", "phishing"],
+      "log_queries": true,
+      "block_uncategorized": false,
+      "enabled_feeds": ["urlhaus", "steven_black", "abuse_ch_feodo"]
+    },
+    "custom_blocklist": [],
+    "custom_allowlist": [],
+    "available_categories": ["malware", "phishing", "c2", "tracking", "advertising", "adult", "gambling", "social_media", "streaming", "gaming"],
+    "available_feeds": [
+      { "key": "urlhaus", "name": "URLhaus", "url": "https://urlhaus.abuse.ch/downloads/hostfile/", "description": "Malware distribution hosts", "format": "hosts" },
+      { "key": "phishtank", "name": "OpenPhish", "url": "https://openphish.com/feed.txt", "description": "Phishing URLs", "format": "url" }
+    ]
+  }
+}
+```
+
+2. Verify `available_feeds` contains all 14 feeds.
+
+3. Verify `enabled_feeds` in the policy matches what is configured on the DNS page.
+
+**Pass:** 14 feeds listed in `available_feeds`, `enabled_feeds` reflects the org's configuration, 10 categories in `available_categories`.
+
+**Fail / Common issues:**
+- `403 FORBIDDEN` -- user is not a member of the org
+- Feature gate error -- org is on the `free` plan; DNS filtering requires `personal` or higher
+
+---
+
+## ST2 -- Sync Threat Feeds
+
+**What it verifies:** The `sync_feeds` action fetches data from all enabled feeds, parses domains/IPs, and populates the `dns_feed_cache` and `threat_blocked_ips` tables.
+
+**Steps:**
+
+1. Trigger a feed sync (admin required):
+```powershell
+$body = @{
+    action = "sync_feeds"
+    org_id = "$ORG_ID"
+} | ConvertTo-Json
+
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/dns-filter" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$result.data | ConvertTo-Json -Depth 3
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "total_domains": 45230,
+    "feeds": [
+      { "feed": "urlhaus", "domains": 1250, "status": "synced" },
+      { "feed": "steven_black", "domains": 42000, "status": "synced" },
+      { "feed": "spamhaus_drop", "domains": 0, "ips": 850, "status": "synced" },
+      { "feed": "crowdsec_community", "domains": 0, "ips": 5200, "status": "synced" }
+    ]
+  }
+}
+```
+
+2. For each feed in the `feeds` array, verify:
+   - `status` is `"synced"` (not `"fetch_failed"` or `"error: ..."`)
+   - Domain-type feeds have `domains` greater than 0
+   - IP/CIDR feeds (`spamhaus_drop`, `spamhaus_edrop`, `crowdsec_community`) have `ips` greater than 0
+
+3. The sync may take 10-30 seconds depending on how many feeds are enabled and their response sizes.
+
+**Pass:** All enabled feeds show `status: "synced"` with non-zero domain or IP counts.
+
+**Fail / Common issues:**
+- `"status": "fetch_failed"` -- the upstream feed URL may be down or rate-limited; this is transient
+- `"status": "error: ..."` -- parse error; the feed format may have changed
+- `403 FORBIDDEN` -- non-admin user; feed sync requires admin role
+- Timeout -- too many feeds enabled; the 15-second per-feed timeout (`AbortSignal.timeout(15000)`) may expire for slow feeds
+
+---
+
+## ST3 -- Check Feed Stats
+
+**What it verifies:** The `get_feed_stats` action returns current cache statistics for each synced feed.
+
+**Steps:**
+
+1. Query feed stats (does not require admin):
+```powershell
+$body = @{
+    action = "get_feed_stats"
+    org_id = "$ORG_ID"
+} | ConvertTo-Json
+
+$stats = Invoke-RestMethod -Uri "https://login.quickztna.com/api/dns-filter" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$stats.data | ConvertTo-Json -Depth 3
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "feeds": [
+      { "feed_name": "urlhaus", "domain_count": 1250, "earliest_expiry": "2026-03-24T..." },
+      { "feed_name": "steven_black", "domain_count": 42000, "earliest_expiry": "2026-03-24T..." }
+    ],
+    "ip_feeds": [
+      { "feed_name": "spamhaus_drop", "ip_count": 850, "earliest_expiry": "2026-03-24T..." }
+    ]
+  }
+}
+```
+
+2. Verify that:
+   - `feeds` contains an entry for each domain-type feed that was synced
+   - `ip_feeds` contains entries for IP/CIDR feeds (Spamhaus, CrowdSec)
+   - `earliest_expiry` dates are approximately 7 days in the future (feeds are cached with `NOW() + INTERVAL '7 days'`)
+   - `domain_count` and `ip_count` values are consistent with the sync results from ST2
+
+**Pass:** Feed stats are non-empty, expiry dates are in the future, counts match sync results.
+
+**Fail / Common issues:**
+- Empty `feeds` array -- feeds were never synced or all entries have expired. Run `sync_feeds` first (ST2).
+- `ip_feeds` is empty -- the `threat_blocked_ips` table may not exist yet; this is handled gracefully with a try/catch.
+
+---
+
+## ST4 -- Update Enabled Feeds
+
+**What it verifies:** An admin can change which feeds are enabled, and subsequent syncs only fetch the selected feeds.
+
+**Steps:**
+
+1. Update the policy to enable additional feeds:
+```powershell
+$body = @{
+    action        = "update_policy"
+    org_id        = "$ORG_ID"
+    enabled       = $true
+    enabled_feeds = @("urlhaus", "steven_black", "abuse_ch_feodo", "hagezi_threat", "spamhaus_drop")
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/dns-filter" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": { "updated": true }
+}
+```
+
+2. Trigger a sync:
+```powershell
+$body = @{ action = "sync_feeds"; org_id = "$ORG_ID" } | ConvertTo-Json
+
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/dns-filter" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$result.data.feeds | ConvertTo-Json
+```
+
+3. Verify the sync results include exactly the 5 feeds from step 1 (not all 14).
+
+4. Reduce back to fewer feeds:
+```powershell
+$body = @{
+    action        = "update_policy"
+    org_id        = "$ORG_ID"
+    enabled_feeds = @("urlhaus", "steven_black")
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/dns-filter" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+**Pass:** Sync only processes feeds listed in `enabled_feeds`; updating the policy changes which feeds sync.
+
+**Fail / Common issues:**
+- All 14 feeds synced despite only 5 enabled -- verify the `enabled_feeds` column was actually updated (query `get_policy` to confirm)
+- `403 FORBIDDEN` -- non-admin users cannot update the policy
+
+---
+
+## ST5 -- Feed Cache Expiry Behaviour
+
+**What it verifies:** Feed cache entries expire after 7 days and are replaced on the next sync.
+
+**Steps:**
+
+1. Check the current feed cache stats:
+```powershell
+$body = @{ action = "get_feed_stats"; org_id = "$ORG_ID" } | ConvertTo-Json
+
+$stats = Invoke-RestMethod -Uri "https://login.quickztna.com/api/dns-filter" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json" } `
+    -Body $body
+
+$stats.data.feeds | Format-Table feed_name, domain_count, earliest_expiry
+```
+
+2. Verify that `earliest_expiry` for each feed is approximately 7 days from the last sync time.
+
+3. The `sync_feeds` action performs `DELETE FROM dns_feed_cache WHERE feed_name = ?` before re-inserting, so a sync always replaces the entire feed. This means:
+   - Old entries are removed even if they have not expired
+   - Fresh entries get a new 7-day TTL
+   - The `dns_feed_cache` primary key is `(domain, feed_name)` with `ON CONFLICT DO NOTHING` for deduplication
+
+4. For IP/CIDR feeds, the same pattern applies to `threat_blocked_ips`: `DELETE FROM threat_blocked_ips WHERE feed_name = ?` followed by batch insert.
+
+5. The feed cache is capped at 50,000 domains per feed (`slice(0, 50000)`) and 10,000 IPs per feed (`slice(0, 10000)`).
+
+**Pass:** Expiry dates are 7 days from sync time; re-syncing refreshes all entries.
+
+**Fail / Common issues:**
+- Expiry dates are in the past -- feeds were synced more than 7 days ago; run `sync_feeds` again
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Key assertion |
+|----------|---------------|---------------|
+| ST1 | Policy and feed listing | 14 available feeds, current `enabled_feeds` visible |
+| ST2 | Feed sync execution | All enabled feeds show `synced` status with non-zero counts |
+| ST3 | Feed cache statistics | Domain and IP counts match sync results, expiry 7 days out |
+| ST4 | Enable/disable feeds | Only selected feeds are synced; policy updates persist |
+| ST5 | Cache expiry and refresh | 7-day TTL; sync replaces old entries; caps at 50k domains / 10k IPs per feed |

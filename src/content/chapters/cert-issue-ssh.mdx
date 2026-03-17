@@ -1,0 +1,414 @@
+---
+title: "Issue SSH Certificate"
+topic: "Certificate Authority"
+order: 57
+machines: ["Win-A", "Linux-C"]
+summary: "Issue an SSH certificate for a user or host -- verify certificate type, principals, and validity."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA's SSH Certificate Authority issues real OpenSSH-format certificates (`ecdsa-sha2-nistp256-cert-v01@openssh.com`) that are compatible with `ssh-keygen -L`. This is a separate CA from the X.509 CA -- it has its own key pair stored in the `ssh_ca_public_key` and `ssh_ca_private_key_encrypted` columns of the `ca_configs` table.
+
+The SSH certificate flow uses `POST /api/ssh-certificate` with these actions:
+
+1. **`action: "initialize_ssh_ca"`** -- Generates an ECDSA P-256 key pair for the SSH CA. The public key is stored in OpenSSH format (`ecdsa-sha2-nistp256 base64...`). Returns the public key and fingerprint with a usage hint to add it to `sshd_config` as `TrustedUserCAKeys`.
+
+2. **`action: "issue_ssh_cert"`** -- Issues a **user certificate** (type 1) signed by the SSH CA. Generates an ephemeral ECDSA P-256 key pair for the certificate. Required fields:
+   - **org_id** -- organization scope
+   - **principal** (required) -- the SSH username (e.g., `ubuntu`, `root`)
+   - **ttl_hours** (optional, default 8) -- validity period; must be between 1 and 24 hours
+   - **machine_id** (optional) -- ties the certificate to a machine; triggers quarantine/posture checks
+   - **extensions** (optional) -- custom SSH extensions to merge with defaults
+
+   Default extensions included: `permit-agent-forwarding`, `permit-port-forwarding`, `permit-pty`.
+
+   The key ID is formatted as `quickztna-{org_id}-{principal}-{serial_hex}`. Certificates are stored in `issued_certificates` with `subject_cn` prefixed by `ssh:` (e.g., `ssh:ubuntu`).
+
+3. **`action: "list_ssh_certs"`** -- Lists SSH certificates (filtered by `subject_cn LIKE 'ssh:%'`).
+
+4. **`action: "revoke_ssh_cert"`** -- Revokes an SSH certificate by ID.
+
+5. **`action: "get_ssh_ca_public_key"`** -- Returns the SSH CA public key for configuring `sshd_config`. Any org member can call this (not admin-only).
+
+Write operations (`initialize_ssh_ca`, `issue_ssh_cert`, `revoke_ssh_cert`) require **org admin** role. Read operations (`list_ssh_certs`, `get_ssh_ca_public_key`) require **org membership**.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard, PowerShell for API calls |
+| <MachineRef name="Linux-C" /> | Target SSH server to test certificate authentication |
+
+Ensure both machines are online and in the same organization. Have your JWT token and org ID ready.
+
+---
+
+## ST1 -- Initialize the SSH CA
+
+**What it verifies:** The `initialize_ssh_ca` action generates a valid SSH CA key pair and returns the public key in OpenSSH format.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "initialize_ssh_ca",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "ssh_ca_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZH...",
+    "fingerprint": "AB:CD:12:...",
+    "message": "SSH CA initialized. Add to sshd_config: TrustedUserCAKeys /path/to/ca.pub"
+  },
+  "error": null
+}
+```
+
+2. Verify:
+   - `ssh_ca_public_key` starts with `ecdsa-sha2-nistp256 `
+   - `fingerprint` is a colon-separated uppercase hex string
+   - `message` includes the `TrustedUserCAKeys` hint
+
+3. Save the CA public key for later use:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"action": "initialize_ssh_ca", "org_id": "YOUR_ORG_ID"}' | python -c "import sys,json; print(json.load(sys.stdin)['data']['ssh_ca_public_key'])" > ssh_ca.pub
+```
+
+**Pass:** Response returns `success: true` with an OpenSSH-format public key and SHA-256 fingerprint.
+
+**Fail / Common issues:**
+- 403 Forbidden -- you must be an org admin to initialize the SSH CA.
+- Calling `initialize_ssh_ca` again updates the existing CA key pair (does not error). The old SSH certificates will no longer verify against the new CA.
+
+---
+
+## ST2 -- Issue an SSH User Certificate
+
+**What it verifies:** The `issue_ssh_cert` action returns a valid OpenSSH certificate with correct principal, validity window, and extensions.
+
+**Prerequisites:** SSH CA must be initialized (ST1 completed).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, run:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue_ssh_cert",
+    "org_id": "YOUR_ORG_ID",
+    "principal": "ubuntu",
+    "ttl_hours": 4
+  }'
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "certificate_id": "uuid-...",
+    "certificate": "ecdsa-sha2-nistp256-cert-v01@openssh.com AAAAI...",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nMIG...\n-----END PRIVATE KEY-----",
+    "public_key": "ecdsa-sha2-nistp256 AAAAE2VjZH...",
+    "serial_number": "0000abcdef123456",
+    "principal": "ubuntu",
+    "valid_after": "2026-03-17T10:00:00.000Z",
+    "valid_before": "2026-03-17T14:00:00.000Z",
+    "ttl_hours": 4,
+    "fingerprint": "EF:01:23:...",
+    "usage": "Save certificate as id_ecdsa-cert.pub, private key as id_ecdsa. Use: ssh -i id_ecdsa user@host"
+  },
+  "error": null
+}
+```
+
+2. Verify:
+   - HTTP status is **201** (not 200)
+   - `certificate` starts with `ecdsa-sha2-nistp256-cert-v01@openssh.com `
+   - `private_key` is a PKCS#8 PEM
+   - `public_key` is in OpenSSH format
+   - `principal` matches what you requested (`ubuntu`)
+   - `ttl_hours` is 4
+   - `valid_before` is approximately 4 hours after `valid_after`
+   - `usage` field tells you how to save and use the files
+
+3. Save the certificate and key for testing in ST3:
+```powershell
+# Save private key
+# (copy the private_key value to id_ecdsa)
+
+# Save certificate
+# (copy the certificate value to id_ecdsa-cert.pub)
+```
+
+**Pass:** Response returns HTTP 201 with a valid OpenSSH certificate, private key, and all metadata fields.
+
+**Fail / Common issues:**
+- `SSH_CA_NOT_INITIALIZED` (400) -- run ST1 first to initialize the SSH CA.
+- `MISSING_FIELDS` (400) -- the `principal` field is missing. It is required for SSH certificates.
+- `INVALID_TTL` (400) -- `ttl_hours` must be between 1 and 24 for SSH certificates (stricter than X.509).
+
+---
+
+## ST3 -- Verify SSH Certificate on Linux
+
+**What it verifies:** The issued SSH certificate can be inspected with `ssh-keygen -L` and contains the correct principal, validity, and extensions.
+
+**Prerequisites:** Certificate and private key from ST2 saved to files.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, save the certificate and key from ST2:
+```bash
+# Save the private key (copy PEM content)
+cat > /tmp/id_ecdsa << 'EOF'
+-----BEGIN PRIVATE KEY-----
+MIG...paste full key here...
+-----END PRIVATE KEY-----
+EOF
+chmod 600 /tmp/id_ecdsa
+
+# Save the certificate (copy the full single-line certificate)
+echo "ecdsa-sha2-nistp256-cert-v01@openssh.com AAAAI...paste here..." > /tmp/id_ecdsa-cert.pub
+```
+
+2. Inspect the certificate:
+```bash
+ssh-keygen -L -f /tmp/id_ecdsa-cert.pub
+```
+
+**Expected output (structure):**
+```
+/tmp/id_ecdsa-cert.pub:
+        Type: ecdsa-sha2-nistp256-cert-v01@openssh.com user certificate
+        Public key: ECDSA-CERT SHA256:...
+        Signing CA: ECDSA SHA256:...
+        Key ID: "quickztna-YOUR_ORG_ID-ubuntu-0000abcdef123456"
+        Serial: 12345678901234
+        Valid: 2026-03-17T10:00:00 to 2026-03-17T14:00:00
+        Principals:
+                ubuntu
+        Critical Options: (none)
+        Extensions:
+                permit-agent-forwarding
+                permit-port-forwarding
+                permit-pty
+```
+
+3. Verify:
+   - Type says **user certificate**
+   - Key ID contains your org ID, the principal name, and the serial hex
+   - Serial matches the `serial_number` from the API response (as a decimal number)
+   - Principals list contains exactly `ubuntu`
+   - Valid range matches `valid_after` and `valid_before` from the API response
+   - Extensions include `permit-agent-forwarding`, `permit-port-forwarding`, and `permit-pty`
+   - Critical Options is `(none)` (no critical options are set by default)
+
+**Pass:** `ssh-keygen -L` parses the certificate without errors and shows the correct type, principal, validity, and extensions.
+
+**Fail / Common issues:**
+- "is not a certificate" -- the file was not saved correctly. Ensure it is a single line starting with the cert type string.
+- Missing principals -- the `principal` field was not provided in the API request.
+- Wrong validity window -- check that the system clocks on the API server and test machine are synchronized.
+
+---
+
+## ST4 -- Validate TTL Boundaries
+
+**What it verifies:** The SSH certificate handler enforces the 1--24 hour TTL range and uses the default of 8 hours when not specified.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, test the default TTL (no `ttl_hours` provided):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue_ssh_cert",
+    "org_id": "YOUR_ORG_ID",
+    "principal": "test-default-ttl"
+  }'
+```
+
+**Expected:** `ttl_hours` in the response is `8` (the default). The `valid_before` timestamp is approximately 8 hours after `valid_after`.
+
+2. Test the lower bound (1 hour):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue_ssh_cert",
+    "org_id": "YOUR_ORG_ID",
+    "principal": "test-min-ttl",
+    "ttl_hours": 1
+  }'
+```
+
+**Expected:** `success: true`, `ttl_hours: 1`.
+
+3. Test exceeding the upper bound (25 hours):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue_ssh_cert",
+    "org_id": "YOUR_ORG_ID",
+    "principal": "test-over-ttl",
+    "ttl_hours": 25
+  }'
+```
+
+**Expected error response (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_TTL",
+    "message": "ttl_hours must be between 1 and 24 for SSH certificates"
+  }
+}
+```
+
+4. Test zero TTL:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue_ssh_cert",
+    "org_id": "YOUR_ORG_ID",
+    "principal": "test-zero-ttl",
+    "ttl_hours": 0
+  }'
+```
+
+**Expected:** 400 with `INVALID_TTL` -- zero is below the minimum of 1.
+
+**Pass:** Default TTL is 8 hours. TTL of 1 succeeds. TTL of 25 and 0 both return `INVALID_TTL` errors.
+
+**Fail / Common issues:**
+- TTL of 25 is accepted -- this is a bug. The handler should reject any value outside 1--24.
+- Default TTL is not 8 -- check the handler code; `ttl_hours ?? 8` provides the fallback.
+
+---
+
+## ST5 -- Retrieve SSH CA Public Key and List Certificates
+
+**What it verifies:** The `get_ssh_ca_public_key` action returns the CA public key for server configuration, and `list_ssh_certs` returns only SSH certificates (filtered by `ssh:` prefix).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, get the SSH CA public key:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "get_ssh_ca_public_key",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "ssh_ca_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZH...",
+    "fingerprint": "AB:CD:12:...",
+    "usage": "Add to /etc/ssh/sshd_config: TrustedUserCAKeys /path/to/ca.pub"
+  },
+  "error": null
+}
+```
+
+This action only requires org membership (not admin), so any authenticated user in the org can retrieve it.
+
+2. On <MachineRef name="Linux-C" />, you would use this key in `sshd_config`:
+```bash
+# Save the CA public key
+echo "ecdsa-sha2-nistp256 AAAAE2VjZH..." > /etc/ssh/ca.pub
+
+# Add to sshd_config
+echo "TrustedUserCAKeys /etc/ssh/ca.pub" >> /etc/ssh/sshd_config
+
+# Reload sshd
+systemctl reload sshd
+```
+(This step is informational -- only do this on a test machine you control.)
+
+3. List all SSH certificates:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_ssh_certs",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "certificates": [
+      {
+        "id": "uuid-...",
+        "org_id": "YOUR_ORG_ID",
+        "machine_id": null,
+        "serial_number": "0000abcdef123456",
+        "subject_cn": "ssh:ubuntu",
+        "expires_at": "2026-03-17T14:00:00.000Z",
+        "fingerprint": "EF:01:23:...",
+        "revoked": false,
+        "revoked_at": null,
+        "issued_at": "2026-03-17T10:00:00.000Z"
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+4. Verify:
+   - Only SSH certificates appear (all `subject_cn` values start with `ssh:`)
+   - X.509 certificates from `POST /api/issue-certificate` do not appear in this list
+   - Certificates from ST2 and ST4 are present
+   - The list is ordered by `issued_at DESC` (newest first), limit 100
+
+**Pass:** CA public key is returned in OpenSSH format. The SSH certificate list shows only SSH-type certificates with `ssh:` prefix in `subject_cn`.
+
+**Fail / Common issues:**
+- `SSH_CA_NOT_INITIALIZED` (400) -- the SSH CA was never initialized. Run ST1 first.
+- Empty certificate list -- verify you are using the correct `org_id` where SSH certificates were issued.
+- X.509 certificates appearing in the list -- the SQL filter `subject_cn LIKE 'ssh:%'` is not working correctly.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | SSH CA initialization generates an ECDSA P-256 key pair in OpenSSH format |
+| ST2 | SSH user certificates are issued with correct principal, serial, validity, and extensions (HTTP 201) |
+| ST3 | Issued certificates are parseable by `ssh-keygen -L` with correct type, key ID, and principals |
+| ST4 | TTL enforcement rejects values outside 1--24 hours and defaults to 8 hours |
+| ST5 | CA public key retrieval works for non-admin members; list returns only SSH-type certificates |

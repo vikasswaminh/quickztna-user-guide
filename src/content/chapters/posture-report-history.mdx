@@ -1,0 +1,315 @@
+---
+title: "Posture Report History"
+topic: "Posture Policies"
+order: 54
+machines: ["Win-A", "Linux-C"]
+summary: "View posture report history for a machine — verify compliance status tracking over time."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Posture reports are stored in the `posture_reports` table with a **UNIQUE constraint on `machine_id`** (added in migration `002_quarantine_and_fixes.sql`). This means each machine has exactly **one** posture report row that is upserted on every report cycle. The handler uses `ON CONFLICT (machine_id) DO UPDATE` to overwrite the previous report.
+
+This design means:
+- There is no historical time-series of posture reports in the database -- only the **latest** report per machine
+- The `reported_at` timestamp shows when the last report was received
+- To track compliance changes over time, you use the **audit log** (Loki), which records `machine.auto_quarantine` and `machine.auto_unquarantine` events
+
+The `posture_reports` table schema (after all migrations):
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | UUID | Primary key |
+| `org_id` | UUID | Organization reference |
+| `machine_id` | UUID | UNIQUE -- one report per machine |
+| `os_version` | TEXT | e.g., `linux/amd64`, `windows/amd64` |
+| `disk_encrypted` | BOOLEAN | Full disk encryption status |
+| `firewall_enabled` | BOOLEAN | Host firewall status |
+| `antivirus_enabled` | BOOLEAN | Antivirus running |
+| `antivirus_name` | TEXT | Name of AV product (nullable) |
+| `last_patch_date` | TIMESTAMPTZ | Last OS patch date (nullable) |
+| `compliant` | BOOLEAN | Result of last policy evaluation |
+| `violations` | JSONB | Array of violation codes |
+| `reported_at` | TIMESTAMPTZ | Timestamp of last report |
+| `usb_storage_disabled` | BOOLEAN | Extended posture (migration 034) |
+| `screen_lock_timeout` | INTEGER | Seconds (migration 034) |
+| `firewall_audit` | JSONB | Detailed firewall state (migration 034) |
+| `pending_security_updates` | INTEGER | Count of pending patches (migration 034) |
+| `reboot_pending` | BOOLEAN | Reboot needed (migration 034) |
+
+The dashboard also shows posture compliance statistics via the CRUD summary endpoint, which runs:
+```sql
+SELECT COUNT(*) as total, SUM(CASE WHEN compliant = TRUE THEN 1 ELSE 0 END) as compliant FROM posture_reports WHERE org_id = ?
+```
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard + API queries |
+| <MachineRef name="Linux-C" /> | Machine with posture reports to inspect |
+
+Ensure <MachineRef name="Linux-C" /> has sent at least one posture report (Chapter 52).
+
+---
+
+## ST1 -- View Latest Posture Report via API
+
+**What it verifies:** The CRUD endpoint returns the latest posture report for a specific machine.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, query the posture report by machine ID:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$machineId = "LINUX_C_MACHINE_ID"
+
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+
+$result.data | Format-List
+```
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "<uuid>",
+      "org_id": "<org-id>",
+      "machine_id": "<machine-id>",
+      "os_version": "linux/amd64",
+      "disk_encrypted": false,
+      "firewall_enabled": false,
+      "antivirus_enabled": false,
+      "antivirus_name": null,
+      "last_patch_date": null,
+      "compliant": false,
+      "violations": ["disk_encryption_required", "firewall_required", "antivirus_required"],
+      "reported_at": "2026-03-17T...",
+      "usb_storage_disabled": null,
+      "screen_lock_timeout": null,
+      "firewall_audit": null,
+      "pending_security_updates": null,
+      "reboot_pending": null
+    }
+  ]
+}
+```
+
+**Pass:** Exactly one row is returned for the machine, with all posture fields populated and `reported_at` reflecting the time of the last report.
+
+**Fail / Common issues:**
+- Empty array -- no posture report exists for this machine. Run `ztna posture status` on Linux-C.
+- Multiple rows -- this should be impossible due to the UNIQUE constraint on `machine_id`. If it happens, migration 002 may not have run.
+
+---
+
+## ST2 -- View All Org Posture Reports via API
+
+**What it verifies:** An admin can list all posture reports for the organization to see compliance across all machines.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, query all posture reports:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?org_id=eq.$orgId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+
+$result.data | Format-Table machine_id, os_version, disk_encrypted, firewall_enabled, antivirus_enabled, compliant, reported_at
+```
+
+**Expected behavior:**
+- One row per machine that has sent at least one posture report
+- Each row shows the latest posture state and compliance status
+- The `org_id` filter ensures only your org's reports are returned (row-level security in `db-crud.ts`)
+
+**Pass:** All machines with posture reports are listed, each with exactly one row. The `compliant` field accurately reflects whether the machine meets the current policy.
+
+**Fail / Common issues:**
+- Missing machines -- machines that have never sent a posture report will not have a row. This includes machines registered before posture was enabled.
+
+---
+
+## ST3 -- Verify Posture Report Updates on Compliance Change
+
+**What it verifies:** When a machine's posture changes (e.g., firewall is enabled), the posture report row is updated in-place with the new values.
+
+**Steps:**
+
+1. On <MachineRef name="Linux-C" />, note the current posture state:
+
+```bash
+ztna posture status --json
+```
+
+Record the `firewall_enabled` value (likely `false`).
+
+2. Enable the firewall on Linux-C:
+
+```bash
+sudo ufw enable
+```
+
+Or add an iptables rule:
+
+```bash
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+```
+
+3. Trigger a new posture report:
+
+```bash
+ztna posture status
+```
+
+The `Firewall` field should now show `enabled`.
+
+4. On <MachineRef name="Win-A" />, query the posture report again:
+
+```powershell
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_reports?machine_id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+
+$result.data[0] | Select-Object firewall_enabled, compliant, violations, reported_at
+```
+
+**Expected behavior:**
+- `firewall_enabled` is now `true`
+- `violations` no longer includes `firewall_required`
+- `reported_at` has been updated to the new report time
+- If the only remaining violations are cleared, `compliant` becomes `true`
+- Still exactly one row (upsert behavior)
+
+**Pass:** The posture report row was updated in-place with the new firewall status, and violations were recalculated.
+
+**Fail / Common issues:**
+- `firewall_enabled` still false -- the posture check on Linux uses `iptables -L -n` and looks for rules beyond default chain headers, or checks `ufw status` for "active". If your iptables rule was not added correctly, the check may fail.
+- Two rows exist -- this indicates a bug in the UNIQUE constraint. Should not happen.
+
+---
+
+## ST4 -- Check Compliance Summary on Dashboard
+
+**What it verifies:** The dashboard shows aggregate posture compliance statistics for the organization.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/posture-policies` in a browser.
+
+2. Look for compliance summary information showing the total number of machines with posture reports and how many are compliant.
+
+3. Alternatively, check the dashboard overview at `https://login.quickztna.com/dashboard`, which fetches summary stats including `postureTotal` and `postureCompliant` from the CRUD summary endpoint.
+
+4. Verify via API:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+# The dashboard calls this summary endpoint internally
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/organizations?id=eq.$orgId&_summary=true" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+The response includes `postureTotal` and `postureCompliant` fields.
+
+**Expected behavior:**
+- `postureTotal` equals the number of machines that have sent at least one posture report
+- `postureCompliant` equals the count of machines where `compliant = true`
+- These numbers should match what you see when listing posture reports in ST2
+
+**Pass:** Dashboard compliance numbers match the actual data in `posture_reports`.
+
+**Fail / Common issues:**
+- Numbers show 0 -- no posture reports exist yet. Connect machines and let them report.
+- Numbers are stale -- the dashboard may cache data. Refresh the page.
+
+---
+
+## ST5 -- Verify Auto-Unquarantine on Compliance Recovery
+
+**What it verifies:** When a quarantined machine becomes compliant (all violations resolved), the server automatically sets its status back to `online` and logs an audit event.
+
+**Steps:**
+
+1. Ensure <MachineRef name="Linux-C" /> is currently quarantined (Chapter 53, ST1) and enforcement is `enforce`.
+
+2. Fix all posture violations on Linux-C. For example, enable the firewall and install ClamAV:
+
+```bash
+sudo ufw enable
+sudo apt-get install -y clamav clamav-daemon
+sudo systemctl start clamav-daemon
+```
+
+For disk encryption, LUKS must be set up on the root volume -- this is not practical to change on a running system. If the policy requires disk encryption, you may need to temporarily disable that requirement in the policy:
+
+```powershell
+# On Win-A: update the policy to only require firewall + antivirus
+$token = "YOUR_JWT_TOKEN"
+$policyId = "YOUR_POLICY_ID"
+
+$body = @{
+    _filters = @{ id = $policyId }
+    require_disk_encryption = $false
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies" `
+    -Method PATCH `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+3. Wait for the client's quarantine polling cycle (60 seconds) or manually trigger:
+
+```bash
+ztna posture status
+```
+
+4. On <MachineRef name="Win-A" />, check the machine status:
+
+```powershell
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/machines?id=eq.$machineId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+
+$result.data[0].status
+```
+
+**Expected behavior:**
+- Machine `status` changes from `quarantined` to `online`
+- The posture report shows `compliant: true` and `violations: []`
+- A `machine.auto_unquarantine` audit event was logged
+- The Go client exits the QUARANTINE state and reconnects (logs: "Posture compliant -- exiting quarantine, reconnecting")
+
+**Pass:** Machine automatically transitions from `quarantined` to `online` once all policy requirements are met.
+
+**Fail / Common issues:**
+- Machine stays quarantined -- check the posture report. Are all violations cleared? Is there a `max_patch_age_days` requirement that is still failing?
+- Client does not reconnect -- older client versions may not handle the quarantine-to-online transition. Check `ztna status` after the status change.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Latest posture report is retrievable per-machine via API |
+| ST2 | All org posture reports are listable with org-scoped filtering |
+| ST3 | Posture report row is upserted when device state changes |
+| ST4 | Dashboard shows accurate aggregate compliance statistics |
+| ST5 | Auto-unquarantine restores `online` status when violations are resolved |

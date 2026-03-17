@@ -1,0 +1,271 @@
+---
+title: "Delete Group with ACL Dependency Check"
+topic: "Network Segmentation (Departments)"
+order: 35
+machines: ["Win-A"]
+summary: "Delete segmentation groups and verify behavior when ACL rules reference the group."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+When a segmentation group is deleted, two things happen at the database level:
+
+1. **Members cascade-deleted:** All rows in `segmentation_group_members` with the matching `group_id` are automatically removed (the FK has `ON DELETE CASCADE`).
+2. **ACL rules are NOT updated:** The `acl_rules` table stores group references as plain text (e.g., `group:engineering` in the `source` or `destination` column). Deleting a group does NOT modify any ACL rules. Those rules will simply stop matching any machine because the group no longer exists in the database.
+
+The dashboard provides a warning when deleting a group that is referenced by ACL rules. The Segmentation page scans all ACL rules for `group:<name>` patterns and shows a count of dependent rules. When you click the delete button, a confirmation dialog appears with a warning if dependencies exist.
+
+Key implementation details (from `SegmentationPage.tsx`):
+- `fetchAclDeps()` scans `acl_rules` for regex matches on `group:(\S+)` in both `source` and `destination` fields
+- `handleDeleteClick()` checks if the group name appears in the dependency map
+- If dependencies exist, the delete confirmation shows: "Warning: This group is referenced by N ACL rule(s). Deleting it may break those rules."
+- The actual delete uses: `DELETE /api/db/segmentation_groups?org_id=X&id=eq.GROUP_ID` with an empty JSON body
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin dashboard + API testing |
+
+**Prerequisite:** Groups `engineering`, `finance`, and `marketing-team` exist from previous chapters. The `engineering-to-finance` ACL rule references both `engineering` and `finance` groups.
+
+---
+
+## ST1 -- Delete a Group with No ACL Dependencies
+
+**What it verifies:** Deleting a group that is not referenced by any ACL rule proceeds without a warning and cleanly removes the group and its members.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/segmentation`.
+2. Verify that the `marketing-team` group has NO ACL badge (no rules reference it).
+3. Click the red trash icon on the `marketing-team` card.
+4. The confirmation dialog should appear with the message: "This action cannot be undone. The segmentation group will be permanently removed."
+   - Note: There should be NO warning about ACL dependencies.
+5. Confirm the deletion.
+
+**Expected:** Toast "Group deleted" appears. The `marketing-team` card disappears from the page.
+
+6. Verify via API that the group no longer exists:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&name=eq.marketing-team" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"data": []`
+
+7. Verify that any members that were in the group are also removed:
+```bash
+# If you know the old group ID
+curl -s "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** No membership rows reference the deleted group ID (they were cascade-deleted).
+
+**Pass:** Group and its members are removed. No ACL warning shown. API confirms deletion.
+
+---
+
+## ST2 -- Delete a Group with ACL Dependencies (Warning Flow)
+
+**What it verifies:** Deleting a group that IS referenced by ACL rules shows a warning, and after confirmation the group is deleted but the ACL rules remain with stale `group:` references.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, on the Segmentation page, verify that the `finance` group shows an ACL badge (e.g., "1 ACL rule").
+2. Click the red trash icon on the `finance` card.
+3. The confirmation dialog should include a warning message similar to: "Warning: This group is referenced by 1 ACL rule(s). Deleting it may break those rules."
+4. Confirm the deletion anyway.
+
+**Expected:** Toast "Group deleted" appears. The `finance` card disappears.
+
+5. Check the `engineering-to-finance` ACL rule still exists:
+```bash
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID&name=eq.engineering-to-finance" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** The rule still exists with `destination: "group:finance"`. The rule is NOT automatically deleted or modified.
+
+6. Evaluate the rule -- it should no longer match any destination because the `finance` group no longer exists:
+```bash
+WIN_B_ID="WIN_B_MACHINE_ID"
+LINUX_C_ID="LINUX_C_MACHINE_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"org_id\": \"$ORG_ID\",
+    \"source_machine_id\": \"$WIN_B_ID\",
+    \"destination_machine_id\": \"$LINUX_C_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** The `engineering-to-finance` rule no longer matches because the `group:finance` selector finds no matching group in the database. The result depends on whether other rules match.
+
+**Pass:** Warning shown before deletion. Group deleted. ACL rule persists with stale reference. ACL evaluation no longer matches the deleted group.
+
+---
+
+## ST3 -- Delete Group via API
+
+**What it verifies:** Groups can be deleted programmatically. The DELETE endpoint requires an empty JSON body, admin auth, and the `org_id` + `id` filters.
+
+**Steps:**
+1. First, create a temporary group for this test:
+```bash
+TOKEN="YOUR_ADMIN_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+USER_ID="YOUR_USER_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG_ID\",\"name\":\"temp-delete-test\",\"description\":\"Temporary group for delete testing\",\"created_by\":\"$USER_ID\"}" | python3 -m json.tool
+```
+
+Note the `id` from the response.
+
+2. Delete the group via API:
+```bash
+TEMP_GROUP_ID="THE_TEMP_GROUP_ID"
+
+curl -s -X DELETE "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&id=eq.$TEMP_GROUP_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": null
+}
+```
+
+3. Verify deletion:
+```bash
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&name=eq.temp-delete-test" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"data": []`
+
+**Pass:** API delete returns success. Group no longer exists.
+
+**Fail / Common issues:**
+- Forgetting the empty JSON body `{}` causes the DELETE to fail. The CRUD handler parses the body for non-GET requests.
+- Omitting `id=eq.VALUE` filter results in an `UNSAFE_DELETE` error ("DELETE requires at least one record filter").
+
+---
+
+## ST4 -- Attempt Delete Without Record Filter
+
+**What it verifies:** The CRUD layer's safety check prevents mass deletion when no specific record filter is provided.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, attempt to delete all groups (no `id` filter):
+```bash
+curl -s -X DELETE "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+**Expected error:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "UNSAFE_DELETE",
+    "message": "DELETE requires at least one record filter (e.g. id=eq.X or _filters). Cannot delete all records in a table."
+  }
+}
+```
+
+2. Verify that all remaining groups are still intact:
+```bash
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** Groups still exist (e.g., `engineering` should still be present).
+
+**Pass:** Mass deletion blocked with `UNSAFE_DELETE` error. No data lost.
+
+---
+
+## ST5 -- Cleanup and Verify Cascade Behavior
+
+**What it verifies:** After deleting a group, its member rows in `segmentation_group_members` are automatically cascade-deleted. Also cleans up test data.
+
+**Steps:**
+1. Check remaining groups:
+```bash
+curl -s "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+2. For the `engineering` group (which should still have members), note the group ID and count its members:
+```bash
+ENG_GROUP_ID="ENGINEERING_GROUP_ID"
+
+curl -s "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID&group_id=eq.$ENG_GROUP_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+Note the member count (should be 2 or more from Chapter 32).
+
+3. Delete the `engineering` group:
+```bash
+curl -s -X DELETE "https://login.quickztna.com/api/db/segmentation_groups?org_id=$ORG_ID&id=eq.$ENG_GROUP_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+4. Verify cascade -- query members for the deleted group:
+```bash
+curl -s "https://login.quickztna.com/api/db/segmentation_group_members?org_id=$ORG_ID&group_id=eq.$ENG_GROUP_ID" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** `"data": []` -- all member rows were cascade-deleted when the group was removed.
+
+5. Verify the machines themselves are unaffected:
+```bash
+curl -s "https://login.quickztna.com/api/db/machines?org_id=$ORG_ID&select=id,name,status" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**Expected:** All machines still exist with their original status. Deleting a group does NOT delete or modify the machines.
+
+6. **Final cleanup:** Delete the stale `engineering-to-finance` ACL rule:
+```bash
+RULE_ID="THE_ACL_RULE_ID"
+
+curl -s -X DELETE "https://login.quickztna.com/api/db/acl_rules?org_id=$ORG_ID&id=eq.$RULE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{}" | python3 -m json.tool
+```
+
+**Pass:** Member rows cascade-deleted. Machines unaffected. Stale ACL rules cleaned up manually.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Delete group without ACL deps | Clean deletion, no warning, members cascade-removed |
+| ST2 | Delete group with ACL deps | Warning shown, ACL rules persist with stale reference |
+| ST3 | API delete | DELETE endpoint works with org_id + id filter + empty body |
+| ST4 | Mass delete prevention | UNSAFE_DELETE error when no record filter provided |
+| ST5 | Cascade verification | Member rows deleted, machines unaffected, manual ACL cleanup |

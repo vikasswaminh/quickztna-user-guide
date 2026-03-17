@@ -1,0 +1,435 @@
+---
+title: "Certificate Expiry & Revocation"
+topic: "Certificate Authority"
+order: 59
+machines: ["Win-A"]
+summary: "Verify certificate expiry enforcement and revocation -- revoked certificates should be rejected."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+QuickZTNA certificates have two lifecycle controls: **expiry** (time-based) and **revocation** (admin-initiated). This chapter tests both mechanisms.
+
+**Expiry** is enforced at issuance time via the `ttl_hours` parameter:
+- X.509 certificates: TTL is capped by `min(ttl_hours, ca_configs.cert_ttl_hours, ca_configs.max_cert_ttl_hours)`. The `ca_configs` table defaults are `cert_ttl_hours = 24` and `max_cert_ttl_hours = 720`. The API allows requesting up to 87600 hours (10 years), but it is always capped by the org's CA config.
+- SSH certificates: TTL is strictly 1--24 hours (enforced by the handler). Default is 8 hours.
+- The `certificate_policies` table can further restrict TTL via `max_ttl_hours` per org.
+
+**Revocation** is performed via two actions:
+- X.509: `POST /api/issue-certificate` with `action: "revoke"` and `certificate_id`
+- SSH: `POST /api/ssh-certificate` with `action: "revoke_ssh_cert"` and `certificate_id`
+
+Both set `revoked = TRUE`, `revoked_at = NOW()`, and `revoke_reason = 'Manual revocation'` on the `issued_certificates` row. Revocation requires **org admin** role.
+
+Note: QuickZTNA does not implement CRL (Certificate Revocation List) or OCSP at this time. The `revoked` flag is stored in the database and visible in the certificate list, but external TLS clients do not automatically check revocation status. Revocation is a control-plane audit marker.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | PowerShell for API calls and dashboard verification |
+
+**Prerequisites:** CA initialized and at least one X.509 and one SSH certificate issued (Chapters 56 and 57).
+
+---
+
+## ST1 -- Verify TTL Capping on X.509 Certificates
+
+**What it verifies:** The issued certificate TTL is capped by the CA config's `max_cert_ttl_hours` value.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, check the current CA config defaults by issuing a certificate with a very large TTL:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "subject_cn": "ttl-cap-test",
+    "ttl_hours": 50000
+  }'
+```
+
+**Expected response:** `success: true`. Check the `ttl_hours` field in the response -- it should be capped at the CA config's `max_cert_ttl_hours` (default 720), not 50000.
+
+2. Verify the `expires_at` date matches the capped TTL:
+   - If `ttl_hours` returns 720, then `expires_at` should be approximately 30 days from now.
+
+3. Issue a certificate with a TTL within range:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "subject_cn": "short-lived-test",
+    "ttl_hours": 1
+  }'
+```
+
+**Expected:** `ttl_hours: 1`. The `expires_at` is approximately 1 hour from now.
+
+4. Test the hard lower boundary (0 hours):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "subject_cn": "zero-ttl-test",
+    "ttl_hours": 0
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_TTL",
+    "message": "ttl_hours must be a number between 1 and 87600 (10 years)"
+  }
+}
+```
+
+**Pass:** TTL is capped to `max_cert_ttl_hours` when exceeding the limit. TTL of 1 hour is accepted. TTL of 0 is rejected with `INVALID_TTL`.
+
+**Fail / Common issues:**
+- `ttl_hours` returns the uncapped value (50000) -- the handler is not applying `Math.min()` correctly. Check that `ca_configs.max_cert_ttl_hours` has a value.
+- No error for TTL of 0 -- the validation check `ttl_hours < 1` is not working.
+
+---
+
+## ST2 -- Verify Certificate Policy TTL Enforcement
+
+**What it verifies:** When a `certificate_policies` row exists for the org with a `max_ttl_hours` value, it overrides the requested TTL.
+
+**Steps:**
+1. First, check if a certificate policy exists for your org:
+```powershell
+curl -s "https://login.quickztna.com/api/db/certificate_policies?org_id=YOUR_ORG_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+2. If no policy exists, create one with a 24-hour maximum:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/certificate_policies" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "max_ttl_hours": 24,
+    "require_posture_compliant": false,
+    "require_machine_online": false
+  }'
+```
+
+3. Now issue a certificate with a machine_id and a TTL exceeding the policy:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "MACHINE_UUID",
+    "subject_cn": "policy-test",
+    "ttl_hours": 48
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "TTL_EXCEEDS_POLICY",
+    "message": "Requested TTL 48h exceeds policy maximum 24h"
+  }
+}
+```
+
+4. Issue with TTL within the policy:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "issue",
+    "org_id": "YOUR_ORG_ID",
+    "machine_id": "MACHINE_UUID",
+    "subject_cn": "policy-ok-test",
+    "ttl_hours": 12
+  }'
+```
+
+**Expected:** `success: true` with `ttl_hours: 12`.
+
+Note: The certificate policy check only applies when `machine_id` is provided. Certificates issued without a `machine_id` skip the policy check.
+
+**Pass:** TTL exceeding the policy maximum returns `TTL_EXCEEDS_POLICY`. TTL within the policy is accepted.
+
+**Fail / Common issues:**
+- Policy is ignored -- the `certificate_policies` table row may not exist for this org. Verify the insert succeeded.
+- Policy check triggers without `machine_id` -- this is unexpected based on the handler code. The policy lookup only runs inside the `if (machine_id)` block.
+
+---
+
+## ST3 -- Revoke an X.509 Certificate
+
+**What it verifies:** The `revoke` action marks a certificate as revoked in the database, and the revocation is visible in the list.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, list certificates to get a certificate ID:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+Pick a certificate ID from the list (use one from a test certificate, not a production one).
+
+2. Revoke the certificate:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "revoke",
+    "org_id": "YOUR_ORG_ID",
+    "certificate_id": "CERT_UUID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "revoked": true
+  },
+  "error": null
+}
+```
+
+3. Verify the certificate is now marked as revoked in the list:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+Find the revoked certificate in the response. It should have:
+```json
+{
+  "id": "CERT_UUID",
+  "revoked": true,
+  "revoked_at": "2026-03-17T...",
+  "revoke_reason": "Manual revocation"
+}
+```
+
+4. Try revoking without a certificate_id:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "revoke",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "MISSING_CERT",
+    "message": "certificate_id required"
+  }
+}
+```
+
+**Pass:** Revocation returns `revoked: true`. The certificate list shows `revoked: true`, a `revoked_at` timestamp, and `revoke_reason: "Manual revocation"`. Missing `certificate_id` returns `MISSING_CERT`.
+
+**Fail / Common issues:**
+- 403 Forbidden -- only org admins can revoke certificates. Verify your role.
+- Certificate still shows `revoked: false` after revocation -- the UPDATE query may not have matched (wrong `certificate_id` or wrong `org_id`).
+
+---
+
+## ST4 -- Revoke an SSH Certificate
+
+**What it verifies:** SSH certificates can be revoked via the `revoke_ssh_cert` action, and the revocation is visible in the SSH certificate list.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, list SSH certificates:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_ssh_certs",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+Pick a certificate ID.
+
+2. Revoke the SSH certificate:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "revoke_ssh_cert",
+    "org_id": "YOUR_ORG_ID",
+    "certificate_id": "SSH_CERT_UUID"
+  }'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "revoked": true,
+    "certificate_id": "SSH_CERT_UUID"
+  },
+  "error": null
+}
+```
+
+3. Verify in the list:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "list_ssh_certs",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+The revoked certificate should show `revoked: true` and a `revoked_at` timestamp.
+
+4. Try without `certificate_id`:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/ssh-certificate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "action": "revoke_ssh_cert",
+    "org_id": "YOUR_ORG_ID"
+  }'
+```
+
+**Expected error (HTTP 400):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "MISSING_FIELDS",
+    "message": "certificate_id required"
+  }
+}
+```
+
+**Pass:** SSH certificate revocation returns `revoked: true` with the `certificate_id` echoed back. The list shows the updated revocation status. Missing `certificate_id` returns `MISSING_FIELDS`.
+
+**Fail / Common issues:**
+- Revocation silently succeeds for a non-existent UUID -- the UPDATE WHERE clause does not verify the certificate exists. The response will still say `revoked: true` even if no row was updated. This is by design (idempotent revocation).
+- Revoking an X.509 cert via the SSH endpoint -- the SSH revoke action filters with `subject_cn LIKE 'ssh:%'`, so X.509 certificates are not affected.
+
+---
+
+## ST5 -- Verify Expiry Dates in OpenSSL
+
+**What it verifies:** The Not Before and Not After dates in the certificate match the requested TTL, and expired certificates are detectable with OpenSSL.
+
+**Steps:**
+1. On <MachineRef name="Win-A" /> (using Git Bash for OpenSSL) or <MachineRef name="Linux-C" />, issue a 1-hour certificate and save it:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/issue-certificate" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "issue", "org_id": "YOUR_ORG_ID", "subject_cn": "expiry-test", "ttl_hours": 1}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['certificate'])" > expiry-test.pem
+```
+
+2. Check the validity dates:
+```bash
+openssl x509 -in expiry-test.pem -dates -noout
+```
+
+**Expected output:**
+```
+notBefore=Mar 17 10:00:00 2026 GMT
+notAfter=Mar 17 11:00:00 2026 GMT
+```
+
+The difference between Not After and Not Before should be approximately 1 hour.
+
+3. Check if the certificate is currently valid:
+```bash
+openssl x509 -in expiry-test.pem -checkend 0
+```
+
+**Expected output (if still within validity):**
+```
+Certificate will not expire
+```
+
+4. Check if it will expire within 2 hours (3600 * 2 = 7200 seconds):
+```bash
+openssl x509 -in expiry-test.pem -checkend 7200
+```
+
+**Expected output (for a 1-hour cert):**
+```
+Certificate will expire
+```
+
+5. For a long-lived certificate (e.g., 720 hours), verify the date math:
+```bash
+# Not After should be ~30 days from Not Before
+openssl x509 -in cert.pem -dates -noout
+```
+
+Verify the day offset matches: 720 hours = 30 days.
+
+**Pass:** Certificate validity dates match the requested TTL. `openssl x509 -checkend` correctly reports whether the certificate will expire within a given time window.
+
+**Fail / Common issues:**
+- Dates are off by more than a few seconds -- clock skew between the API server and your test machine. NTP synchronization should keep this within seconds.
+- 1-hour cert shows a longer validity -- the TTL may have been overridden by `ca_configs.cert_ttl_hours` if `ttl_hours` was not explicitly provided.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | X.509 TTL is capped by `ca_configs.max_cert_ttl_hours`; values below 1 are rejected |
+| ST2 | Certificate policies enforce per-org TTL limits when `machine_id` is provided |
+| ST3 | X.509 certificate revocation sets `revoked = true` with timestamp and reason |
+| ST4 | SSH certificate revocation works via separate endpoint with `revoke_ssh_cert` action |
+| ST5 | Certificate validity dates match the requested TTL; OpenSSL can detect pending expiry |

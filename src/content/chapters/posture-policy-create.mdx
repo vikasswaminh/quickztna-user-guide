@@ -1,0 +1,305 @@
+---
+title: "Create Posture Policy (OS Version Check)"
+topic: "Posture Policies"
+order: 51
+machines: ["Win-A"]
+summary: "Create device posture policies via dashboard and API — define OS version requirements and compliance checks."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Posture policies define the security baseline that every machine in your organization must meet. They are stored in the `posture_policies` table with these key columns:
+
+- **name** (TEXT, required) -- human-readable policy name
+- **description** (TEXT) -- optional description
+- **allowed_os** (JSONB, default `[]`) -- list of allowed operating systems (e.g., `["windows","macos","linux"]`)
+- **min_os_version** (JSONB, default `{}`) -- minimum OS version per platform
+- **require_disk_encryption** (BOOLEAN, default false) -- require full disk encryption (BitLocker, LUKS, FileVault)
+- **require_firewall** (BOOLEAN, default false) -- require host firewall enabled
+- **require_antivirus** (BOOLEAN, default false) -- require antivirus running
+- **max_patch_age_days** (INTEGER, nullable) -- maximum days since last OS patch
+- **enabled** (BOOLEAN, default true) -- disabled policies are skipped during evaluation
+
+Policies are created and managed via:
+1. The **dashboard** at `https://login.quickztna.com/posture-policies` -- uses `POST /api/db/posture_policies` (generic CRUD)
+2. The **REST API** directly -- same CRUD endpoint
+
+The system also ships three **template policies** under the system org (`00000000-0000-0000-0000-000000000000`) that are visible to all organizations as read-only starting points:
+- **Basic Security** -- disk encryption + firewall
+- **Enterprise Standard** -- disk encryption + firewall + antivirus + patches within 30 days
+- **Healthcare / HIPAA** -- all Enterprise checks + patches within 14 days
+
+Posture enforcement is controlled by the `posture_enforcement` column in `org_settings`. Three modes exist:
+- `disabled` (default) -- posture reports are stored but no compliance evaluation occurs; all machines are marked compliant
+- `monitor` -- compliance is evaluated and violations logged, but non-compliant machines are NOT quarantined
+- `enforce` -- compliance is evaluated and non-compliant online machines are automatically set to `quarantined` status
+
+The enforcement mode is updated via `POST /api/org-management` with `action: "update_org_settings"`.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser for dashboard tests + curl/PowerShell for API tests |
+
+Ensure you are logged in as an **org admin** -- posture policy creation requires admin write access (the `posture_policies` table is in the `ADMIN_WRITE_TABLES` set in `db-crud.ts`).
+
+---
+
+## ST1 -- Create a Posture Policy via Dashboard
+
+**What it verifies:** An admin can create a posture policy from the Posture Policies page with disk encryption and firewall requirements enabled.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/posture-policies` in a browser.
+2. Note the **template policies** that appear (Basic Security, Enterprise Standard, Healthcare / HIPAA) -- these are read-only system templates.
+3. Click the button to add a new policy.
+4. Fill in the form:
+   - Name: `Test-Posture-ST1`
+   - Description: `Manual test policy for disk encryption and firewall`
+   - Require Disk Encryption: **ON**
+   - Require Firewall: **ON**
+   - Require Antivirus: OFF
+   - Max Patch Age Days: leave empty
+5. Click **Save**.
+
+**Expected behavior:**
+- The policy appears in the list with name `Test-Posture-ST1`
+- `require_disk_encryption` and `require_firewall` are both true
+- `enabled` is true by default
+- The policy `org_id` matches your current organization
+
+**Pass:** Policy created successfully and visible in the policy list with all fields matching the input.
+
+**Fail / Common issues:**
+- 403 Forbidden -- you are not an org admin. Check your role in the Users page.
+- Policy not appearing -- it may be filtered by org. Ensure you are viewing the correct organization.
+
+---
+
+## ST2 -- Create a Posture Policy via API
+
+**What it verifies:** An admin can create a posture policy with all fields via the REST API, including `max_patch_age_days`.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+$body = @{
+    org_id                  = $orgId
+    name                    = "API-Posture-ST2"
+    description             = "Created via API with all checks enabled"
+    allowed_os              = @("windows", "linux", "macos")
+    min_os_version          = @{ windows = "10.0"; linux = "5.15" }
+    require_disk_encryption = $true
+    require_firewall        = $true
+    require_antivirus       = $true
+    max_patch_age_days      = 30
+    enabled                 = $true
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "org_id": "<your-org-id>",
+    "name": "API-Posture-ST2",
+    "require_disk_encryption": true,
+    "require_firewall": true,
+    "require_antivirus": true,
+    "max_patch_age_days": 30,
+    "enabled": true
+  }
+}
+```
+
+The returned `id` is nested at `data.data.id` (the CRUD insert response double-nests).
+
+**Pass:** 200 response with the policy object, all fields match input, and a UUID `id` is generated.
+
+**Fail / Common issues:**
+- 403 -- not an org admin
+- 400 with missing `org_id` -- the CRUD handler requires `org_id` for org-scoped tables
+
+---
+
+## ST3 -- Enable Posture Enforcement Mode
+
+**What it verifies:** The org admin can change the `posture_enforcement` setting from `disabled` to `enforce` via the org management API.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, run:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+# Set enforcement to "enforce" (auto-quarantine non-compliant machines)
+$body = @{
+    action               = "update_org_settings"
+    org_id               = $orgId
+    posture_enforcement  = "enforce"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/org-management" `
+    -Method POST `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body $body
+```
+
+**Expected response:**
+
+```json
+{
+  "success": true,
+  "data": { "updated": true }
+}
+```
+
+**Verify** the setting was saved by reading org_settings:
+
+```powershell
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/org_settings?org_id=eq.$orgId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+The `posture_enforcement` field should be `"enforce"`.
+
+**Pass:** Setting is accepted and persisted. The three valid values are `enforce`, `monitor`, and `disabled`.
+
+**Fail / Common issues:**
+- 400 `INVALID_VALUE` -- `posture_enforcement` must be one of: `enforce`, `monitor`, `disabled`. Any other value is rejected by `org-management.ts`.
+- 403 -- admin access required for `update_org_settings`
+
+---
+
+## ST4 -- Verify Template Policies Are Read-Only
+
+**What it verifies:** The system template policies (org_id `00000000-0000-0000-0000-000000000000`) are visible to all orgs but cannot be modified or deleted by non-system users.
+
+**Steps:**
+
+1. On <MachineRef name="Win-A" />, fetch posture policies via API:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies?org_id=eq.$orgId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+2. Note that the results include both your org's policies AND the system templates. The CRUD handler in `db-crud.ts` adds a special condition for `posture_policies`: `(org_id = ? OR org_id = '00000000-0000-0000-0000-000000000000')`.
+
+3. Attempt to delete a system template:
+
+```powershell
+$systemPolicyId = "00000000-0000-0000-0001-000000000001"  # Basic Security template
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies?id=eq.$systemPolicyId" `
+    -Method DELETE `
+    -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+    -Body '{}'
+```
+
+**Expected behavior:**
+- GET returns your org policies plus the three system templates
+- DELETE on a system template either returns 0 changes (the org_id filter prevents deletion) or 403
+
+**Pass:** System templates are visible but immutable from your org context.
+
+**Fail / Common issues:**
+- If templates do not appear, the migration `024_production_seed_data.sql` may not have run. Check the `posture_policies` table directly.
+
+---
+
+## ST5 -- List and Inspect a Policy via API
+
+**What it verifies:** All posture policy fields are correctly returned by the CRUD GET endpoint, including JSONB fields like `allowed_os` and `min_os_version`.
+
+**Steps:**
+
+On <MachineRef name="Win-A" />, list all policies:
+
+```powershell
+$token = "YOUR_JWT_TOKEN"
+$orgId = "YOUR_ORG_ID"
+
+$result = Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies?org_id=eq.$orgId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+
+$result.data | Format-Table id, name, require_disk_encryption, require_firewall, require_antivirus, max_patch_age_days, enabled
+```
+
+Then fetch a specific policy by ID:
+
+```powershell
+$policyId = "THE_POLICY_ID_FROM_ST2"
+
+Invoke-RestMethod -Uri "https://login.quickztna.com/api/db/posture_policies?id=eq.$policyId" `
+    -Method GET `
+    -Headers @{ Authorization = "Bearer $token" }
+```
+
+**Expected response shape:**
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "<uuid>",
+      "org_id": "<your-org-id>",
+      "name": "API-Posture-ST2",
+      "description": "Created via API with all checks enabled",
+      "allowed_os": ["windows", "linux", "macos"],
+      "min_os_version": { "windows": "10.0", "linux": "5.15" },
+      "require_disk_encryption": true,
+      "require_firewall": true,
+      "require_antivirus": true,
+      "max_patch_age_days": 30,
+      "enabled": true,
+      "created_by": "<user-uuid>",
+      "created_at": "2026-...",
+      "updated_at": "2026-..."
+    }
+  ]
+}
+```
+
+**Pass:** All fields are present and match the values set during creation. JSONB fields (`allowed_os`, `min_os_version`) are returned as parsed JSON, not strings.
+
+**Fail / Common issues:**
+- JSONB fields returned as strings -- this would indicate a serialization issue in the CRUD handler; unlikely but check `Content-Type: application/json` header.
+- `created_by` is null -- the CRUD handler auto-sets `created_by` to the authenticated user for `posture_policies` (line 348 in `db-crud.ts`).
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Dashboard policy creation works with boolean toggle fields |
+| ST2 | API policy creation works with all fields including `max_patch_age_days` and JSONB fields |
+| ST3 | Posture enforcement mode (`enforce`/`monitor`/`disabled`) can be configured per-org |
+| ST4 | System template policies are visible to all orgs but immutable |
+| ST5 | Policy retrieval returns all fields correctly, including JSONB and auto-set `created_by` |

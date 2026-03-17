@@ -1,0 +1,286 @@
+---
+title: "Generate Auth Key (Reusable, Ephemeral, Expiring)"
+topic: "Auth Keys"
+order: 41
+machines: ["Win-A"]
+summary: "Generate auth keys with various configurations — reusable, ephemeral, with expiry dates and IP/tag restrictions."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+Auth keys allow headless machine registration without browser interaction. This chapter tests the key creation flow via the API endpoint `POST /api/key-management` with `action: "create_auth_key"`. The backend generates a 32-byte random hex key prefixed with `tskey-auth-`, stores a SHA256 hash, and returns the full key exactly once.
+
+Key facts from source code (`backend/src/handlers/api-key-auth.ts`):
+- **Endpoint:** `POST /api/key-management` (alias: `POST /api/api-keys`)
+- **Action:** `"create_auth_key"`
+- **Required fields:** `action`, `org_id`, `name`
+- **Optional fields:** `reusable` (bool), `ephemeral` (bool), `expiry_days` (int, 1-365, default 90), `allowed_tags` (string array), `allowed_cidrs` (string array)
+- **Auth:** JWT required, caller must be org admin or owner
+- **Response:** `{ id, key, key_prefix, name, reusable, ephemeral, expiry_days, allowed_tags, allowed_cidrs }` (HTTP 201)
+- **Key format:** `tskey-auth-` followed by 64 hex characters (32 bytes)
+- **Key prefix stored:** `tskey-auth-XXXXXXXX...` (first 8 hex chars + ellipsis)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Dashboard + API calls (admin user) |
+
+---
+
+## ST1 — Create a Basic Reusable Auth Key
+
+**What it verifies:** An admin can create a reusable auth key with default expiry (90 days).
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, obtain a JWT token (log in via dashboard, extract from browser DevTools or use the auth API).
+2. Create a reusable auth key:
+```bash
+TOKEN="YOUR_ACCESS_TOKEN"
+ORG_ID="YOUR_ORG_ID"
+
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"reusable-test-key\",
+    \"reusable\": true,
+    \"ephemeral\": false
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "key": "tskey-auth-<64 hex chars>",
+    "key_prefix": "tskey-auth-xxxxxxxx...",
+    "name": "reusable-test-key",
+    "reusable": true,
+    "ephemeral": false,
+    "expiry_days": 90,
+    "allowed_tags": null,
+    "allowed_cidrs": null
+  }
+}
+```
+
+3. Save the `key` value -- it is returned only once and cannot be retrieved later.
+
+**Pass:** Response is HTTP 201. The `key` field starts with `tskey-auth-`. `reusable` is `true`. `expiry_days` defaults to 90.
+
+**Fail / Common issues:**
+- `UNAUTHORIZED` (401) -- JWT token is missing or expired. Re-authenticate.
+- `FORBIDDEN` (403) -- caller is not an admin or owner in the org.
+- `MISSING_FIELDS` (400) -- `name`, `action`, or `org_id` is missing from the request body.
+
+---
+
+## ST2 — Create an Ephemeral Auth Key with Custom Expiry
+
+**What it verifies:** An ephemeral key with a custom expiry (e.g., 7 days) is accepted. Machines registered with ephemeral keys are automatically cleaned up when they go offline for 30 minutes.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create an ephemeral auth key:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"ephemeral-ci-key\",
+    \"reusable\": true,
+    \"ephemeral\": true,
+    \"expiry_days\": 7
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "key": "tskey-auth-<64 hex chars>",
+    "key_prefix": "tskey-auth-xxxxxxxx...",
+    "name": "ephemeral-ci-key",
+    "reusable": true,
+    "ephemeral": true,
+    "expiry_days": 7,
+    "allowed_tags": null,
+    "allowed_cidrs": null
+  }
+}
+```
+
+**Pass:** `ephemeral` is `true`. `expiry_days` is 7 (not the default 90).
+
+**Fail / Common issues:**
+- `INVALID_INPUT` (400) -- `expiry_days` must be an integer between 1 and 365 inclusive. Values like 0, 366, or non-integers are rejected.
+
+---
+
+## ST3 — Create an Auth Key with Tag Restrictions
+
+**What it verifies:** An auth key can be scoped to specific tags. Machines registering with this key can only claim tags listed in `allowed_tags`. Tags with `tag:` prefix are auto-stripped by the backend.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a tag-restricted key:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"server-only-key\",
+    \"reusable\": true,
+    \"allowed_tags\": [\"server\", \"tag:production\"],
+    \"expiry_days\": 30
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "key": "tskey-auth-<64 hex chars>",
+    "key_prefix": "tskey-auth-xxxxxxxx...",
+    "name": "server-only-key",
+    "reusable": true,
+    "ephemeral": false,
+    "expiry_days": 30,
+    "allowed_tags": ["server", "production"],
+    "allowed_cidrs": null
+  }
+}
+```
+
+Note: The `tag:` prefix on `"tag:production"` is automatically stripped by the backend. The stored tag is `"production"`.
+
+**Pass:** `allowed_tags` contains `["server", "production"]` (prefix stripped). Key created successfully.
+
+**Fail / Common issues:**
+- Tags still have `tag:` prefix in response -- this would indicate a backend regression. The handler at line 68 of `api-key-auth.ts` strips this prefix.
+
+---
+
+## ST4 — Create an Auth Key with CIDR Restrictions
+
+**What it verifies:** An auth key can be scoped to specific IP ranges. Only machines registering from an IP within the allowed CIDRs will be accepted.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, create a CIDR-restricted key:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"office-only-key\",
+    \"reusable\": true,
+    \"allowed_cidrs\": [\"10.0.0.0/8\", \"192.168.1.0/24\"],
+    \"expiry_days\": 14
+  }" | python3 -m json.tool
+```
+
+**Expected response (HTTP 201):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "<uuid>",
+    "key": "tskey-auth-<64 hex chars>",
+    "key_prefix": "tskey-auth-xxxxxxxx...",
+    "name": "office-only-key",
+    "reusable": true,
+    "ephemeral": false,
+    "expiry_days": 14,
+    "allowed_tags": null,
+    "allowed_cidrs": ["10.0.0.0/8", "192.168.1.0/24"]
+  }
+}
+```
+
+**Pass:** `allowed_cidrs` contains the two CIDRs. Key created with 14-day expiry.
+
+**Fail / Common issues:**
+- Empty `allowed_cidrs` in response -- the backend requires a non-empty array. Passing `[]` results in `null` (no restriction).
+
+---
+
+## ST5 — Validation Rejects Invalid Inputs
+
+**What it verifies:** The backend rejects malformed requests with appropriate error codes.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, attempt to create a key without a name:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** HTTP 400 with `MISSING_FIELDS` error: `"name required"`.
+
+2. Attempt to create a key with invalid expiry:
+```bash
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"bad-expiry-key\",
+    \"expiry_days\": 500
+  }" | python3 -m json.tool
+```
+
+**Expected:** HTTP 400 with `INVALID_INPUT` error: `"expiry_days must be an integer between 1 and 365"`.
+
+3. Attempt to create a key as a non-admin member:
+```bash
+MEMBER_TOKEN="NON_ADMIN_JWT"
+curl -s -X POST "https://login.quickztna.com/api/key-management" \
+  -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"action\": \"create_auth_key\",
+    \"org_id\": \"$ORG_ID\",
+    \"name\": \"forbidden-key\"
+  }" | python3 -m json.tool
+```
+
+**Expected:** HTTP 403 with `FORBIDDEN` error: `"Admin required"`.
+
+**Pass:** All three requests return the expected error codes and messages. No keys are created.
+
+**Fail / Common issues:**
+- Getting 200 instead of 400 for missing name -- check that the request body is valid JSON and the `name` field is truly absent.
+- Getting 200 instead of 403 for non-admin -- the user may actually have admin role. Verify via `GET /api/user-orgs`.
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Basic reusable key creation | HTTP 201, key starts with `tskey-auth-`, `reusable: true`, default 90-day expiry |
+| ST2 | Ephemeral key with custom expiry | HTTP 201, `ephemeral: true`, `expiry_days: 7` |
+| ST3 | Tag-restricted key | HTTP 201, `allowed_tags` populated, `tag:` prefix stripped |
+| ST4 | CIDR-restricted key | HTTP 201, `allowed_cidrs` populated with valid CIDRs |
+| ST5 | Input validation | Missing name returns 400, invalid expiry returns 400, non-admin returns 403 |

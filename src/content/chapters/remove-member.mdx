@@ -1,0 +1,206 @@
+---
+title: "Remove Member & Machine Quarantine"
+topic: "Users & Invitations"
+order: 49
+machines: ["Win-A", "Win-B"]
+summary: "Remove a member from the organization and verify their machines are handled appropriately."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+When an admin removes a member from the organization, the backend (`handlers/org-management.ts`, action `remove_member`) implements a cascade of actions:
+
+- **Endpoint**: `POST /api/org-management` with `action: "remove_member"`, `org_id`, `target_user_id`
+- **Authorization**: Only admins and owners can remove members (`isOrgAdmin` check)
+- **Self-removal blocked**: A user cannot remove themselves — returns `FORBIDDEN` with "Can't remove yourself"
+- **Membership deletion**: Deletes the row from `org_members` for the target user + org
+- **Machine quarantine cascade**: All machines owned by the removed user in this org with status `online` or `offline` are set to `quarantined` — prevents orphaned machines from remaining on the network
+- **Email notification**: The removed user receives an email via `sendRemovedFromOrgEmail` with subject "You've been removed from OrgName -- QuickZTNA"
+- **Realtime broadcast**: A `members:DELETE` event is broadcast to connected WebSocket clients
+- **Audit logging**: Logged via Loki with event `member.removed`, including `machines_quarantined` count
+- **Response**: Returns `{ removed: "<user_id>", machines_quarantined: <count> }`
+
+The frontend (`UsersPage.tsx`) uses a confirmation dialog ("Remove member?") before executing the deletion, calling the CRUD API endpoint.
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Admin/Owner performing the removal |
+| <MachineRef name="Win-B" /> | The member being removed (has machines registered) |
+
+Prerequisites: The target member should have at least one machine registered in the org (status `online` or `offline`) to verify the quarantine cascade.
+
+---
+
+## ST1 — Remove Member via Dashboard
+
+**What it verifies:** An admin can remove a member through the UI confirmation dialog.
+
+**Steps:**
+1. Log in to `https://login.quickztna.com` as an org admin or owner on <MachineRef name="Win-A" />.
+2. Navigate to the **Users** page.
+3. Find the member you want to remove in the active members table.
+4. Click the three-dot menu icon on their row.
+5. Select **Remove** (red text with trash icon).
+6. A confirmation dialog appears: "Remove member?" with description "This action cannot be undone. The member will be permanently removed from the organization."
+7. Click **Remove** to confirm.
+
+**Expected behavior:**
+- The member's row disappears from the active members table
+- The member count in the page subtitle decreases by 1
+
+**Pass:** Member removed from the list. The confirmation dialog prevents accidental removals.
+
+**Fail / Common issues:**
+- Three-dot menu not visible — the target is an `owner`, or you are looking at your own row. Owners cannot be removed via the menu, and you cannot remove yourself.
+- "Failed to remove member" — check the Network tab for errors on the DELETE request.
+
+---
+
+## ST2 — Verify Machine Quarantine Cascade
+
+**What it verifies:** After removing a member, all their machines in the org are quarantined automatically.
+
+**Steps:**
+1. Before removing the member, note how many machines they own. Navigate to the **Machines** page and filter or search for machines owned by the target user.
+2. Remove the member (as in ST1).
+3. Navigate back to the **Machines** page.
+4. Check the status of machines that were owned by the removed user.
+
+**Expected behavior:**
+- All machines previously owned by the removed user that had status `online` or `offline` now show status `quarantined`
+- Machines that were already `pending` or `quarantined` remain unchanged
+
+You can also verify via the API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"remove_member","org_id":"<org_id>","target_user_id":"<user_id>"}'
+```
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": {
+    "removed": "<user_id>",
+    "machines_quarantined": 2
+  }
+}
+```
+
+The `machines_quarantined` count tells you how many machines were transitioned to quarantine.
+
+**Pass:** All eligible machines show `quarantined` status. The response includes the correct quarantine count.
+
+**Fail / Common issues:**
+- Machines remain `online`/`offline` — the cascade update query may have failed. The SQL updates machines where `owner_id = ? AND org_id = ? AND status IN ('online', 'offline')`.
+- `machines_quarantined: 0` when machines exist — verify the machines' `owner_id` matches the removed user's `user_id`. Machines registered via auth key may have a different owner.
+
+---
+
+## ST3 — Removal Email Notification
+
+**What it verifies:** The removed user receives an email notification about their removal.
+
+**Steps:**
+1. Remove a member whose email you can check (or use a test email from earlier chapters).
+2. Check the removed user's email inbox (and spam/junk folder).
+
+**Expected behavior:**
+- **From**: `noreply@quickztna.com`
+- **Subject**: "You've been removed from OrgName -- QuickZTNA"
+- The email body explains the removal
+
+**Pass:** Email received with correct subject and org name.
+
+**Fail / Common issues:**
+- Email not received — the `sendRemovedFromOrgEmail` call is fire-and-forget (errors are caught and logged, not surfaced). Check API container logs: `ssh root@172.99.189.211 "docker logs quickztna-api-1 --tail 50 | grep -i 'removed from org'"`.
+- No email sent when SMTP is down — the function exits early if `env.SMTP_HOST` is not set.
+
+---
+
+## ST4 — Self-Removal Blocked
+
+**What it verifies:** An admin cannot remove themselves from the organization.
+
+**Steps:**
+1. Attempt to remove yourself via API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"remove_member","org_id":"<org_id>","target_user_id":"<your_own_user_id>"}'
+```
+
+**Expected behavior:**
+- HTTP 400
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Can't remove yourself"
+  }
+}
+```
+
+**Dashboard note:** The three-dot menu does not appear on your own row, so this can only be tested via API.
+
+**Pass:** Self-removal rejected with clear error.
+
+**Fail / Common issues:**
+- Returns 200 and the user is removed — the `target_user_id === user.user_id` guard is missing.
+
+---
+
+## ST5 — Non-Admin Cannot Remove Members
+
+**What it verifies:** A user with the `member` or `auditor` role cannot remove other members.
+
+**Steps:**
+1. Log in as a user who has the `member` role in the org.
+2. Attempt to remove another member via API:
+```bash
+curl -s -X POST https://login.quickztna.com/api/org-management \
+  -H "Authorization: Bearer <member_access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"remove_member","org_id":"<org_id>","target_user_id":"<other_user_id>"}'
+```
+
+**Expected behavior:**
+- HTTP 403
+- Response body:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Admin required"
+  }
+}
+```
+
+**Dashboard note:** Non-admin users do not see the three-dot action menu at all on the Users page (the `isAdmin` check hides the column). This test confirms the backend also enforces the restriction.
+
+**Pass:** API returns 403. Non-admins cannot remove members via API or UI.
+
+**Fail / Common issues:**
+- Returns 200 — the `isOrgAdmin` check is missing from the `remove_member` action.
+
+---
+
+## Summary
+
+| Sub-test | Exercises | Key assertion |
+|----------|-----------|---------------|
+| ST1 | Dashboard removal with confirmation dialog | Member removed, row disappears, count decreases |
+| ST2 | Machine quarantine cascade | Removed user's machines set to `quarantined`, count returned |
+| ST3 | Removal email notification | Email sent to removed user with correct subject |
+| ST4 | Self-removal blocked | 400 `FORBIDDEN` — "Can't remove yourself" |
+| ST5 | Non-admin removal blocked | 403 `FORBIDDEN` — "Admin required" |

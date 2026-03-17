@@ -1,0 +1,258 @@
+---
+title: "DNS Failover Behavior"
+topic: "DNS & MagicDNS"
+order: 39
+machines: ["Win-A", "Linux-C"]
+summary: "Verify DNS failover — when MagicDNS is unavailable, queries fall back to upstream resolvers."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+The local DNS resolver (`pkg/dns/resolver.go`) has a layered resolution strategy: tailnet queries are answered locally from the in-memory records map, and all other queries are forwarded upstream. When upstream DNS-over-TLS fails, the resolver's behavior depends on the `AllowPlaintextFallback` flag. We test the resolver's resilience: what happens when the local resolver cannot reach Quad9, when the resolver itself is not running, and when tailnet records are stale.
+
+Key facts from source code:
+
+- **Resolution order in `handleQuery`** (`resolver.go` lines 320-357):
+  1. Check DNS threat blocklist -- if domain is blocked, return NXDOMAIN immediately
+  2. Check if tailnet query (`isTailnetQuery`) -- resolve from local records map
+  3. Forward to upstream DNS (`forwardToUpstream`)
+- **Upstream forwarding** (`resolver.go` lines 420-434):
+  - First: DNS-over-TLS to Quad9 (`9.9.9.9:853`, `149.112.112.112:853`) with 3-second timeout per server
+  - If DoT fails and `AllowPlaintextFallback` is `true`: plaintext UDP to system DNS servers
+  - If DoT fails and `AllowPlaintextFallback` is `false` (default): returns nil, resulting in no response to the client
+- **Port fallback:** If port 53 is unavailable, the resolver binds to port 15353 (`resolver.go` lines 176-189)
+- **Tailnet NXDOMAIN:** If a tailnet hostname is not found in local records, the resolver returns NXDOMAIN (not forwarded upstream) (`resolver.go` lines 391-393)
+- **System DNS detection:** `getSystemDNS()` reads platform-specific resolvers; defaults to `["9.9.9.9:53", "149.112.112.112:53"]` if none found (`resolver.go` lines 602-620)
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Peer machine -- used as a resolution target |
+| <MachineRef name="Linux-C" /> | Test machine -- runs DNS queries, simulates failures |
+
+Both machines must be connected (`ztna up`) with MagicDNS enabled.
+
+---
+
+## ST1 -- Tailnet Resolution Does Not Depend on Upstream DNS
+
+**What it verifies:** Tailnet hostname resolution uses only the local records map and does not forward to upstream DNS servers. Even if upstream DNS is unreachable, tailnet names resolve.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, confirm the local resolver is running and can resolve a tailnet name:
+```bash
+nslookup Win-A 127.0.0.53
+```
+
+**Expected:** Resolves to Win-A's tailnet IP (e.g., `100.64.0.1`).
+
+2. Simulate upstream DNS failure by temporarily blocking outbound port 853 (DNS-over-TLS) and port 53:
+```bash
+sudo iptables -A OUTPUT -p tcp --dport 853 -j DROP
+sudo iptables -A OUTPUT -p udp --dport 53 -j DROP
+```
+
+3. Retry the tailnet query:
+```bash
+nslookup Win-A 127.0.0.53
+```
+
+**Expected:** Still resolves to Win-A's tailnet IP. The resolver answers tailnet queries from its in-memory map without contacting any upstream server.
+
+4. Verify that public DNS is indeed broken:
+```bash
+nslookup google.com 127.0.0.53
+```
+
+**Expected:** Times out or returns SERVFAIL (upstream unreachable).
+
+5. Restore network:
+```bash
+sudo iptables -D OUTPUT -p tcp --dport 853 -j DROP
+sudo iptables -D OUTPUT -p udp --dport 53 -j DROP
+```
+
+**Pass:** Tailnet names resolve even when upstream DNS is completely blocked. Public DNS queries fail as expected.
+
+**Fail / Common issues:**
+- Tailnet name also fails -- the local resolver may not be running. Check `ztna status` and verify port 53 or 15353 is bound.
+- The `iptables` rules block ALL DNS. Use this test carefully on a machine you can access via tailnet IP (not hostname).
+
+---
+
+## ST2 -- DNS-over-TLS Failover Between Quad9 Servers
+
+**What it verifies:** The resolver tries both Quad9 servers (`9.9.9.9:853` and `149.112.112.112:853`) before giving up.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, block only the primary Quad9 server:
+```bash
+sudo iptables -A OUTPUT -d 9.9.9.9 -p tcp --dport 853 -j DROP
+```
+
+2. Query a public domain:
+```bash
+nslookup example.com 127.0.0.53
+```
+
+**Expected:** Resolves successfully. The resolver's `forwardDoT` function (`resolver.go` lines 437-478) iterates over `dotServers` -- when `9.9.9.9:853` fails (connection timeout after 3 seconds), it tries `149.112.112.112:853` which should succeed.
+
+3. Block the secondary server too:
+```bash
+sudo iptables -A OUTPUT -d 149.112.112.112 -p tcp --dport 853 -j DROP
+```
+
+4. Query again:
+```bash
+nslookup example.com 127.0.0.53
+```
+
+**Expected:** Fails (timeout or SERVFAIL). Both DoT servers are unreachable. Since `AllowPlaintextFallback` defaults to `false`, the resolver does not fall back to plaintext UDP. The log message `"DNS-over-TLS failed, plaintext fallback disabled -- returning SERVFAIL"` would appear in the client logs.
+
+5. Restore:
+```bash
+sudo iptables -D OUTPUT -d 9.9.9.9 -p tcp --dport 853 -j DROP
+sudo iptables -D OUTPUT -d 149.112.112.112 -p tcp --dport 853 -j DROP
+```
+
+**Pass:** With one Quad9 server blocked, DNS still works (failover to the second). With both blocked, DNS fails because plaintext fallback is disabled by default.
+
+**Fail / Common issues:**
+- Resolution succeeds even with both servers blocked -- `AllowPlaintextFallback` may be set to `true` in the client config, allowing fallback to plaintext UDP on system DNS servers.
+
+---
+
+## ST3 -- CLI DNS Query Bypasses Local Resolver
+
+**What it verifies:** `ztna dns query` does NOT use the local DNS resolver. It calls the backend's `resolve` action over HTTPS, so it works even when the local resolver is down.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, stop the VPN tunnel (this stops the local resolver):
+```bash
+ztna down
+```
+
+2. Try a system-level DNS query (should fail for tailnet names):
+```bash
+nslookup Win-A 127.0.0.53
+```
+
+**Expected:** Connection refused or timeout (the local resolver is no longer running).
+
+3. Try the CLI query (uses HTTPS to the backend):
+```bash
+ztna dns query Win-A
+```
+
+**Expected output:**
+```
+Win-A.yourorg.zt.net -> 100.64.0.1
+```
+
+The CLI sends an authenticated HTTPS POST to `/api/dns-management` with `action: "resolve"`. This does not require the local DNS resolver to be running. It only requires the machine to be authenticated (has a valid JWT or saved tokens).
+
+**Pass:** `ztna dns query` resolves the hostname even when the local resolver is stopped. `nslookup` fails because the local resolver is not running.
+
+**Fail / Common issues:**
+- `not authenticated. Run 'ztna login' first` -- `ztna down` does not log out. But if the config has no `org_id`, the CLI query will fail. The check is in `cmd_dns.go` line 63.
+- Network error -- the machine needs internet access to reach `login.quickztna.com`. The VPN tunnel being down does not affect HTTPS connectivity.
+
+4. Reconnect:
+```bash
+ztna up
+```
+
+---
+
+## ST4 -- Port 53 Conflict Fallback to 15353
+
+**What it verifies:** When port 53 is already occupied (common on Linux with systemd-resolved), the resolver falls back to port 15353.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, check what is using port 53:
+```bash
+sudo ss -tlnp | grep :53
+```
+
+Common output on Ubuntu/Debian:
+```
+LISTEN  0  4096  127.0.0.53%lo:53  0.0.0.0:*  users:(("systemd-resolve",pid=XXX,fd=14))
+```
+
+2. If systemd-resolved occupies port 53, the QuickZTNA resolver will have started on port 15353 instead. Check which port the resolver is using by examining the client logs or trying both ports:
+```bash
+nslookup Win-A -port=53 127.0.0.53
+nslookup Win-A -port=15353 127.0.0.53
+```
+
+One of these should succeed (whichever port the resolver is bound to).
+
+3. The resolver logs `"Cannot bind to port 53, trying high port"` when the fallback occurs and `"DNS resolver started"` with the actual listen address.
+
+**Pass:** The resolver gracefully falls back to port 15353 when port 53 is unavailable. DNS queries work on the fallback port.
+
+**Fail / Common issues:**
+- Neither port works -- the resolver may have failed entirely. Check that `ztna up` is running and that the client config has `dns_enabled: true`.
+- The DNS manager (`manager_linux.go`) uses `resolvectl` to configure systemd-resolved. If it points to port 53 but the resolver is on 15353, system-level resolution will fail. This is a known edge case where manual `resolvectl` configuration may be needed.
+
+---
+
+## ST5 -- Stale Local Records After Peer Disconnect
+
+**What it verifies:** When a peer disconnects, the local resolver's records may become stale until the next peer list update. The backend always has current data.
+
+**Steps:**
+1. On <MachineRef name="Linux-C" />, confirm <MachineRef name="Win-A" /> resolves locally:
+```bash
+nslookup Win-A 127.0.0.53
+```
+
+**Expected:** Resolves to Win-A's tailnet IP.
+
+2. On <MachineRef name="Win-A" />, disconnect:
+```bash
+ztna down
+```
+
+3. Immediately on <MachineRef name="Linux-C" />, query the local resolver again:
+```bash
+nslookup Win-A 127.0.0.53
+```
+
+**Expected:** May still resolve (stale record). The local resolver keeps records in memory until `UpdateRecords()` is called with a new peer list. The records map is only replaced when the peer manager pushes an update.
+
+4. Compare with the CLI query (goes to backend):
+```bash
+ztna dns query Win-A
+```
+
+**Expected:** Still resolves. The backend includes machines with `status IN ('online', 'offline')`, so Win-A appears even after disconnecting.
+
+5. Wait for the next heartbeat cycle (typically 30-60 seconds). Then retry the local resolver query:
+```bash
+nslookup Win-A 127.0.0.53
+```
+
+**Expected:** After the peer list update, if Win-A is removed from the active peer list, the local resolver returns NXDOMAIN. If Win-A remains in the peer list (offline peers are sometimes retained), it continues to resolve.
+
+**Pass:** The local resolver may serve stale records briefly after a peer disconnects. The backend always returns current data. This demonstrates the difference between the two resolution paths.
+
+**Cleanup:** Reconnect <MachineRef name="Win-A" />:
+```bash
+ztna up
+```
+
+---
+
+## Summary
+
+| Sub-test | What it proves | Pass condition |
+|----------|---------------|----------------|
+| ST1 | Tailnet resolution is local-only | Tailnet names resolve even with upstream DNS blocked |
+| ST2 | DoT failover between Quad9 servers | Blocking one Quad9 IP still allows resolution via the other |
+| ST3 | CLI query bypasses local resolver | `ztna dns query` works even when `ztna down` stops the resolver |
+| ST4 | Port 53 conflict fallback | Resolver falls back to port 15353 when 53 is occupied |
+| ST5 | Stale local records | Local resolver may serve stale data briefly; backend is always current |

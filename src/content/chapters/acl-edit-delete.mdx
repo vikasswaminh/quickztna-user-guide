@@ -1,0 +1,376 @@
+---
+title: "ACL Edit & Delete"
+topic: "Access Control Lists (ACLs)"
+order: 30
+machines: ["Win-A", "Linux-C"]
+summary: "Verify editing existing ACL rules and deleting them — via dashboard and API — and confirm traffic behavior changes immediately."
+---
+
+import MachineRef from '../../components/MachineRef.astro';
+
+## What We're Testing
+
+ACL rules can be modified and deleted through two interfaces:
+
+1. **Dashboard** (`https://login.quickztna.com/acls`) -- the Edit button opens a form pre-filled with the rule's current values. The Delete button (trash icon) removes the rule after confirmation. Both operations use the generic CRUD endpoint.
+
+2. **REST API** -- `PATCH /api/db/acl_rules` for updates, `DELETE /api/db/acl_rules` for removal.
+
+Key implementation details from the source code:
+
+- **Editable columns** (from `db-crud.ts` WRITABLE_COLUMNS): `name`, `source`, `destination`, `ports`, `protocol`, `action`, `priority`, `enabled`, `updated_at`, `created_by`, `expires_at`, `time_start`, `time_end`
+- **PATCH filtering**: The CRUD handler uses `_filters` in the body for WHERE conditions (URL query params are ignored for PATCH). The dashboard uses `.eq("org_id", orgId).eq("id", ruleId).update({...})` which translates to body filters.
+- **DELETE requirements**: Requires `Content-Type: application/json` and a body (even if empty `{}`). The handler parses the body for non-GET methods.
+- **Cache invalidation**: When `acl_rules` are modified, the key `acl-rules:{org_id}` is invalidated (see `CACHE_INVALIDATION_MAP` in `db-crud.ts`). The evaluation engine caches rules for 300 seconds, but CRUD writes force immediate invalidation.
+- **Audit logging**: The dashboard logs `acl_rule.updated`, `acl_rule.deleted`, and `acl_rule.reordered` events via the `logAudit()` client function.
+
+Write operations on `acl_rules` require **admin or owner** role (`ADMIN_WRITE_TABLES`).
+
+## Your Test Setup
+
+| Machine | Role |
+|---------|------|
+| <MachineRef name="Win-A" /> | Browser + curl for edit/delete operations |
+| <MachineRef name="Linux-C" /> | Verification via `ztna acl list` and `ztna acl test` |
+
+Prerequisite: At least two ACL rules should exist (create them per Chapter 26 or 27 instructions).
+
+---
+
+## ST1 -- Edit Rule via API (Change Ports and Action)
+
+**What it verifies:** An existing rule can be updated via the CRUD PATCH endpoint, and the changes take effect in the evaluation engine.
+
+**Steps:**
+1. First, list rules to get the ID of the rule to edit:
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" | python -m json.tool
+```
+
+Pick a rule ID (e.g., an allow rule on port 443).
+
+2. Update the rule to change ports from `443` to `80,443,8080` and name:
+```powershell
+curl -s -X PATCH "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.RULE_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "_filters": {
+      "org_id": "YOUR_ORG_ID",
+      "id": "RULE_ID"
+    },
+    "ports": "80,443,8080",
+    "name": "Allow-Web-Extended"
+  }'
+```
+
+**Important:** PATCH uses `_filters` in the body for the WHERE clause. URL query params alone are not sufficient for PATCH.
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": { "changes": 1 }
+}
+```
+
+3. Verify the update:
+```powershell
+curl -s "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.RULE_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" | python -m json.tool
+```
+
+**Expected:** The rule now has `"ports": "80,443,8080"` and `"name": "Allow-Web-Extended"`.
+
+4. Verify the evaluation reflects the change. Test port 8080 (newly added):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "SOME_DEST_ID",
+    "port": 8080,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** `allowed: true`, matched rule name is `"Allow-Web-Extended"`.
+
+5. Change the action from allow to deny:
+```powershell
+curl -s -X PATCH "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.RULE_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "_filters": {
+      "org_id": "YOUR_ORG_ID",
+      "id": "RULE_ID"
+    },
+    "action": "deny"
+  }'
+```
+
+Re-evaluate port 8080:
+
+**Expected:** `allowed: false`, matched rule shows `"action": "deny"`.
+
+**Pass:** PATCH updates the specified fields. The evaluation engine immediately reflects the changes due to cache invalidation. Both field values (ports, action) update correctly.
+
+**Fail / Common issues:**
+- `changes: 0` -- the `_filters` did not match any row. Verify the `org_id` and rule `id` are correct.
+- Evaluation still shows old values -- the ACL cache (300s TTL) should be invalidated on CRUD write. If not, wait up to 5 minutes or restart the API container.
+
+---
+
+## ST2 -- Edit Rule via Dashboard
+
+**What it verifies:** The dashboard edit dialog pre-fills current values and saves changes correctly.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/acls`.
+2. Find a rule in the list. Click the **Edit** button (pencil icon) on the rule card.
+3. The edit dialog opens with fields pre-filled:
+   - Name, Source, Destination, Protocol, Ports, Action should match the current rule values.
+
+4. Change the **Source** field from `*` to `tag:engineering`.
+5. Change the **Ports** field from `80,443,8080` to `443`.
+6. Click **Save**.
+
+**Expected behavior:**
+- Success toast: "Rule updated"
+- The rule card updates immediately:
+  - Source now shows `tag:engineering`
+  - Ports now shows `443`
+  - All other fields unchanged
+- An audit log entry is created with action `acl_rule.updated`
+
+7. Verify by reloading the page -- the changes persist.
+
+8. Test the **toggle** (enable/disable): Click the switch toggle on the rule card.
+
+**Expected:**
+- The rule becomes disabled (grayed out, "Disabled" badge appears)
+- The evaluation engine skips disabled rules (the SQL query filters `WHERE enabled = true`)
+
+**Pass:** Edit dialog shows correct pre-filled values. Saving updates the rule. Toggle switches enabled/disabled state. Audit log entry is written.
+
+**Fail / Common issues:**
+- Edit button not visible -- only admin and owner roles see the edit/delete buttons. Members see a read-only view.
+- "Failed" toast on save -- check browser Network tab for the PATCH request response. Common cause: trying to set a column not in the writable whitelist.
+
+---
+
+## ST3 -- Delete Rule via API
+
+**What it verifies:** A rule can be deleted via the CRUD DELETE endpoint, and the deletion takes effect immediately in the evaluation engine.
+
+**Steps:**
+1. Create a temporary rule to delete:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Temp-Delete-Test",
+    "source": "*",
+    "destination": "*",
+    "ports": "9999",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 500
+  }'
+```
+
+Note the rule ID from the response (`data.data.id`).
+
+2. Verify the rule exists:
+```powershell
+ztna acl list
+```
+Should show `Temp-Delete-Test` in the output.
+
+3. Delete the rule:
+```powershell
+curl -s -X DELETE "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.RULE_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{}'
+```
+
+**Important:** The DELETE request MUST include `Content-Type: application/json` and a body (even an empty `{}`). The handler parses the body for non-GET methods.
+
+**Expected response:**
+```json
+{
+  "success": true,
+  "data": { "changes": 1 }
+}
+```
+
+4. Verify deletion:
+```powershell
+ztna acl list
+```
+The `Temp-Delete-Test` rule should no longer appear.
+
+5. Evaluate port 9999 (previously allowed by the deleted rule):
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "SOME_DEST_ID",
+    "port": 9999,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** `allowed: false` (the rule is gone, so default deny applies, assuming no other rule matches port 9999).
+
+**Pass:** DELETE returns `changes: 1`. The rule disappears from `ztna acl list`. The evaluation engine no longer matches the deleted rule.
+
+**Fail / Common issues:**
+- `changes: 0` -- incorrect rule ID or org_id in the query params.
+- 400 or parse error -- missing the empty JSON body `{}`. DELETE requires it.
+- Rule still appears -- the cache may not have been invalidated. The `CACHE_INVALIDATION_MAP` for `acl_rules` should clear `acl-rules:{org_id}`.
+
+---
+
+## ST4 -- Verify Traffic Behavior Changes After Edit/Delete
+
+**What it verifies:** Editing or deleting a rule causes an immediate change in traffic evaluation results (within the cache invalidation window).
+
+**Steps:**
+1. Start with a known state. Create an allow rule:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/db/acl_rules" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "name": "Behavior-Test",
+    "source": "*",
+    "destination": "*",
+    "ports": "5000",
+    "protocol": "tcp",
+    "action": "allow",
+    "priority": 75
+  }'
+```
+
+2. Evaluate -- should be allowed:
+```bash
+ztna acl test --src Linux-C --dst Win-A --port 5000 --proto tcp
+```
+Expected: `ALLOWED: Linux-C -> Win-A:5000/tcp`
+
+3. Edit the rule to change action to `deny`:
+```powershell
+curl -s -X PATCH "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.RULE_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "_filters": { "org_id": "YOUR_ORG_ID", "id": "RULE_ID" },
+    "action": "deny"
+  }'
+```
+
+4. Re-evaluate immediately:
+```bash
+ztna acl test --src Linux-C --dst Win-A --port 5000 --proto tcp
+```
+Expected: `DENIED: Linux-C -> Win-A:5000/tcp` -- the change is immediate because CRUD writes invalidate the ACL cache.
+
+5. Delete the rule entirely:
+```powershell
+curl -s -X DELETE "https://login.quickztna.com/api/db/acl_rules?org_id=YOUR_ORG_ID&id=eq.RULE_ID" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{}'
+```
+
+6. Re-evaluate:
+```bash
+ztna acl test --src Linux-C --dst Win-A --port 5000 --proto tcp
+```
+Expected: `DENIED: Linux-C -> Win-A:5000/tcp` -- still denied, but now by default deny (no matching rule) rather than an explicit deny rule.
+
+7. Verify via the API that the matched_rule is now `null` (default deny) rather than the deleted rule:
+```powershell
+curl -s -X POST "https://login.quickztna.com/api/acl-evaluate" `
+  -H "Authorization: Bearer YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "org_id": "YOUR_ORG_ID",
+    "source_machine_id": "LINUX_C_MACHINE_ID",
+    "destination_machine_id": "WIN_A_MACHINE_ID",
+    "port": 5000,
+    "protocol": "tcp"
+  }'
+```
+
+**Expected:** `matched_rule: null` (no rule matched, default deny).
+
+**Pass:** Allow-to-deny edit changes the evaluation result immediately. Deletion removes the rule from evaluation. Cache invalidation works correctly.
+
+**Fail / Common issues:**
+- Results unchanged after edit -- the cache key `acl-rules:{org_id}` may not be invalidated. Check that `CACHE_INVALIDATION_MAP` in `db-crud.ts` includes the `acl_rules` entry.
+- Results change after a delay (up to 300 seconds) -- cache invalidation failed but the TTL expired. This indicates a Valkey connectivity issue.
+
+---
+
+## ST5 -- Verify Audit Log Entries
+
+**What it verifies:** Creating, editing, and deleting ACL rules generates audit log entries visible in the audit log.
+
+**Steps:**
+1. On <MachineRef name="Win-A" />, open `https://login.quickztna.com/audit-log` in the dashboard.
+
+2. Look for recent entries with these action types:
+   - `acl_rule.created` -- from rule creation in previous tests
+   - `acl_rule.updated` -- from edits (including toggle and reorder)
+   - `acl_rule.deleted` -- from deletions
+   - `acl_rule.reordered` -- from priority reorder (arrow buttons on dashboard)
+
+3. Each audit entry should include:
+   - **Action**: the event type (e.g., `acl_rule.updated`)
+   - **Resource type**: `acl_rule`
+   - **Resource ID**: the rule ID or name
+   - **Timestamp**: when the action occurred
+   - **Details**: metadata such as the changed fields
+
+4. Verify a reorder audit entry. On the ACLs page, click the up/down arrow buttons to reorder two rules. Then check the audit log for `acl_rule.reordered` with `{ "direction": "up" }` or `{ "direction": "down" }`.
+
+5. Verify audit entries via the API:
+```powershell
+curl -s "https://login.quickztna.com/api/db/audit_logs?org_id=YOUR_ORG_ID&resource_type=eq.acl_rule" `
+  -H "Authorization: Bearer YOUR_TOKEN" | python -m json.tool
+```
+
+**Expected:** At least one entry for each action type from this test session.
+
+**Note:** Audit logs in QuickZTNA are stored in Loki (not PostgreSQL). The dashboard's audit log page reads from Loki via the `services/loki.ts` service. The `logAudit()` function in the frontend sends audit events to the backend, which forwards them to Loki.
+
+**Pass:** All ACL CRUD operations (create, update, delete, reorder, toggle) produce corresponding audit log entries with correct action types, resource IDs, and timestamps.
+
+**Fail / Common issues:**
+- No audit entries visible -- the `logAudit()` call is client-side (fire-and-forget). If the audit API endpoint is down or Loki is unreachable, entries may be lost. Check the backend logs for Loki connection errors.
+- Entries from API-only operations (curl) may not appear because `logAudit()` is called from the frontend JavaScript, not the backend handler. Only dashboard operations generate frontend audit logs.
+
+---
+
+## Summary
+
+| Sub-test | What it proves |
+|----------|---------------|
+| ST1 | Rules can be updated via API PATCH with `_filters` in the body |
+| ST2 | Dashboard edit dialog pre-fills values correctly and saves changes |
+| ST3 | Rules can be deleted via API DELETE (requires empty JSON body) |
+| ST4 | Traffic evaluation results change immediately after edit/delete (cache invalidation works) |
+| ST5 | All ACL CRUD operations generate audit log entries in Loki |
